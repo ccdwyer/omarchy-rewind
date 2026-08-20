@@ -1,0 +1,8 @@
+/src/rewindd/target/
+/target/
+/bin/rewindd
+/bin/rewind
+**/*.rs.bk
+.DS_Store
+.grok_impl.log
+.impl_prompt.md

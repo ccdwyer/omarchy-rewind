@@ -1,0 +1,7 @@
+[
+  { "ts": 1, "app": "kitty", "title": "commit message zebra-token", "clip": "" },
+  { "ts": 2, "app": "kitty", "title": "zsh", "clip": "git-hash-ff00aa" },
+  { "ts": 3, "app": "firefox", "title": "Rewind plugin spec", "clip": "omarchy plugin add" },
+  { "ts": 4, "app": "code", "title": "Service.qml", "clip": "" },
+  { "ts": 5, "app": "kitty", "title": "htop", "clip": "another line" }
+]

@@ -1,0 +1,7 @@
+#!/bin/sh
+# Thin CLI name from the spec: `rewind wipe today|all|range`.
+ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+if [ -x "$ROOT/bin/rewindd" ]; then
+  exec "$ROOT/bin/rewindd" "$@"
+fi
+exec "$ROOT/compat/rewindd.sh" "$@"

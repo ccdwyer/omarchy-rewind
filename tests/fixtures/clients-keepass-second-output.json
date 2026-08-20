@@ -1,0 +1,24 @@
+[
+  {
+    "address": "0x1",
+    "class": "kitty",
+    "title": "demo",
+    "workspace": "1",
+    "monitor": 0,
+    "mapped": true,
+    "hidden": false,
+    "at": [0, 0],
+    "size": [800, 600]
+  },
+  {
+    "address": "0x2",
+    "class": "keepassxc",
+    "title": "Passwords",
+    "workspace": "2",
+    "monitor": 1,
+    "mapped": true,
+    "hidden": false,
+    "at": [1920, 0],
+    "size": [400, 400]
+  }
+]

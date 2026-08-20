@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.chris.rewind",
+  "name": "Rewind",
+  "version": "1.0.0",
+  "author": "chris",
+  "license": "MIT",
+  "description": "A local time machine for your desktop: arm it, then scrub, search, and recover any recorded moment. Everything stays on disk, nothing leaves the machine.",
+  "kinds": ["service", "overlay", "bar-widget"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "overlay": "Overlay.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Rewind",
+    "category": "Desktop",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "byteCapGb": 2,
+      "cadenceMs": 3000,
+      "idlePauseSec": 120,
+      "excludeApps": "keepassxc,1Password,1password,Bitwarden,bitwarden,seahorse,polkit-gnome-authentication-agent-1,polkit-kde-authentication-agent-1,lxqt-policykit-agent",
+      "titlePausePatterns": "",
+      "armOnLogin": false
+    },
+    "schema": [
+      { "key": "byteCapGb", "type": "number", "label": "Retention cap (GB)" },
+      { "key": "cadenceMs", "type": "number", "label": "Capture interval (ms)" },
+      { "key": "idlePauseSec", "type": "number", "label": "Idle pause after (seconds)" },
+      { "key": "excludeApps", "type": "string", "label": "Excluded app classes" },
+      { "key": "titlePausePatterns", "type": "string", "label": "Extra title pause patterns" },
+      { "key": "armOnLogin", "type": "boolean", "label": "Arm on login (after consent)" }
+    ]
+  }
+}

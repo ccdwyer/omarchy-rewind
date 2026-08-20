@@ -1,0 +1,20 @@
+[
+  {
+    "address": "0x1",
+    "class": "kitty",
+    "title": "zsh",
+    "workspace": "1",
+    "monitor": 0,
+    "mapped": true,
+    "hidden": false
+  },
+  {
+    "address": "0x3",
+    "class": "firefox",
+    "title": "Inbox — Mozilla Firefox",
+    "workspace": "2",
+    "monitor": 0,
+    "mapped": true,
+    "hidden": false
+  }
+]
