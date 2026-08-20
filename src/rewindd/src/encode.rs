@@ -39,15 +39,39 @@ pub fn preferred_name() -> &'static str {
     if which("cwebp") {
         "cwebp"
     } else {
-        "png"
+        "image-webp"
     }
 }
 
 pub fn preferred_ext() -> &'static str {
-    if which("cwebp") {
-        "webp"
-    } else {
-        "png"
+    "webp"
+}
+
+pub fn downscale_to(rgba: &[u8], width: u32, height: u32, max_long: u32) -> RgbaFrame {
+    if width == 0 || height == 0 {
+        return RgbaFrame {
+            bytes: rgba.to_vec(),
+            width,
+            height,
+        };
+    }
+    let long = width.max(height);
+    if long <= max_long {
+        return RgbaFrame {
+            bytes: rgba.to_vec(),
+            width,
+            height,
+        };
+    }
+    let scale = max_long as f32 / long as f32;
+    let nw = ((width as f32 * scale).round() as u32).max(1);
+    let nh = ((height as f32 * scale).round() as u32).max(1);
+    let img = buffer(rgba, width, height);
+    let resized = image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Triangle);
+    RgbaFrame {
+        bytes: resized.into_raw(),
+        width: nw,
+        height: nh,
     }
 }
 
@@ -61,31 +85,13 @@ pub fn which(bin: &str) -> bool {
 }
 
 pub fn downscale_720p(rgba: &[u8], width: u32, height: u32) -> RgbaFrame {
-    if width == 0 || height == 0 {
-        return RgbaFrame {
-            bytes: rgba.to_vec(),
-            width,
-            height,
-        };
-    }
-    let long = width.max(height);
-    if long <= 1280 {
-        return RgbaFrame {
-            bytes: rgba.to_vec(),
-            width,
-            height,
-        };
-    }
-    let scale = 1280.0 / long as f32;
-    let nw = ((width as f32 * scale).round() as u32).max(1);
-    let nh = ((height as f32 * scale).round() as u32).max(1);
-    let img = buffer(rgba, width, height);
-    let resized = image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Triangle);
-    RgbaFrame {
-        bytes: resized.into_raw(),
-        width: nw,
-        height: nh,
-    }
+    downscale_to(rgba, width, height, 1280)
+}
+
+pub struct Roi {
+    pub frame: RgbaFrame,
+    pub x: u32,
+    pub y: u32,
 }
 
 pub fn crop_roi(
@@ -94,7 +100,7 @@ pub fn crop_roi(
     height: u32,
     active: &ActiveWindow,
     monitor: &Monitor,
-) -> Option<RgbaFrame> {
+) -> Option<Roi> {
     if active.size.0 <= 0 || active.size.1 <= 0 {
         return None;
     }
@@ -107,31 +113,49 @@ pub fn crop_roi(
     let h = (active.size.1 as u32).min(height - y).max(1);
     let img = buffer(rgba, width, height);
     let cropped = image::imageops::crop_imm(&img, x, y, w, h).to_image();
-    Some(RgbaFrame {
-        width: cropped.width(),
-        height: cropped.height(),
-        bytes: cropped.into_raw(),
+    Some(Roi {
+        x,
+        y,
+        frame: RgbaFrame {
+            width: cropped.width(),
+            height: cropped.height(),
+            bytes: cropped.into_raw(),
+        },
     })
 }
 
+/// cwebp → image-crate WebP → reduced-scale PNG.
 pub fn encode_frame(
     rgba: &[u8],
     width: u32,
     height: u32,
     dest: &Path,
-) -> Result<Encoder, String> {
-    if which("cwebp") {
-        if write_cwebp(rgba, width, height, dest).is_ok() {
-            return Ok(Encoder::Cwebp);
-        }
+) -> Result<(Encoder, std::path::PathBuf), String> {
+    let webp = dest.with_extension("webp");
+    if which("cwebp") && write_cwebp(rgba, width, height, &webp).is_ok() {
+        return Ok((Encoder::Cwebp, webp));
     }
-    write_png(rgba, width, height, dest)?;
-    Ok(Encoder::Png)
+    if write_image_webp(rgba, width, height, &webp).is_ok() {
+        return Ok((Encoder::ImageWebp, webp));
+    }
+    let _ = std::fs::remove_file(&webp);
+    let small = downscale_to(rgba, width, height, 720);
+    let png = dest.with_extension("png");
+    write_png(&small.bytes, small.width, small.height, &png)?;
+    Ok((Encoder::Png, png))
 }
 
 pub fn write_png(rgba: &[u8], width: u32, height: u32, dest: &Path) -> Result<(), String> {
     let img = buffer(rgba, width, height);
     img.save(dest).map_err(|e| e.to_string())?;
+    perms::secure_file(dest).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn write_image_webp(rgba: &[u8], width: u32, height: u32, dest: &Path) -> Result<(), String> {
+    let img = buffer(rgba, width, height);
+    img.save_with_format(dest, image::ImageFormat::WebP)
+        .map_err(|e| e.to_string())?;
     perms::secure_file(dest).map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -230,7 +254,39 @@ mod tests {
             ..Monitor::default()
         };
         let crop = crop_roi(&px, 100, 80, &active, &mon).unwrap();
-        assert_eq!(crop.width, 10);
-        assert_eq!(crop.height, 10);
+        assert_eq!(crop.frame.width, 10);
+        assert_eq!(crop.frame.height, 10);
+        assert_eq!(crop.x, 90);
+        assert_eq!(crop.y, 70);
+    }
+
+    #[test]
+    fn png_fallback_is_smaller_than_720p() {
+        let px = vec![20u8; 1280 * 720 * 4];
+        let s = downscale_to(&px, 1280, 720, 720);
+        assert!(s.width <= 720);
+        assert!(s.height < 720 || s.width < 1280);
+    }
+
+    #[test]
+    fn preferred_ext_is_webp() {
+        assert_eq!(preferred_ext(), "webp");
+    }
+
+    #[test]
+    fn image_webp_encodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("t.webp");
+        let px = vec![80u8; 32 * 24 * 4];
+        let (enc, path) = encode_frame(&px, 32, 24, &dest).unwrap();
+        assert!(path.exists());
+        match enc {
+            Encoder::Cwebp | Encoder::ImageWebp => {
+                assert_eq!(path.extension().and_then(|e| e.to_str()), Some("webp"));
+            }
+            Encoder::Png => {
+                assert_eq!(path.extension().and_then(|e| e.to_str()), Some("png"));
+            }
+        }
     }
 }

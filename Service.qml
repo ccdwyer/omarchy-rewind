@@ -58,6 +58,9 @@ Item {
   property int lastPlanTs: 0
   property bool planReady: false
   property string lastQuery: ""
+  property double firstTs: 0
+  property double lastTs: 0
+  readonly property bool persistUi: root.consent || root.armed || root.frames > 0
 
   property double byteCapGb: 2
   property int cadenceMs: 3000
@@ -122,7 +125,8 @@ Item {
       root.lastStatus = "ready"
       send("configure", root.settingsPayload())
       send("stats", {})
-      root.publish()
+      if (root.persistUi)
+        root.publish()
       return
     }
     if (ev.event === "reply") {
@@ -185,6 +189,28 @@ Item {
       root.paused = data.paused === true
     if (data.reason !== undefined)
       root.pauseReason = data.reason || ""
+    if (data.firstTs !== undefined)
+      root.firstTs = Number(data.firstTs) || 0
+    if (data.lastTs !== undefined)
+      root.lastTs = Number(data.lastTs) || 0
+    if (data.wiped !== undefined) {
+      root.hits = []
+      root.hitsRevision += 1
+      root.currentMoment = {}
+      root.momentRevision += 1
+      root.currentPlan = {}
+      root.planReady = false
+      root.lastPlanTs = 0
+      root.lastQuery = ""
+      root.timeline = []
+      root.gaps = []
+      root.clips = []
+      root.timelineRevision += 1
+      root.clipsRevision += 1
+      root.refreshTimeline()
+      root.refreshClips()
+      send("stats", {})
+    }
     if (data.hits !== undefined) {
       root.hits = data.hits
       root.hitsRevision += 1
@@ -217,6 +243,8 @@ Item {
   }
 
   function publish() {
+    if (!root.persistUi)
+      return
     uiSnap.setText(JSON.stringify(root.statsObject()) + "\n")
     timelineSnap.setText(JSON.stringify({
       frames: root.timeline,
@@ -259,7 +287,9 @@ Item {
       consent: root.consent,
       helper: root.helperPath,
       fallback: root.usingFallback,
-      status: root.lastStatus
+      status: root.lastStatus,
+      firstTs: root.firstTs,
+      lastTs: root.lastTs
     }
   }
 
@@ -269,17 +299,11 @@ Item {
       return "consent"
     }
     send("arm", root.settingsPayload())
-    root.armed = true
-    root.pauseReason = ""
-    root.bumpStats()
     return "ok"
   }
 
   function disarm() {
     send("disarm", {})
-    root.armed = false
-    root.pauseReason = "disarmed"
-    root.bumpStats()
     return "ok"
   }
 
@@ -317,13 +341,7 @@ Item {
       onLogin = !!(parsed.armOnLogin || parsed.arm_on_login)
     }
     send("consent", { armNow: armNow, armOnLogin: onLogin })
-    root.consent = true
     root.armOnLogin = onLogin
-    if (armNow) {
-      root.armed = true
-      root.pauseReason = ""
-    }
-    root.bumpStats()
     return "ok"
   }
 
@@ -334,7 +352,7 @@ Item {
   }
 
   function refreshTimeline() {
-    send("timeline", { limit: 400 })
+    send("timeline", { limit: 2000 })
   }
 
   function refreshClips() {
@@ -504,12 +522,12 @@ Item {
     }
   }
 
-  FileView { id: uiSnap; path: root.dataDir + "/ui.json"; atomicWrites: true; printErrors: false }
-  FileView { id: timelineSnap; path: root.dataDir + "/timeline.json"; atomicWrites: true; printErrors: false }
-  FileView { id: clipsSnap; path: root.dataDir + "/clips.json"; atomicWrites: true; printErrors: false }
-  FileView { id: momentSnap; path: root.dataDir + "/moment.json"; atomicWrites: true; printErrors: false }
-  FileView { id: hitsSnap; path: root.dataDir + "/hits.json"; atomicWrites: true; printErrors: false }
-  FileView { id: planSnap; path: root.dataDir + "/plan.json"; atomicWrites: true; printErrors: false }
+  FileView { id: uiSnap; path: root.persistUi ? (root.dataDir + "/ui.json") : ""; atomicWrites: true; printErrors: false }
+  FileView { id: timelineSnap; path: root.persistUi ? (root.dataDir + "/timeline.json") : ""; atomicWrites: true; printErrors: false }
+  FileView { id: clipsSnap; path: root.persistUi ? (root.dataDir + "/clips.json") : ""; atomicWrites: true; printErrors: false }
+  FileView { id: momentSnap; path: root.persistUi ? (root.dataDir + "/moment.json") : ""; atomicWrites: true; printErrors: false }
+  FileView { id: hitsSnap; path: root.persistUi ? (root.dataDir + "/hits.json") : ""; atomicWrites: true; printErrors: false }
+  FileView { id: planSnap; path: root.persistUi ? (root.dataDir + "/plan.json") : ""; atomicWrites: true; printErrors: false }
 
   Connections {
     target: Hyprland

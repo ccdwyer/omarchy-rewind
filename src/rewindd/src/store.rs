@@ -34,6 +34,19 @@ pub struct StatsSnap {
     pub frames_today: i64,
     pub bytes: i64,
     pub first_ts: i64,
+    pub last_ts: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FrameGeom {
+    pub crop_x: f64,
+    pub crop_y: f64,
+    pub crop_w: f64,
+    pub crop_h: f64,
+    pub out_w: f64,
+    pub out_h: f64,
+    pub stored_w: f64,
+    pub stored_h: f64,
 }
 
 pub struct Store {
@@ -630,7 +643,8 @@ impl Store {
         let frame: Option<Value> = self
             .conn
             .query_row(
-                "SELECT ts,path,app,title,workspace,bytes,encoder,width,height
+                "SELECT ts,path,app,title,workspace,bytes,encoder,width,height,
+                        out_w,out_h,crop_x,crop_y,crop_w,crop_h
                  FROM frames WHERE ts=?1",
                 params![ts],
                 |r| {
@@ -643,7 +657,13 @@ impl Store {
                         "bytes": r.get::<_, i64>(5)?,
                         "encoder": r.get::<_, String>(6)?,
                         "width": r.get::<_, i64>(7)?,
-                        "height": r.get::<_, i64>(8)?
+                        "height": r.get::<_, i64>(8)?,
+                        "out_w": r.get::<_, i64>(9)?,
+                        "out_h": r.get::<_, i64>(10)?,
+                        "crop_x": r.get::<_, i64>(11)?,
+                        "crop_y": r.get::<_, i64>(12)?,
+                        "crop_w": r.get::<_, i64>(13)?,
+                        "crop_h": r.get::<_, i64>(14)?
                     }))
                 },
             )
@@ -771,6 +791,10 @@ impl Store {
             .conn
             .query_row("SELECT COALESCE(MIN(ts),0) FROM frames", [], |r| r.get(0))
             .unwrap_or(0);
+        let last_ts: i64 = self
+            .conn
+            .query_row("SELECT COALESCE(MAX(ts),0) FROM frames", [], |r| r.get(0))
+            .unwrap_or(0);
         let now = now_ms();
         let start = crate::pixel::local_day_start_ms(now);
         let frames_today: i64 = self
@@ -786,7 +810,33 @@ impl Store {
             frames_today,
             bytes,
             first_ts,
+            last_ts,
         })
+    }
+
+    /// Crop origin/size in capture pixels plus output and stored-frame size.
+    pub fn frame_geom(&self, ts: i64) -> Option<FrameGeom> {
+        self.conn
+            .query_row(
+                "SELECT crop_x, crop_y, crop_w, crop_h, out_w, out_h, width, height
+                 FROM frames WHERE ts=?1",
+                params![ts],
+                |r| {
+                    Ok(FrameGeom {
+                        crop_x: r.get::<_, i64>(0)? as f64,
+                        crop_y: r.get::<_, i64>(1)? as f64,
+                        crop_w: r.get::<_, i64>(2)? as f64,
+                        crop_h: r.get::<_, i64>(3)? as f64,
+                        out_w: r.get::<_, i64>(4)? as f64,
+                        out_h: r.get::<_, i64>(5)? as f64,
+                        stored_w: r.get::<_, i64>(6)? as f64,
+                        stored_h: r.get::<_, i64>(7)? as f64,
+                    })
+                },
+            )
+            .optional()
+            .ok()
+            .flatten()
     }
 
     pub fn self_test(&mut self) -> Result<(), String> {
@@ -926,6 +976,27 @@ mod tests {
             encoder: "png".into(),
             crop_path: None,
         }
+    }
+
+    #[test]
+    fn frame_geom_loads_crop_and_output() {
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("rewind.db")).unwrap();
+        let mut f = sample(42, 10, "geom");
+        f.crop_x = 400;
+        f.crop_y = 108;
+        f.crop_w = 800;
+        f.crop_h = 600;
+        f.out_w = 1920;
+        f.out_h = 1080;
+        f.width = 1280;
+        f.height = 720;
+        store.insert_frame(&f).unwrap();
+        let g = store.frame_geom(42).unwrap();
+        assert_eq!(g.crop_x, 400.0);
+        assert_eq!(g.crop_w, 800.0);
+        assert_eq!(g.out_w, 1920.0);
+        assert_eq!(g.stored_w, 1280.0);
     }
 
     #[test]

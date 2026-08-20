@@ -1,6 +1,6 @@
 use crate::encode::which;
 use crate::ipc::Event;
-use crate::query::{scale_box, WordBox};
+use crate::query::{scale_roi_to_frame, WordBox};
 use crate::{emit, DaemonState};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -21,9 +21,9 @@ pub(crate) fn idle_loop(shared: Arc<DaemonState>) {
         if !shared.is_idle() {
             continue;
         }
-        let pending = match shared.store().pending_crops() {
-            Ok(p) => p,
-            Err(_) => continue,
+        let pending = match shared.with_store(|s| s.pending_crops()) {
+            Some(Ok(p)) => p,
+            _ => continue,
         };
         let queued = pending.len() as i64;
         let mut done = 0i64;
@@ -33,7 +33,7 @@ pub(crate) fn idle_loop(shared: Arc<DaemonState>) {
             }
             let path = shared.data_paths().root.join(&rel);
             if !path.exists() {
-                let _ = shared.store().clear_crop(ts);
+                let _ = shared.with_store(|s| s.clear_crop(ts));
                 continue;
             }
             match run_tesseract(&path) {
@@ -41,35 +41,37 @@ pub(crate) fn idle_loop(shared: Arc<DaemonState>) {
                     let meta = frame_geom(&shared, ts);
                     let boxes: Vec<WordBox> = raw_boxes
                         .into_iter()
-                        .map(|mut b| {
+                        .map(|b| {
                             if let Some(g) = &meta {
-                                let scaled = scale_box(
+                                scale_roi_to_frame(
                                     (b.x, b.y, b.w, b.h),
-                                    (g.0, g.1),
-                                    (g.2, g.3),
-                                    (g.4, g.5),
-                                );
-                                b.x = scaled.x;
-                                b.y = scaled.y;
-                                b.w = scaled.w;
-                                b.h = scaled.h;
+                                    g.crop_x,
+                                    g.crop_y,
+                                    g.crop_w,
+                                    g.crop_h,
+                                    g.out_w,
+                                    g.out_h,
+                                    g.stored_w,
+                                    g.stored_h,
+                                    &b.word,
+                                )
+                            } else {
+                                b
                             }
-                            b
                         })
                         .collect();
-                    {
-                        let store = shared.store();
-                        let (app, title) = store_app_title(&store, ts);
+                    let _ = shared.with_store(|store| {
+                        let (app, title) = store_app_title(store, ts);
                         let clip = store.clip_at(ts).unwrap_or_default();
                         let _ = store.index_search_row(ts, &text, &app, &title, &clip);
                         let _ = store.insert_ocr_boxes(ts, &boxes);
                         let _ = store.clear_crop(ts);
-                    }
+                    });
                     done += 1;
                     emit(&Event::ocr_progress(done, queued));
                 }
                 Err(_) => {
-                    let _ = shared.store().clear_crop(ts);
+                    let _ = shared.with_store(|s| s.clear_crop(ts));
                 }
             }
         }
@@ -97,16 +99,8 @@ fn store_app_title(store: &crate::store::Store, ts: i64) -> (String, String) {
     }
 }
 
-fn frame_geom(shared: &DaemonState, ts: i64) -> Option<(f64, f64, f64, f64, f64, f64)> {
-    let v = shared.store().moment(ts).ok()?;
-    let f = v.get("frame")?;
-    // crop origin is not in the moment JSON; skip scale if missing.
-    let sw = f.get("width").and_then(|x| x.as_i64()).unwrap_or(0) as f64;
-    let sh = f.get("height").and_then(|x| x.as_i64()).unwrap_or(0) as f64;
-    if sw <= 0.0 || sh <= 0.0 {
-        return None;
-    }
-    Some((0.0, 0.0, sw, sh, sw, sh))
+fn frame_geom(shared: &DaemonState, ts: i64) -> Option<crate::store::FrameGeom> {
+    shared.with_store(|s| s.frame_geom(ts)).flatten()
 }
 
 pub fn run_tesseract(path: &Path) -> Result<(String, Vec<WordBox>), String> {

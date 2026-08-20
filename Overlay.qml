@@ -48,6 +48,8 @@ Item {
   property bool uiOcr: false
   property double uiByteCap: 2147483648
   property var uiDaysEstimate: null
+  property double uiFirstTs: 0
+  property double uiLastTs: 0
 
   RewindAdapter { id: adapter }
   readonly property string dataDir: adapter.dataDir()
@@ -117,6 +119,17 @@ Item {
         }
         if (ev.frame || ev.windows)
           root.moment = ev.moment || ev
+        if (ev.wiped !== undefined) {
+          root.highlightBoxes = []
+          root.hits = []
+          root.moment = {}
+          root.frames = []
+          root.clips = []
+          root.gaps = []
+          root.selectedIndex = 0
+          root.plan = {}
+          root.planReady = false
+        }
       } catch (e) {}
     }
     uiView.reload()
@@ -190,6 +203,10 @@ Item {
     if (u.byteCap !== undefined)
       root.uiByteCap = Number(u.byteCap) || root.uiByteCap
     root.uiDaysEstimate = u.daysEstimate
+    if (u.firstTs !== undefined)
+      root.uiFirstTs = Number(u.firstTs) || 0
+    if (u.lastTs !== undefined)
+      root.uiLastTs = Number(u.lastTs) || 0
     root.firstRun = !root.uiConsent
   }
 
@@ -197,6 +214,12 @@ Item {
     var t = Channel.parse(raw, {})
     root.frames = Channel.arrayOf(t.frames)
     root.gaps = Channel.arrayOf(t.gaps)
+    if (!root.frames.length) {
+      root.moment = {}
+      root.highlightBoxes = []
+    } else if (root.selectedIndex >= root.frames.length) {
+      root.selectedIndex = root.frames.length - 1
+    }
   }
 
   function applyClips(raw) {
@@ -336,10 +359,25 @@ Item {
 
   function openWipe(scope) {
     root.wipeScope = scope
-    if (scope === "range" && root.frames.length) {
-      root.wipeFromTs = Number(root.frames[0].ts)
+    if (scope === "range") {
+      var lo = Number(root.uiFirstTs) || 0
+      var hi = Number(root.uiLastTs) || 0
+      if (root.frames.length) {
+        var a = Number(root.frames[0].ts)
+        var b = Number(root.frames[root.frames.length - 1].ts)
+        if (a > b) {
+          var swap = a
+          a = b
+          b = swap
+        }
+        if (!lo || a < lo)
+          lo = a
+        if (!hi || b > hi)
+          hi = b
+      }
       var cur = root.currentFrame()
-      root.wipeToTs = cur ? Number(cur.ts) : Number(root.frames[root.frames.length - 1].ts)
+      root.wipeFromTs = lo
+      root.wipeToTs = cur ? Number(cur.ts) : hi
       if (root.wipeToTs < root.wipeFromTs) {
         var tmp = root.wipeFromTs
         root.wipeFromTs = root.wipeToTs
@@ -360,12 +398,21 @@ Item {
   }
 
   function doWipe() {
+    root.highlightBoxes = []
+    root.hits = []
+    root.moment = {}
+    root.plan = {}
+    root.planReady = false
+    root.frames = []
+    root.clips = []
+    root.gaps = []
+    root.selectedIndex = 0
     if (root.wipeScope === "range")
       root.callSvc("wipe", { scope: "range", from: root.wipeFromTs, to: root.wipeToTs })
     else
       root.callSvc("wipe", { scope: root.wipeScope })
+    root.callSvc("refresh", { overlay: true })
     root.showWipe = false
-    Qt.callLater(root.pull)
   }
 
   function isHit(ts) {
@@ -1229,7 +1276,7 @@ Item {
             Text {
               width: parent.width
               wrapMode: Text.WordWrap
-              text: "From " + Format.clockLabel(root.wipeFromTs) + "  →  " + Format.clockLabel(root.wipeToTs) + ". Scrub to a frame, then set start or end."
+              text: "From " + Format.clockLabel(root.wipeFromTs) + "  →  " + Format.clockLabel(root.wipeToTs) + ". Bounds are the full archive (first–last recorded), not only the loaded strip. Scrub to a frame, then set start or end."
               color: root.foreground
               opacity: 0.75
               font.family: root.fontFamily

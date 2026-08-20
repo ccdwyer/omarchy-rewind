@@ -50,7 +50,7 @@ function mergeStats(target, ev) {
     var src = ev.data && typeof ev.data === "object" ? ev.data : ev
     var keys = ["armed", "paused", "reason", "frames", "framesToday", "bytes",
                 "byteCap", "daysEstimate", "encoder", "ocrAvailable", "capture",
-                "consent", "version"]
+                "consent", "version", "firstTs", "lastTs"]
     for (var i = 0; i < keys.length; i++) {
         var k = keys[i]
         if (src[k] !== undefined)
@@ -73,6 +73,8 @@ function emptyStats() {
         ocrAvailable: false,
         capture: "grim",
         consent: false,
-        version: "1.0.0"
+        version: "1.0.0",
+        firstTs: 0,
+        lastTs: 0
     }
 }

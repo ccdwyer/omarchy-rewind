@@ -127,7 +127,7 @@ Data lives at `$XDG_DATA_HOME/rewind` (default `~/.local/share/rewind`), created
 
 ## Honest limitations
 
-- **Armed-on-demand, not ambient.** Fresh install writes nothing until you arm it. “Arm on login” is opt-in after consent.
+- **Armed-on-demand, not ambient.** A fresh disarmed launch writes nothing: no SQLite, no frame files, no UI snapshots. Persistent storage is created only after consent/arm. “Arm on login” is opt-in after consent.
 - **Focused output only.** Other monitors are not captured.
 - **Reopen & arrange is a reviewable plan**, not session restore. Missing apps launch by `.desktop` mapping; browser tabs, documents, and unsaved state are listed as unrecoverable.
 - **Clipboard is text only.** Images and passwords in password-manager windows should never be captured because those apps pause recording while visible — still, do not arm Rewind over a password field in a terminal.

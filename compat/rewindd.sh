@@ -26,11 +26,13 @@ INDEX="$DATA/index.jsonl"
 STATE="$DATA/state.json"
 LAYOUTS="$DATA/layouts"
 
-mkdir -p "$FRAMES" "$LAYOUTS"
-chmod 700 "$DATA" "$FRAMES" "$LAYOUTS" 2>/dev/null || true
-[ -f "$CLIPS" ] || : >"$CLIPS"
-[ -f "$INDEX" ] || : >"$INDEX"
-chmod 600 "$CLIPS" "$INDEX" 2>/dev/null || true
+prepare_data() {
+  mkdir -p "$FRAMES" "$LAYOUTS"
+  chmod 700 "$DATA" "$FRAMES" "$LAYOUTS" 2>/dev/null || true
+  [ -f "$CLIPS" ] || : >"$CLIPS"
+  [ -f "$INDEX" ] || : >"$INDEX"
+  chmod 600 "$CLIPS" "$INDEX" 2>/dev/null || true
+}
 
 CONSENT=0
 CONSENT_AT=0
@@ -77,6 +79,10 @@ print("TITLEPAUSE=%r"%tp)
 }
 
 save_state() {
+  if [ "${CONSENT_AT:-0}" -eq 0 ]; then
+    return 0
+  fi
+  prepare_data
   python3 -c '
 import json,sys
 path=sys.argv[1]
@@ -102,35 +108,44 @@ merge_configure() {
   eval "$(python3 -c '
 import json,sys
 v=json.loads(sys.argv[1])
-def n(*keys):
-    for k in keys:
-        if k in v and v[k] not in (None,""):
-            print(k, v[k]); return
-n("byteCapGb","byteCap")
-n("cadenceMs")
-n("idlePauseSec")
-n("excludeApps","exclude")
-n("titlePausePatterns","titlePause")
-n("armOnLogin")
-' "$line" 2>/dev/null | while IFS= read -r k rest; do
-    case "$k" in
-      byteCapGb) echo "BYTECAP=$(python3 -c "print(int(float(\"$rest\")*1024*1024*1024))" 2>/dev/null || echo $BYTECAP)" ;;
-      byteCap) echo "BYTECAP=$rest" ;;
-      cadenceMs) echo "CADENCE=$rest" ;;
-      idlePauseSec) echo "IDLEPAUSE=$rest" ;;
-      excludeApps|exclude) echo "EXCLUDES=$rest" ;;
-      titlePausePatterns|titlePause) echo "TITLEPAUSE=$rest" ;;
-      armOnLogin) echo "ARMONLOGIN=$([ "$rest" = "True" ] || [ "$rest" = "true" ] && echo 1 || echo 0)" ;;
-    esac
-  done)"
+if v.get("byteCapGb") not in (None, ""):
+    print("BYTECAP=%d" % int(float(v["byteCapGb"])*1024*1024*1024))
+elif v.get("byteCap") not in (None, ""):
+    print("BYTECAP=%d" % int(v["byteCap"]))
+if v.get("cadenceMs") not in (None, ""):
+    print("CADENCE=%d" % int(v["cadenceMs"]))
+if v.get("idlePauseSec") not in (None, ""):
+    print("IDLEPAUSE=%d" % int(v["idlePauseSec"]))
+ex=v.get("excludeApps") if v.get("excludeApps") not in (None, "") else v.get("exclude")
+if ex not in (None, ""):
+    if isinstance(ex, list):
+        ex=",".join(str(x) for x in ex)
+    print("EXCLUDES=%r" % ex)
+tp=v.get("titlePausePatterns") if v.get("titlePausePatterns") not in (None, "") else v.get("titlePause")
+if tp not in (None, ""):
+    if isinstance(tp, list):
+        tp=",".join(str(x) for x in tp)
+    print("TITLEPAUSE=%r" % tp)
+if "armOnLogin" in v:
+    print("ARMONLOGIN=%d" % (1 if v.get("armOnLogin") else 0))
+' "$line" 2>/dev/null || true)"
 }
 
 bytes_used() {
-  du -sk "$FRAMES" 2>/dev/null | awk '{print $1 * 1024}'
+  if [ ! -d "$FRAMES" ]; then
+    printf '0\n'
+    return 0
+  fi
+  du -sk "$FRAMES" 2>/dev/null | awk '{print $1 * 1024; found=1} END {if (!found) print 0}'
 }
 
 frame_count() {
-  find "$FRAMES" -type f 2>/dev/null | wc -l | tr -d ' '
+  if [ ! -d "$FRAMES" ]; then
+    printf '0\n'
+    return 0
+  fi
+  n=$(find "$FRAMES" -type f 2>/dev/null | wc -l | tr -d ' ')
+  printf '%s\n' "${n:-0}"
 }
 
 stats_json() {

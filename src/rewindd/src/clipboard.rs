@@ -122,9 +122,10 @@ fn ingest(shared: &DaemonState, raw: &str) {
         *g = text.clone();
     }
     let ts = now_ms();
-    let store = shared.store();
-    let _ = store.insert_clip(ts, "text/plain", &text);
-    let _ = store.record_clip_search(ts, &text);
+    let _ = shared.with_store(|store| {
+        let _ = store.insert_clip(ts, "text/plain", &text);
+        let _ = store.record_clip_search(ts, &text);
+    });
 }
 
 #[cfg(test)]

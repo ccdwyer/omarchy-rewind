@@ -15,20 +15,22 @@ pub struct DataPaths {
 }
 
 impl DataPaths {
-    pub fn prepare(root: &Path) -> Result<Self, String> {
-        install_umask();
-        secure_dir(root).map_err(|e| e.to_string())?;
-        let frames = root.join("frames");
-        let crops = root.join("crops");
-        secure_dir(&frames).map_err(|e| e.to_string())?;
-        secure_dir(&crops).map_err(|e| e.to_string())?;
-        let paths = Self {
+    pub fn bare(root: &Path) -> Self {
+        Self {
             root: root.to_path_buf(),
             db: root.join("rewind.db"),
             state: root.join("state.json"),
-            frames,
-            crops,
-        };
+            frames: root.join("frames"),
+            crops: root.join("crops"),
+        }
+    }
+
+    pub fn prepare(root: &Path) -> Result<Self, String> {
+        install_umask();
+        secure_dir(root).map_err(|e| e.to_string())?;
+        let paths = Self::bare(root);
+        secure_dir(&paths.frames).map_err(|e| e.to_string())?;
+        secure_dir(&paths.crops).map_err(|e| e.to_string())?;
         Ok(paths)
     }
 }

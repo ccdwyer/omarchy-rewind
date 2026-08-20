@@ -44,6 +44,9 @@ if ! command -v strace >/dev/null 2>&1; then
 fi
 
 LOG="$TMP/strace.log"
+OUT="$TMP/daemon.out"
+ERR="$TMP/daemon.err"
+set +e
 {
   echo '{"cmd":"consent","id":1,"armNow":true}'
   echo '{"cmd":"arm","id":2}'
@@ -51,7 +54,30 @@ LOG="$TMP/strace.log"
   echo '{"cmd":"stats","id":3}'
   echo '{"cmd":"disarm","id":4}'
   echo '{"cmd":"shutdown","id":5}'
-} | strace -e trace=network -o "$LOG" -f "$BIN" daemon || true
+} | strace -e trace=network -o "$LOG" -f "$BIN" daemon >"$OUT" 2>"$ERR"
+status=$?
+set -e
+
+if [ "$status" -ne 0 ]; then
+  echo "FAIL: rewindd/strace exited $status before completing the capture cycle" >&2
+  cat "$OUT" "$ERR" "$LOG" 2>/dev/null || true
+  exit 1
+fi
+if ! grep -q '"event":"ready"' "$OUT"; then
+  echo "FAIL: daemon never emitted ready; capture cycle did not start" >&2
+  cat "$OUT" "$ERR" >&2
+  exit 1
+fi
+if ! grep -q '"bye":true' "$OUT"; then
+  echo "FAIL: daemon did not complete shutdown; capture cycle did not finish" >&2
+  cat "$OUT" "$ERR" >&2
+  exit 1
+fi
+if ! grep -q '"event":"reply"' "$OUT"; then
+  echo "FAIL: daemon produced no command replies; capture cycle did not run" >&2
+  cat "$OUT" "$ERR" >&2
+  exit 1
+fi
 
 if grep -E 'connect\(|sendto\(|recvfrom\(' "$LOG" | grep -v 'UNIX' | grep -v 'AF_UNIX' >/dev/null 2>&1; then
   echo "FAIL: unexpected network syscall"

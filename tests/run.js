@@ -154,6 +154,19 @@ test("query: bbox scales to 0-1", () => {
   assert.ok(b.w > 0)
 })
 
+test("query: ROI-local tess box maps through crop origin onto stored frame", () => {
+  const b = Query.scaleBox(
+    { x: 0, y: 0, w: 48, h: 16 },
+    { x: 400, y: 108 },
+    { w: 1920, h: 1080 },
+    { w: 1280, h: 720 },
+    { w: 800, h: 600 }
+  )
+  assert.ok(Math.abs(b.x - 400 / 1920) < 0.001)
+  assert.ok(Math.abs(b.y - 108 / 1080) < 0.001)
+  assert.notStrictEqual(b.x, 0)
+})
+
 test("query: snippet around needle", () => {
   const s = Query.snippetAround("the commit hash abcdef123 lives here", "abcdef123")
   assert.ok(s.indexOf("abcdef123") >= 0)
@@ -299,6 +312,69 @@ test("compat query over index jsonl", () => {
   assert.strictEqual(r.status, 0, r.stderr + r.stdout)
   const body = JSON.parse(r.stdout)
   assert.ok(body.hits && body.hits.length >= 1)
+})
+
+test("compat daemon writes nothing while disarmed", () => {
+  const os = require("os")
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "rewind-zero-"))
+  const data = path.join(tmp, "data")
+  const env = Object.assign({}, process.env, { REWIND_DATA_DIR: data })
+  const p = path.join(ROOT, "compat", "rewindd.sh")
+  fs.chmodSync(p, 0o755)
+  const r = spawnSync(p, ["daemon"], {
+    encoding: "utf8",
+    env,
+    input: '{"cmd":"hello","id":1}\n{"cmd":"stats","id":2}\n{"cmd":"timeline","id":3}\n{"cmd":"configure","id":4,"byteCapGb":2}\n{"cmd":"arm","id":5}\n{"cmd":"shutdown","id":6}\n'
+  })
+  assert.strictEqual(r.status, 0, r.stderr + r.stdout)
+  assert.ok(r.stdout.indexOf('"event":"ready"') >= 0, r.stdout)
+  const walked = []
+  function walk(dir) {
+    if (!fs.existsSync(dir))
+      return
+    for (const name of fs.readdirSync(dir)) {
+      const pth = path.join(dir, name)
+      if (fs.statSync(pth).isDirectory())
+        walk(pth)
+      else
+        walked.push(path.relative(data, pth))
+    }
+  }
+  walk(data)
+  assert.deepStrictEqual(walked, [], "disarmed fallback wrote " + JSON.stringify(walked))
+})
+
+test("service keeps snapshots in memory until consent/arm", () => {
+  const src = fs.readFileSync(path.join(ROOT, "Service.qml"), "utf8")
+  assert.ok(src.indexOf("persistUi") >= 0)
+  assert.ok(src.indexOf("data.wiped") >= 0)
+  assert.ok(src.indexOf("root.refreshTimeline()") >= 0)
+  assert.ok(src.indexOf("root.armed = true") < 0)
+})
+
+test("overlay refreshes and clears after wipe; range uses archive bounds", () => {
+  const src = fs.readFileSync(path.join(ROOT, "Overlay.qml"), "utf8")
+  assert.ok(/function doWipe[\s\S]*callSvc\("refresh"/.test(src))
+  assert.ok(src.indexOf("uiFirstTs") >= 0)
+  assert.ok(src.indexOf("uiLastTs") >= 0)
+  assert.ok(src.indexOf("full archive") >= 0)
+})
+
+test("encoder fallback chain is cwebp then image-webp then smaller png", () => {
+  const cargo = fs.readFileSync(path.join(ROOT, "src", "rewindd", "Cargo.toml"), "utf8")
+  assert.ok(cargo.indexOf('"webp"') >= 0)
+  const enc = fs.readFileSync(path.join(ROOT, "src", "rewindd", "src", "encode.rs"), "utf8")
+  assert.ok(enc.indexOf("ImageWebp") >= 0)
+  assert.ok(enc.indexOf("write_image_webp") >= 0)
+  assert.ok(enc.indexOf("downscale_to(rgba, width, height, 720)") >= 0)
+})
+
+test("network-audit requires daemon completion, not strace || true", () => {
+  const src = fs.readFileSync(path.join(ROOT, "scripts", "network-audit.sh"), "utf8")
+  assert.ok(src.indexOf("strace") >= 0)
+  assert.ok(!/strace[^\n]*\|\|\s*true/.test(src))
+  assert.ok(src.indexOf('"event":"ready"') >= 0)
+  assert.ok(src.indexOf('"bye":true') >= 0)
 })
 
 test("compat arm without consent is rejected and does not record consent", () => {

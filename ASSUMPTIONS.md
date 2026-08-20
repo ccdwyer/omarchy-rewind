@@ -8,7 +8,7 @@ Conservative choices where the Omarchy / Quickshell / Hyprland API was not 100% 
 - **Injected properties used:** `omarchyPath`, `shell`, `manifest`, `pluginRegistry`, `bar` (host load). **Not used:** `serviceFor` / `firstPartyServiceFor`. Overlay and bar widget talk to the service only through documented `omarchy-shell shell summon|hide|toggle|call <id> …` plus FileView snapshots the service writes under `$XDG_DATA_HOME/rewind/` (`ui.json`, `timeline.json`, `clips.json`, `moment.json`, `hits.json`, `plan.json`).
 - **`keepLoaded: true`** so the overlay’s layer-shell window survives between summons (image-picker pattern). The spec’s kinds/entryPoints are otherwise unchanged.
 - **Settings are inline on the `shell.json` entry.** Widget keys live in `manifest.barWidget.defaults` + `schema`. The bar widget pushes them with `shell call … configure '<json>'`.
-- **Arm/consent persistence** is runtime state in `~/.local/share/rewind/state.json` (0600). Startup recording is `consentAt > 0 && armOnLogin` only; a bare persisted `armed` bit does not resume capture. `arm` is rejected until consent is recorded.
+- **Arm/consent persistence** is runtime state in `~/.local/share/rewind/state.json` (0600), written only after consent. A fresh disarmed launch does not create the data dir, SQLite, or UI snapshots; those exist only after consent/arm. Startup recording is `consentAt > 0 && armOnLogin` only; a bare persisted `armed` bit does not resume capture. `arm` is rejected until consent is recorded.
 - **IPC replies:** `IpcHandler` methods return a string (consumed via Process `StdioCollector waitForEnd`). Query/timeline/moment/plan payloads are also published to the snapshot files so the overlay never depends on discarded `execDetached` stdout.
 - **Third-party id** is `io.github.chris.rewind`. Never `omarchy.*`.
 
@@ -33,7 +33,7 @@ Conservative choices where the Omarchy / Quickshell / Hyprland API was not 100% 
 
 ## Encoder
 
-- Order: `cwebp` → PNG via the `image` crate. The spec’s “image crate WebP” step needs libwebp; it is not compiled in so the binary stays dependency-light. Encoder name is recorded on every frame and in `stats`.
+- Order: `cwebp` → image-crate WebP (`image` crate `webp` feature) → reduced-scale PNG (long edge 720, smaller than the 720p WebP path). Encoder name is recorded on every frame and in `stats`.
 
 ## Lock / idle / portal
 
@@ -46,7 +46,7 @@ Conservative choices where the Omarchy / Quickshell / Hyprland API was not 100% 
 
 - FTS5 over app + title + clipboard is written on every frame (including the current clipboard text). Independent clipboard events (their own timestamps) are attached to the **nearest frame** via `record_clip_search` and a LEFT JOIN / clip-table merge so OCR-free clipboard search hits a screenshot, not an orphan ts. LIKE fallback uses the same nearest-clip-before-frame rule.
 - Clipboard ingest is gated by the **full pause matrix** (not merely `armed`). While paused the in-memory clip cache is cleared so a later frame cannot attach a secret copied in KeePass etc.
-- Tesseract is optional, `nice -n 19`, TSV parse, crops deleted after. Word boxes are stored as fractions of the stored frame; QML maps them through `Query.fittedRect` onto the PreserveAspectFit painted area.
+- Tesseract is optional, `nice -n 19`, TSV parse, crops deleted after. Tesseract boxes are ROI-local; they are mapped through `crop_x/crop_y/crop_w/crop_h/out_w/out_h` into stored-frame 0..1 fractions. QML maps those through `Query.fittedRect` onto the PreserveAspectFit painted area.
 - `wl-paste -w` payloads are NUL-delimited so multiline clipboard text is one event (64 KB cap).
 
 ## Reopen & arrange
@@ -65,5 +65,5 @@ Conservative choices where the Omarchy / Quickshell / Hyprland API was not 100% 
 - **No committed 8-hour CPU% / GB/day.** Authoring host has no Hyprland. Planning numbers are the spec’s 25–80 KB/frame; live UI uses measured bytes.
 - **wlr-screencopy is feature-gated** (macOS cannot compile wayland). On Linux with the feature, the session is persistent; grim is fallback only.
 - **POSIX fallback does not record** (privacy). Query/wipe of existing data still work.
-- **image-crate WebP skipped** (native libwebp). PNG is the compiled fallback after `cwebp`.
+- **image-crate WebP is compiled in** (`webp` feature). PNG is only the last fallback, at a smaller scale than the 720p WebP path.
 - **At-rest encryption** remains a documented roadmap item (tribunal applied-changes).

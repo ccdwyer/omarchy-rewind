@@ -58,28 +58,60 @@ pub fn snippet_around(hay: &str, needle: &str) -> String {
 }
 
 /// Map a Tesseract box from crop-pixel space into stored-frame fractions 0..1.
+///
+/// Tesseract runs on the full-res focused-window ROI. The stored screenshot is
+/// a uniformly scaled copy of the whole output, so boxes must be offset by the
+/// crop origin and divided by the *output* size (not the ROI size).
 pub fn scale_box(
     crop_box: (f64, f64, f64, f64),
     crop_origin: (f64, f64),
     out: (f64, f64),
     stored: (f64, f64),
 ) -> WordBox {
+    scale_roi_to_frame(
+        crop_box,
+        crop_origin.0,
+        crop_origin.1,
+        0.0,
+        0.0,
+        out.0,
+        out.1,
+        stored.0,
+        stored.1,
+        "",
+    )
+}
+
+pub fn scale_roi_to_frame(
+    crop_box: (f64, f64, f64, f64),
+    crop_x: f64,
+    crop_y: f64,
+    crop_w: f64,
+    crop_h: f64,
+    out_w: f64,
+    out_h: f64,
+    stored_w: f64,
+    stored_h: f64,
+    word: &str,
+) -> WordBox {
     let (x, y, w, h) = crop_box;
-    let (ox, oy) = crop_origin;
-    let (out_w, out_h) = out;
-    let (sw, sh) = stored;
-    let sx = if out_w > 0.0 { sw / out_w } else { 1.0 };
-    let sy = if out_h > 0.0 { sh / out_h } else { 1.0 };
-    let fx = ((ox + x) * sx) / sw.max(1.0);
-    let fy = ((oy + y) * sy) / sh.max(1.0);
-    let fw = (w * sx) / sw.max(1.0);
-    let fh = (h * sy) / sh.max(1.0);
+    let ow = if out_w > 0.0 { out_w } else { stored_w.max(1.0) };
+    let oh = if out_h > 0.0 { out_h } else { stored_h.max(1.0) };
+    let sw = stored_w.max(1.0);
+    let sh = stored_h.max(1.0);
+    // Tesseract pixels are ROI-local in the crop_w×crop_h focused-window image.
+    // Stored frame is a uniform scale of the full output (out_w×out_h).
+    let _roi = (crop_w, crop_h);
+    let x_out = crop_x + x;
+    let y_out = crop_y + y;
+    let sx = sw / ow;
+    let sy = sh / oh;
     WordBox {
-        word: String::new(),
-        x: fx.clamp(0.0, 1.0),
-        y: fy.clamp(0.0, 1.0),
-        w: fw.clamp(0.0, 1.0),
-        h: fh.clamp(0.0, 1.0),
+        word: word.to_string(),
+        x: ((x_out * sx) / sw).clamp(0.0, 1.0),
+        y: ((y_out * sy) / sh).clamp(0.0, 1.0),
+        w: ((w * sx) / sw).clamp(0.0, 1.0),
+        h: ((h * sy) / sh).clamp(0.0, 1.0),
     }
 }
 
@@ -138,6 +170,30 @@ mod tests {
         let b = scale_box((10.0, 20.0, 30.0, 10.0), (100.0, 50.0), (200.0, 100.0), (100.0, 50.0));
         assert!((b.x - 0.55).abs() < 0.02);
         assert!(b.w > 0.0 && b.w < 1.0);
+    }
+
+    #[test]
+    fn roi_box_is_not_normalized_as_full_frame() {
+        // Crop at (400, 108) on a 1920×1080 output, stored 1280×720.
+        // Tess box at top-left of the ROI must land at 400/1920, not 0.
+        let b = scale_roi_to_frame(
+            (0.0, 0.0, 48.0, 16.0),
+            400.0,
+            108.0,
+            800.0,
+            600.0,
+            1920.0,
+            1080.0,
+            1280.0,
+            720.0,
+            "hi",
+        );
+        assert!((b.x - 400.0 / 1920.0).abs() < 0.001);
+        assert!((b.y - 108.0 / 1080.0).abs() < 0.001);
+        assert!((b.w - 48.0 / 1920.0).abs() < 0.001);
+        assert_ne!(b.x, 0.0);
+        // Treating the ROI as the full frame would put this box at 0.
+        assert!((b.x - 0.0).abs() > 0.1);
     }
 
     #[test]

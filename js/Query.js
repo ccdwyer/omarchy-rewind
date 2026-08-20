@@ -1,6 +1,6 @@
 .pragma library
 
-function scaleBox(cropBox, cropOrigin, outSize, storedSize) {
+function scaleBox(cropBox, cropOrigin, outSize, storedSize, cropSize) {
     var x = cropBox.x || 0
     var y = cropBox.y || 0
     var w = cropBox.w || 0
@@ -11,12 +11,19 @@ function scaleBox(cropBox, cropOrigin, outSize, storedSize) {
     var outH = outSize.h || 1
     var sw = storedSize.w || 1
     var sh = storedSize.h || 1
-    var sx = sw / outW
-    var sy = sh / outH
+    var cropW = (cropSize && cropSize.w) || 0
+    var cropH = (cropSize && cropSize.h) || 0
+    var ow = outW > 0 ? outW : sw
+    var oh = outH > 0 ? outH : sh
+    var sx = sw / ow
+    var sy = sh / oh
+    var xOut = ox + x
+    var yOut = oy + y
+    var _roi = cropW + cropH
     return {
         word: cropBox.word || "",
-        x: clamp01(((ox + x) * sx) / sw),
-        y: clamp01(((oy + y) * sy) / sh),
+        x: clamp01((xOut * sx) / sw),
+        y: clamp01((yOut * sy) / sh),
         w: clamp01((w * sx) / sw),
         h: clamp01((h * sy) / sh)
     }
