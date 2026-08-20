@@ -108,6 +108,9 @@ Item {
     }
   }
 
+  // `request` must be a Lua dispatcher (`hl.dsp.exec_cmd("…")`), not a classic
+  // `exec cmd` string. Hyprland 0.55+ wraps the dispatch argument as
+  // `hl.dispatch(<request>)`.
   function dispatchHypr(request) {
     if (!request)
       return false

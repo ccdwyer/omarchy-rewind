@@ -26,9 +26,9 @@ if command -v hyprctl >/dev/null 2>&1; then
   # sh -c payload — an unsanitized path containing a quote or shell metachar
   # would break the quoting (or inject). Keep only safe path characters.
   SAFE_PWD=$(pwd | tr -cd 'A-Za-z0-9/._ -')
-  hyprctl dispatch exec "kitty --hold sh -c 'echo $PHRASE; echo typed in $SAFE_PWD; exec zsh'" || true
+  hyprctl dispatch "hl.dsp.exec_cmd(\"kitty --hold sh -c 'echo $PHRASE; echo typed in $SAFE_PWD; exec zsh'\")" || true
   sleep 1
-  hyprctl dispatch exec "kitty --hold sh -c 'echo second window; exec zsh'" || true
+  hyprctl dispatch "hl.dsp.exec_cmd(\"kitty --hold sh -c 'echo second window; exec zsh'\")" || true
 else
   say "hyprctl missing — type $PHRASE yourself and copy $HASH"
 fi

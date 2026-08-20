@@ -161,32 +161,74 @@ pub fn parse_monitors(raw: &str) -> Result<Vec<Monitor>, String> {
         .collect())
 }
 
-pub fn dispatch(request: &str) -> Result<(), String> {
-    let status = Command::new("hyprctl")
-        .args(["dispatch"])
-        .arg(request)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| e.to_string())?;
-    if status.success() {
-        Ok(())
+/// Quote `s` as a Lua double-quoted string.
+pub fn lua_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn window_sel(addr: &str) -> String {
+    if addr.starts_with("address:") {
+        lua_quote(addr)
     } else {
-        Err(format!("hyprctl dispatch failed: {request}"))
+        lua_quote(&format!("address:{addr}"))
     }
 }
 
-/// Run `hyprctl dispatch <dispatcher> <arg>` with the dispatcher and its
-/// argument as SEPARATE argv items — the form Hyprland's dispatch expects.
-/// Passing the whole "dispatcher arg" string as one argv (as `dispatch` above
-/// does) mis-parses multi-word dispatchers; reopen must use this. Returns the
-/// real exit status so a failed step is not silently counted as success.
-pub fn dispatch_parts(dispatcher: &str, arg: &str) -> Result<(), String> {
+/// `hl.dsp.exec_cmd(cmd)` or `hl.dsp.exec_cmd(cmd, { workspace = "N" })`.
+/// Do not use the classic `[workspace N silent] cmd` exec prefix.
+pub fn exec_cmd_expr(cmd: &str, workspace: Option<&str>) -> String {
+    match workspace {
+        Some(ws) if !ws.is_empty() => format!(
+            "hl.dsp.exec_cmd({}, {{ workspace = {} }})",
+            lua_quote(cmd),
+            lua_quote(ws)
+        ),
+        _ => format!("hl.dsp.exec_cmd({})", lua_quote(cmd)),
+    }
+}
+
+/// Silent move: `hl.dsp.window.move({ workspace = "N", follow = false, window = "address:0x…" })`.
+pub fn move_to_workspace_expr(addr: &str, workspace: &str) -> String {
+    format!(
+        "hl.dsp.window.move({{ workspace = {}, follow = false, window = {} }})",
+        lua_quote(workspace),
+        window_sel(addr)
+    )
+}
+
+/// Absolute pixel move: `hl.dsp.window.move({ x = X, y = Y, relative = false, window = "address:0x…" })`.
+pub fn move_pixel_expr(addr: &str, x: i64, y: i64) -> String {
+    format!(
+        "hl.dsp.window.move({{ x = {x}, y = {y}, relative = false, window = {} }})",
+        window_sel(addr)
+    )
+}
+
+/// Run `hyprctl dispatch <lua-expr>` with the Lua dispatcher as a SINGLE argv
+/// item. Hyprland 0.55+ wraps that as `hl.dispatch(<expr>)`; splitting a
+/// classic dispatcher name and argument into two argv items concatenates them
+/// into invalid Lua (`hl.dispatch(exec kitty)`) and the action is a no-op.
+pub fn dispatch(expr: &str) -> Result<(), String> {
+    dispatch_lua(expr)
+}
+
+pub fn dispatch_lua(expr: &str) -> Result<(), String> {
     let status = Command::new("hyprctl")
         .arg("dispatch")
-        .arg(dispatcher)
-        .arg(arg)
+        .arg(expr)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -195,7 +237,7 @@ pub fn dispatch_parts(dispatcher: &str, arg: &str) -> Result<(), String> {
     if status.success() {
         Ok(())
     } else {
-        Err(format!("hyprctl dispatch {dispatcher} {arg} failed"))
+        Err(format!("hyprctl dispatch failed: {expr}"))
     }
 }
 
@@ -410,5 +452,40 @@ mod tests {
         // A webcam (Video/Source) without a screencast marker is not a share.
         let cam = r#"[{"info":{"props":{"node.name":"v4l2 Camera","media.class":"Video/Source"}}}]"#;
         assert!(!parse_portal_dump(cam));
+    }
+
+    #[test]
+    fn lua_quote_escapes_quotes_and_backslashes() {
+        assert_eq!(lua_quote("true"), "\"true\"");
+        assert_eq!(lua_quote(r#"say "hi""#), r#""say \"hi\"""#);
+        assert_eq!(lua_quote(r#"a\b"#), r#""a\\b""#);
+    }
+
+    #[test]
+    fn exec_cmd_expr_uses_lua_workspace_table_not_classic_prefix() {
+        assert_eq!(exec_cmd_expr("true", None), r#"hl.dsp.exec_cmd("true")"#);
+        assert_eq!(
+            exec_cmd_expr("kitty", Some("4")),
+            r#"hl.dsp.exec_cmd("kitty", { workspace = "4" })"#
+        );
+        let expr = exec_cmd_expr("kitty --hold", Some("4"));
+        assert!(!expr.contains("[workspace"));
+        assert!(!expr.contains("silent]"));
+    }
+
+    #[test]
+    fn window_move_exprs_are_lua_tables() {
+        assert_eq!(
+            move_to_workspace_expr("0xabc", "3"),
+            r#"hl.dsp.window.move({ workspace = "3", follow = false, window = "address:0xabc" })"#
+        );
+        assert_eq!(
+            move_to_workspace_expr("address:0xabc", "3"),
+            r#"hl.dsp.window.move({ workspace = "3", follow = false, window = "address:0xabc" })"#
+        );
+        assert_eq!(
+            move_pixel_expr("0xabc", 10, 20),
+            r#"hl.dsp.window.move({ x = 10, y = 20, relative = false, window = "address:0xabc" })"#
+        );
     }
 }

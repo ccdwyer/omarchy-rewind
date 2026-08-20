@@ -633,23 +633,22 @@ fn execute_plan(plan: serde_json::Value) -> Result<serde_json::Value, String> {
     let mut failed = Vec::new();
     for step in steps {
         let kind = step.get("kind").and_then(|k| k.as_str()).unwrap_or("");
-        // Each dispatch passes the dispatcher and its argument as SEPARATE argv
-        // items (dispatch_parts), and we record the step only when hyprctl
-        // actually reports success — a failed step is surfaced, never counted
-        // as done.
+        // Hyprland 0.55+ wraps `hyprctl dispatch <arg>` as `hl.dispatch(<arg>)`.
+        // Classic two-argv dispatchers concatenate into invalid Lua and no-op.
+        // Each step is a single Lua expr; record it only when hyprctl succeeds.
         let result: Option<Result<(), String>> = match kind {
             "exec" => step.get("cmd").and_then(|c| c.as_str()).map(|cmd| {
                 let ws = step.get("workspace").and_then(|w| w.as_i64()).unwrap_or(1);
-                hypr::dispatch_parts("exec", &format!("[workspace {ws} silent] {cmd}"))
+                hypr::dispatch_lua(&hypr::exec_cmd_expr(cmd, Some(&ws.to_string())))
             }),
             "move" => match (
                 step.get("address").and_then(|a| a.as_str()),
                 step.get("workspace").and_then(|w| w.as_i64()),
             ) {
-                (Some(addr), Some(ws)) => Some(hypr::dispatch_parts(
-                    "movetoworkspacesilent",
-                    &format!("{ws},address:{addr}"),
-                )),
+                (Some(addr), Some(ws)) => Some(hypr::dispatch_lua(&hypr::move_to_workspace_expr(
+                    addr,
+                    &ws.to_string(),
+                ))),
                 _ => None,
             },
             "geometry" => match (
@@ -657,10 +656,9 @@ fn execute_plan(plan: serde_json::Value) -> Result<serde_json::Value, String> {
                 step.get("x").and_then(|v| v.as_i64()),
                 step.get("y").and_then(|v| v.as_i64()),
             ) {
-                (Some(addr), Some(x), Some(y)) => Some(hypr::dispatch_parts(
-                    "movewindowpixel",
-                    &format!("exact {x} {y},address:{addr}"),
-                )),
+                (Some(addr), Some(x), Some(y)) => {
+                    Some(hypr::dispatch_lua(&hypr::move_pixel_expr(addr, x, y)))
+                }
                 _ => None,
             },
             _ => None,

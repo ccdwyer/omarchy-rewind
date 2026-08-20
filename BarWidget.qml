@@ -34,7 +34,10 @@ BarWidget {
 
   function callShell(method, arg) {
     var payload = arg === undefined || arg === null || String(arg).length === 0 ? "{}" : String(arg)
-    Quickshell.execDetached(["omarchy-shell", "shell", "call", root.moduleName, method, payload])
+    // Plugin IpcHandler (`omarchy-shell <id> <method>`), not `shell call`.
+    // `shell call` looks up the overlay panelLoader, which has toggle() for
+    // the overlay UI — not toggleArm/configure/status.
+    Quickshell.execDetached(["omarchy-shell", root.moduleName, method, payload])
   }
 
   function pushSettings() {
@@ -55,13 +58,13 @@ BarWidget {
     // AFTER the helper actually arms/disarms and emits its `state` event) and
     // the periodic status poll. So the dot can never show "disarmed" while
     // recording is on, nor optimistically flip before the helper acknowledges.
-    Quickshell.execDetached(["omarchy-shell", "shell", "call", root.moduleName, "toggleArm", "{}"])
+    Quickshell.execDetached(["omarchy-shell", root.moduleName, "toggleArm", "{}"])
   }
 
   function pollStatus() {
     if (statusProc.running)
       return
-    statusProc.command = ["omarchy-shell", "shell", "call", root.moduleName, "status", "{}"]
+    statusProc.command = ["omarchy-shell", root.moduleName, "status", "{}"]
     statusProc.running = true
   }
 
