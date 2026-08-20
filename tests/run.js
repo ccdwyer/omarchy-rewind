@@ -533,7 +533,7 @@ test("service gates snapshots on consent and serves the overlay while open", () 
 
 test("disarm never optimistically flips state; helper ack is authoritative", () => {
   const src = fs.readFileSync(path.join(ROOT, "Service.qml"), "utf8")
-  const dis = (src.split("function disarm()")[1] || "").split("function toggleArm")[0]
+  const dis = (src.split("function disarm")[1] || "").split("function toggleArm")[0]
   // No optimistic local mutation — the helper's state event flips armed.
   assert.ok(dis.indexOf("root.armed = false") < 0, "disarm must not optimistically set armed")
   assert.ok(dis.indexOf('send("disarm"') >= 0)
