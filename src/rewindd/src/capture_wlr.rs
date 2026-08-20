@@ -204,14 +204,19 @@ impl Session {
 
 fn pick_output(state: &State) -> Option<WlOutput> {
     if state.want_output.is_empty() {
+        // No specific output requested (e.g. single-output session); the first
+        // is unambiguous.
         return state.outputs.first().map(|o| o.1.clone());
     }
+    // A focused output WAS named. Match it exactly and NEVER substitute a
+    // different one — recording a sensitive secondary display would be a privacy
+    // leak. On no match, return None so `grab` errors and the caller falls back
+    // to `grim -o <focused-output>`, which targets the correct display.
     state
         .outputs
         .iter()
         .find(|o| o.2 == state.want_output)
         .map(|o| o.1.clone())
-        .or_else(|| state.outputs.first().map(|o| o.1.clone()))
 }
 
 fn shm_file(size: i64) -> Result<(OwnedFd, File), String> {

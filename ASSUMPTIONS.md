@@ -81,6 +81,28 @@ Conservative choices where the Omarchy / Quickshell / Hyprland API was not 100% 
   ticket (the generation) at start; `write_allowed`/`still_armed` require the
   ticket to still match, so a job begun before a disarm cannot commit after a
   rapid disarm→re-arm. Regression: `stale_ticket_after_disarm_rearm_cannot_commit`.
+- **Privacy epoch (all pauses, not just disarm).** The arm generation only moves
+  on arm/disarm, but capture must also be dropped when a NON-disarm privacy pause
+  (lock, idle, overlay, portal, per-app exclusion, private-browsing, title-pattern)
+  begins *during* the blocking grab/read/tesseract. A monotonic `privacy_epoch`
+  is bumped on every pause-state transition (via `note_pause_change` and on
+  disarm). Each capture/clip/OCR job samples both the arm ticket AND the epoch at
+  entry, before blocking work; `still_recording` = ticket-match AND epoch-unchanged,
+  and every commit additionally re-observes the live pause (`refresh_pause`) and
+  rejects if paused now. `capture_once` re-checks immediately after the grab.
+  Regressions: `capture_privacy_pause_during_grab_does_not_commit`,
+  `armed_unpaused_capture_writes_a_frame` (guards against over-rejection).
+- **Clip cache is generation+epoch tagged, publish-after-commit.** The last-clip
+  cache holds `{text, gen, epoch}` and is populated ONLY after a clip actually
+  commits; a rejected/paused clip is never cached. `latest_cached(gen, epoch)`
+  returns a clip only for a frame carrying the exact same tag, and the cache is
+  cleared on disarm and on every pause transition — so a clip copied in one
+  recording window can never attach to a frame from another (no search-data
+  leak). Regression: `clip_cache_cleared_and_not_attached_across_privacy_pause`.
+- **Focused-output capture never substitutes.** When a focused output name is
+  requested but has no exact wlr registry match, `pick_output` returns `None`
+  (the wlr grab errors) and capture falls back to `grim -o <focused-output>` —
+  it never silently records a different (possibly sensitive) display.
 - **Atomic byte-cap.** Oldest-first pruning runs inside the capture insert
   transaction (`prune_within_tx`); file unlinks happen only after commit. A
   prune error rolls back the whole capture, so a capture never reports success

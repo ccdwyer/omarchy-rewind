@@ -7,10 +7,21 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-static LAST: OnceLock<Mutex<String>> = OnceLock::new();
+/// A cached clip is tagged with the (arm generation, privacy epoch) it was
+/// committed under. `latest_cached` only returns it for a frame carrying the
+/// exact same tag, so a clip can only ever attach to a frame from the same
+/// uninterrupted recording window — never resurrected across a disarm or a
+/// privacy pause.
+struct Cached {
+    text: String,
+    gen: u64,
+    epoch: u64,
+}
 
-fn cache() -> &'static Mutex<String> {
-    LAST.get_or_init(|| Mutex::new(String::new()))
+static LAST: OnceLock<Mutex<Option<Cached>>> = OnceLock::new();
+
+fn cache() -> &'static Mutex<Option<Cached>> {
+    LAST.get_or_init(|| Mutex::new(None))
 }
 
 #[cfg(test)]
@@ -36,18 +47,22 @@ fn fire_after_ticket_hook() {
     });
 }
 
-pub fn latest_cached() -> Option<String> {
+/// Return the cached clip only if it was committed under the same arm
+/// generation AND privacy epoch as the frame being finalized. Any mismatch
+/// (stale generation, a pause transition since, or nothing cached) yields None.
+pub(crate) fn latest_cached(gen: u64, epoch: u64) -> Option<String> {
     let g = cache().lock().ok()?;
-    if g.is_empty() {
-        None
+    let c = g.as_ref()?;
+    if c.gen == gen && c.epoch == epoch && !c.text.is_empty() {
+        Some(c.text.clone())
     } else {
-        Some(g.clone())
+        None
     }
 }
 
-fn clear_cached() {
+pub(crate) fn clear_cached() {
     if let Ok(mut g) = cache().lock() {
-        g.clear();
+        *g = None;
     }
 }
 
@@ -140,6 +155,10 @@ pub(crate) fn ingest(shared: &DaemonState, raw: &str) {
         clear_cached();
         return;
     };
+    // Sample the privacy epoch alongside the ticket, before any processing. Both
+    // must still hold at commit, so a disarm OR any privacy pause that begins
+    // between here and the commit invalidates this clip.
+    let epoch0 = shared.privacy_epoch();
     // Test-only: let a test disarm→re-arm here, between ticket capture and the
     // commit below, to prove the retained ticket (not the live `arm.gen`) gates
     // the write.
@@ -152,24 +171,43 @@ pub(crate) fn ingest(shared: &DaemonState, raw: &str) {
         clear_cached();
         return;
     }
-    {
-        let mut g = cache().lock().unwrap();
-        if *g == text {
-            return;
+    // Dedup: this exact clip is already cached for this recording window.
+    if let Ok(g) = cache().lock() {
+        if let Some(c) = g.as_ref() {
+            if c.gen == ticket && c.epoch == epoch0 && c.text == text {
+                return;
+            }
         }
-        *g = text.clone();
     }
-    crate::with_arm_read(shared, |arm| {
-        if !crate::write_allowed(shared, arm, ticket) {
-            return;
+    // Commit FIRST, under the gate and the original (ticket, epoch); publish to
+    // the cache only on success. Caching before validation would let a rejected
+    // clip attach to the next valid frame (leaking into search data), so the
+    // cache is only ever populated with a clip that actually committed.
+    let committed = crate::with_arm_read(shared, |arm| {
+        if !crate::write_allowed(shared, arm, ticket) || shared.privacy_epoch() != epoch0 {
+            return false;
         }
         let ts = now_ms();
-        let _ = shared.with_store_mut(|store| {
-            let _ = store.commit_clip_tx(ts, "text/plain", &text, || {
-                crate::write_allowed(shared, arm, ticket)
-            });
-        });
+        shared
+            .with_store_mut(|store| {
+                store.commit_clip_tx(ts, "text/plain", &text, || {
+                    crate::write_allowed(shared, arm, ticket) && shared.privacy_epoch() == epoch0
+                })
+            })
+            .unwrap_or(Ok(false))
+            .unwrap_or(false)
     });
+    if committed {
+        if let Ok(mut g) = cache().lock() {
+            *g = Some(Cached {
+                text,
+                gen: ticket,
+                epoch: epoch0,
+            });
+        }
+    } else {
+        clear_cached();
+    }
 }
 
 #[cfg(test)]

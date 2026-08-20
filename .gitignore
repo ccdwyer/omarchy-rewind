@@ -11,3 +11,6 @@
 .review*
 .round*
 .serena/
+.fix_agent_*.md
+.review_prompt*.md
+.fix_prompt_*.md

@@ -89,6 +89,15 @@ pub(crate) struct Shared {
     capture_backend: Mutex<String>,
     last_pause: Mutex<Option<PauseReason>>,
     arm_gen: AtomicU64,
+    /// Monotonic privacy epoch. Bumped under `last_pause`'s lock on EVERY
+    /// pause-state transition (lock, idle, overlay, portal, exclusion,
+    /// private-browsing, title-pattern, disarm — on and off). A capture/OCR/clip
+    /// job records the epoch at entry, before any blocking work, and every
+    /// commit requires the epoch to be unchanged AND the session to be currently
+    /// not paused. This closes the window where a privacy pause *begins during*
+    /// the blocking grab/read/tesseract and the frame/clip would otherwise still
+    /// commit (the arm generation alone does not move on a non-disarm pause).
+    privacy_epoch: AtomicU64,
     tripwire: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
@@ -125,6 +134,7 @@ fn boot_shared(data_dir: &Path) -> Result<Arc<Shared>, String> {
         capture_backend: Mutex::new(capture::backend_name().to_string()),
         last_pause: Mutex::new(None),
         arm_gen: AtomicU64::new(if armed { 1 } else { 0 }),
+        privacy_epoch: AtomicU64::new(0),
         tripwire: Mutex::new(None),
     }))
 }
@@ -420,6 +430,10 @@ fn disarm_now(shared: &Shared) {
         let mut st = shared.settings.lock().unwrap();
         st.armed = false;
     }
+    // A disarm is also a privacy transition; advance the epoch and drop any
+    // cached clip so a re-arm cannot resurrect a clip copied around the disarm.
+    shared.privacy_epoch.fetch_add(1, Ordering::SeqCst);
+    clipboard::clear_cached();
     drop_writable_store(shared);
 }
 
@@ -657,11 +671,35 @@ fn discard_capture_files(files: &[PathBuf]) {
     }
 }
 
+/// Observe the live pause state and, if it transitioned since the last
+/// observation, bump the privacy epoch and record the pause/resume event.
+/// Returns the current pause reason (None = recording). This is the single
+/// point where the epoch advances, so a capture/OCR/clip job that samples the
+/// epoch at entry and re-checks it (or calls this) before commit cannot write
+/// material captured across a privacy pause that began mid-work.
+fn refresh_pause(shared: &Shared) -> Option<PauseReason> {
+    let reason = evaluate_pause(shared);
+    note_pause_change(shared, reason.clone());
+    reason
+}
+
+/// Live recording check for a running job: arm generation still matches the
+/// job's ticket AND no privacy transition has occurred since the job's epoch.
+pub(crate) fn still_recording(shared: &Shared, gen: u64, epoch0: u64) -> bool {
+    still_armed(shared, gen) && shared.privacy_epoch.load(Ordering::SeqCst) == epoch0
+}
+
 fn note_pause_change(shared: &Shared, reason: Option<PauseReason>) {
     let mut prev = shared.last_pause.lock().unwrap();
     if prev.as_ref() == reason.as_ref() {
         return;
     }
+    // Every transition (pause on, pause off, pause-reason change) advances the
+    // privacy epoch under this same lock, and invalidates any cached clip: a
+    // clip copied in one recording window must never attach to a frame from a
+    // different one.
+    shared.privacy_epoch.fetch_add(1, Ordering::SeqCst);
+    clipboard::clear_cached();
     with_arm_read(shared, |arm| {
         // A pause/resume event is an in-the-moment write; authorize against the
         // live generation held under this same read guard.
@@ -689,23 +727,38 @@ fn finalize_capture(
     files: &[PathBuf],
     clients: &[hypr::Client],
     ticket: u64,
+    epoch0: u64,
 ) -> Result<bool, String> {
+    // Re-observe the live pause state right before committing (outside the gate,
+    // since it does compositor IO): a pause that engaged during the preceding
+    // encode/crop work bumps the epoch here, so the epoch check below rejects
+    // the frame. `live.is_some()` also rejects a pause that is active *now*.
+    let live = refresh_pause(shared);
     // Hold the gate read lock across the whole commit so a concurrent disarm
     // (which needs the write lock) cannot interleave between the authorization
     // check and the transaction commit.
     with_arm_read(shared, |arm| {
-        if !write_allowed(shared, arm, ticket) {
+        let epoch_ok = shared.privacy_epoch.load(Ordering::SeqCst) == epoch0;
+        if !write_allowed(shared, arm, ticket) || !epoch_ok || live.is_some() {
             discard_capture_files(files);
             return Ok(false);
         }
-        let clip = clipboard::latest_cached().unwrap_or_default();
+        // Attach only a clip committed under this frame's exact (generation,
+        // epoch); `None` for anything stale or from a different recording
+        // window, so a rejected/paused clip can never leak into search data.
+        let clip = clipboard::latest_cached(ticket, epoch0).unwrap_or_default();
+        // Re-checked at each step INSIDE the transaction: still armed under the
+        // original ticket AND no privacy transition since the job's epoch.
         match shared.with_store_mut(|store| {
             store.commit_capture_tx(insert, clients, &clip, settings.byte_cap, || {
                 write_allowed(shared, arm, ticket)
+                    && shared.privacy_epoch.load(Ordering::SeqCst) == epoch0
             })
         }) {
             Some(Ok(true)) => {
-                if write_allowed(shared, arm, ticket) {
+                if write_allowed(shared, arm, ticket)
+                    && shared.privacy_epoch.load(Ordering::SeqCst) == epoch0
+                {
                     Ok(true)
                 } else {
                     discard_capture_files(files);
@@ -776,11 +829,19 @@ fn capture_once(
     let Some(gen) = arm_ticket(shared) else {
         return Ok(false);
     };
+    // Sample the privacy epoch alongside the arm ticket, before any blocking
+    // work. A lock/idle/overlay/portal/exclusion pause that *begins during* the
+    // grab bumps the epoch (via `refresh_pause`), so `still_recording` and the
+    // commit gate reject this frame even though the arm generation is unchanged.
+    let epoch0 = shared.privacy_epoch.load(Ordering::SeqCst);
     let monitor = hypr::focused_monitor().unwrap_or_default();
     let active = hypr::active_window().unwrap_or_default();
     let clients = hypr::clients().unwrap_or_default();
     let raw = session.grab(&monitor.name)?;
-    if !still_armed(shared, gen) {
+    // Re-evaluate pause immediately after the blocking grab: if a pause became
+    // active while we were blocked, this bumps the epoch and returns Some, so we
+    // drop the frame now rather than committing content from a paused moment.
+    if refresh_pause(shared).is_some() || !still_recording(shared, gen, epoch0) {
         return Ok(false);
     }
     let hash = dhash::compute(&raw.rgba, raw.width, raw.height);
@@ -791,15 +852,15 @@ fn capture_once(
     }
 
     let scaled = encode::downscale_720p(&raw.rgba, raw.width, raw.height);
-    if !still_armed(shared, gen) {
+    if !still_recording(shared, gen, epoch0) {
         return Ok(false);
     }
 
-    if !still_armed(shared, gen) {
+    if !still_recording(shared, gen, epoch0) {
         return Ok(false);
     }
     ensure_store(shared)?;
-    if !still_armed(shared, gen) {
+    if !still_recording(shared, gen, epoch0) {
         return Ok(false);
     }
 
@@ -814,12 +875,12 @@ fn capture_once(
     if let Some(parent) = dest.parent() {
         perms::secure_dir(parent).map_err(|e| e.to_string())?;
     }
-    if !still_armed(shared, gen) {
+    if !still_recording(shared, gen, epoch0) {
         return Ok(false);
     }
     let (enc, written) = encode::encode_frame(&scaled.bytes, scaled.width, scaled.height, &dest)?;
     let mut files = vec![written.clone()];
-    if !still_armed(shared, gen) {
+    if !still_recording(shared, gen, epoch0) {
         discard_capture_files(&files);
         return Ok(false);
     }
@@ -835,7 +896,7 @@ fn capture_once(
     let mut crop_w = raw.width as i64;
     let mut crop_h = raw.height as i64;
     if let Some(roi) = encode::crop_roi(&raw.rgba, raw.width, raw.height, &active, &monitor) {
-        if !still_armed(shared, gen) {
+        if !still_recording(shared, gen, epoch0) {
             discard_capture_files(&files);
             return Ok(false);
         }
@@ -858,7 +919,7 @@ fn capture_once(
         crop_rel = Some(crop_name);
     }
 
-    if !still_armed(shared, gen) {
+    if !still_recording(shared, gen, epoch0) {
         discard_capture_files(&files);
         return Ok(false);
     }
@@ -887,7 +948,7 @@ fn capture_once(
         crop_path: crop_rel,
     };
 
-    if !finalize_capture(shared, settings, &insert, &files, &clients, gen)? {
+    if !finalize_capture(shared, settings, &insert, &files, &clients, gen, epoch0)? {
         return Ok(false);
     }
 
@@ -1094,6 +1155,12 @@ impl Shared {
 
     pub fn is_recording(&self) -> bool {
         evaluate_pause(self).is_none()
+    }
+
+    /// Current privacy epoch. A job samples this at entry and requires it to be
+    /// unchanged at commit; any pause transition in between advances it.
+    pub(crate) fn privacy_epoch(&self) -> u64 {
+        self.privacy_epoch.load(Ordering::SeqCst)
     }
 
     pub fn is_idle(&self) -> bool {
@@ -1505,6 +1572,119 @@ mod tests {
             "no frame rows for a capture whose grab spanned disarm/re-arm"
         );
         assert_eq!(counts.1, 0, "no event rows either");
+        std::env::remove_var("REWIND_TEST_CAPTURE");
+    }
+
+    #[test]
+    fn armed_unpaused_capture_writes_a_frame() {
+        // Guard against the privacy-epoch/pause rechecks over-rejecting: a
+        // normal armed capture with no pause must still commit exactly one
+        // frame.
+        let _env = TEST_CAPTURE_ENV_LOCK.lock().unwrap();
+        std::env::set_var("REWIND_TEST_CAPTURE", "1");
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("rewind");
+        let shared = boot_shared(&data).unwrap();
+        {
+            let mut st = shared.settings.lock().unwrap();
+            st.consent_at = now_ms();
+        }
+        persist_consent(&shared).unwrap();
+        arm_now(&shared).unwrap();
+        let settings = shared.settings.lock().unwrap().clone();
+
+        let mut session = capture::CaptureSession::new();
+        let _ = capture_once(&shared, &settings, &mut session).unwrap();
+
+        let counts = shared
+            .with_store(|s| s.mutation_counters().unwrap())
+            .unwrap();
+        assert_eq!(counts.0, 1, "an armed, unpaused capture must write one frame");
+        std::env::remove_var("REWIND_TEST_CAPTURE");
+    }
+
+    #[test]
+    fn capture_privacy_pause_during_grab_does_not_commit() {
+        // A NON-disarm privacy pause (here: the overlay opening) that begins
+        // *during* the blocking grab must drop the frame. The arm generation is
+        // unchanged across an overlay pause, so this is caught only by the
+        // privacy-epoch/live-pause recheck, not by the arm-generation guard.
+        let _env = TEST_CAPTURE_ENV_LOCK.lock().unwrap();
+        std::env::set_var("REWIND_TEST_CAPTURE", "1");
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("rewind");
+        let shared = boot_shared(&data).unwrap();
+        {
+            let mut st = shared.settings.lock().unwrap();
+            st.consent_at = now_ms();
+        }
+        persist_consent(&shared).unwrap();
+        arm_now(&shared).unwrap();
+        let settings = shared.settings.lock().unwrap().clone();
+
+        let mut session = capture::CaptureSession::new();
+        // Overlay opens mid-grab — a privacy pause with the SAME arm generation.
+        let hook_shared = shared.clone();
+        session.set_grab_hook(Box::new(move || {
+            hook_shared.overlay_open.store(true, Ordering::SeqCst);
+        }));
+
+        let kept = capture_once(&shared, &settings, &mut session).unwrap();
+        assert!(!kept, "a frame grabbed as the overlay opened must be dropped");
+
+        let counts = shared
+            .with_store(|s| s.mutation_counters().unwrap())
+            .unwrap();
+        assert_eq!(
+            counts.0, 0,
+            "no frame rows for a capture whose grab spanned an overlay pause"
+        );
+        std::env::remove_var("REWIND_TEST_CAPTURE");
+    }
+
+    #[test]
+    fn clip_cache_cleared_and_not_attached_across_privacy_pause() {
+        // A clip committed in one recording window must not attach to a frame in
+        // another: any privacy transition advances the epoch and clears the
+        // cache, so `latest_cached` for the old (gen, epoch) yields nothing.
+        let _env = TEST_CAPTURE_ENV_LOCK.lock().unwrap();
+        std::env::set_var("REWIND_TEST_CAPTURE", "1");
+        clipboard::clear_cached();
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("rewind");
+        let shared = boot_shared(&data).unwrap();
+        {
+            let mut st = shared.settings.lock().unwrap();
+            st.consent_at = now_ms();
+        }
+        persist_consent(&shared).unwrap();
+        arm_now(&shared).unwrap();
+
+        let gen = arm_ticket(&shared).unwrap();
+        let epoch = shared.privacy_epoch();
+        clipboard::ingest(&shared, "AKIA-DISTINCTIVE-WINDOW-CLIP");
+        assert_eq!(
+            clipboard::latest_cached(gen, epoch).as_deref(),
+            Some("AKIA-DISTINCTIVE-WINDOW-CLIP"),
+            "clip should be cached under its own (gen, epoch) right after commit"
+        );
+
+        // A privacy transition (overlay on, then off) advances the epoch and
+        // clears the cache.
+        shared.overlay_open.store(true, Ordering::SeqCst);
+        note_pause_change(&shared, evaluate_pause(&shared));
+        shared.overlay_open.store(false, Ordering::SeqCst);
+        note_pause_change(&shared, evaluate_pause(&shared));
+
+        assert!(
+            shared.privacy_epoch() != epoch,
+            "epoch must advance across a pause transition"
+        );
+        assert!(
+            clipboard::latest_cached(gen, epoch).is_none(),
+            "stale clip must not be retrievable for the pre-transition window"
+        );
+        clipboard::clear_cached();
         std::env::remove_var("REWIND_TEST_CAPTURE");
     }
 

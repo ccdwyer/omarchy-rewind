@@ -37,6 +37,9 @@ pub(crate) fn process_pending(shared: &DaemonState) -> i64 {
         Some(g) => g,
         None => return 0,
     };
+    // Sample the privacy epoch with the ticket; a pause transition during the
+    // blocking tesseract run advances it and blocks the OCR commit below.
+    let epoch0 = shared.privacy_epoch();
     let pending = match shared.with_store(|s| s.pending_crops()) {
         Some(Ok(p)) => p,
         _ => return 0,
@@ -44,7 +47,7 @@ pub(crate) fn process_pending(shared: &DaemonState) -> i64 {
     let queued = pending.len() as i64;
     let mut done = 0i64;
     for (ts, rel) in pending {
-        if !crate::still_armed(shared, gen) || !shared.is_idle() {
+        if !crate::still_recording(shared, gen, epoch0) || !shared.is_idle() {
             break;
         }
         let path = shared.data_paths().root.join(&rel);
@@ -53,7 +56,13 @@ pub(crate) fn process_pending(shared: &DaemonState) -> i64 {
         }
         match run_tesseract(&path) {
             Ok((text, raw_boxes)) => {
-                if !crate::still_armed(shared, gen) {
+                // Re-check AFTER the blocking tesseract run, before committing:
+                // `is_idle()` re-evaluates live compositor state, so if the user
+                // resumed activity mid-OCR we stop; `still_recording` rejects a
+                // disarm or any privacy-pause transition observed since entry.
+                // (Idle is itself the expected OCR condition, so we must not
+                // treat it as a pause here — only *loss* of idle stops us.)
+                if !crate::still_recording(shared, gen, epoch0) || !shared.is_idle() {
                     break;
                 }
                 let meta = frame_geom(shared, ts);
@@ -86,19 +95,22 @@ pub(crate) fn process_pending(shared: &DaemonState) -> i64 {
                     })
                     .unwrap_or_default();
                 let committed = crate::with_arm_read(shared, |arm| {
-                    if !crate::write_allowed(shared, arm, gen) {
+                    if !crate::write_allowed(shared, arm, gen)
+                        || shared.privacy_epoch() != epoch0
+                    {
                         return false;
                     }
                     shared
                         .with_store_mut(|store| {
                             store.commit_ocr_tx(ts, &text, &app, &title, &clip, &boxes, || {
                                 crate::write_allowed(shared, arm, gen)
+                                    && shared.privacy_epoch() == epoch0
                             })
                         })
                         .unwrap_or(Ok(false))
                         .unwrap_or(false)
                 });
-                if committed && crate::still_armed(shared, gen) {
+                if committed && crate::still_recording(shared, gen, epoch0) {
                     let _ = std::fs::remove_file(&path);
                     done += 1;
                     emit(&Event::ocr_progress(done, queued));
