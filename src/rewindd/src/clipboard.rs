@@ -179,6 +179,18 @@ pub(crate) fn ingest(shared: &DaemonState, raw: &str) {
             }
         }
     }
+    // Re-observe the live pause state immediately before committing. The
+    // `is_recording()` check above can go stale: a lock/overlay/portal/exclusion
+    // pause may engage between it and the commit, and nothing else advances the
+    // epoch for a clipboard job. `refresh_pause` both advances the epoch on a
+    // freshly-seen transition (so the epoch check below fails) AND lets us reject
+    // a pause that is active *now* — matching the capture path in
+    // `finalize_capture`.
+    let live = crate::refresh_pause(shared);
+    if live.is_some() {
+        clear_cached();
+        return;
+    }
     // Commit FIRST, under the gate and the original (ticket, epoch); publish to
     // the cache only on success. Caching before validation would let a rejected
     // clip attach to the next valid frame (leaking into search data), so the

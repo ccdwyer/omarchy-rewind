@@ -137,6 +137,12 @@ impl CaptureSession {
                 height: h,
             });
         }
+        // Never hand an empty output name to a real backend: grim would omit
+        // `-o` and grab every display, and the wlr backend would fall back to
+        // the first output. Refuse rather than capture the wrong monitor.
+        if output.is_empty() {
+            return Err("refusing capture: no focused output resolved".into());
+        }
         #[cfg(feature = "wayland")]
         {
             if self.wlr.is_none() && Instant::now() >= self.wlr_retry_at {
@@ -175,12 +181,16 @@ fn grab_grim(output: &str) -> Result<RawFrame, String> {
     if !which("grim") {
         return Err("neither wlr-screencopy nor grim is available".into());
     }
+    // An empty output would make grim capture every display. Callers must pass
+    // an exact focused output; refuse otherwise (defense in depth behind the
+    // guard in `grab`).
+    if output.is_empty() {
+        return Err("refusing grim capture: empty output name".into());
+    }
     let dest = tmp_path();
     let mut cmd = Command::new("grim");
     cmd.arg("-t").arg("png");
-    if !output.is_empty() {
-        cmd.arg("-o").arg(output);
-    }
+    cmd.arg("-o").arg(output);
     cmd.arg(&dest);
     let status = cmd
         .stdin(Stdio::null())
@@ -248,5 +258,29 @@ mod tests {
         assert_eq!(next_cadence_ms(3000, true), 10_000);
         assert_eq!(next_cadence_ms(3000, false), 3000);
         assert_eq!(next_cadence_ms(5000, false), 5000);
+    }
+
+    #[test]
+    fn grab_empty_output_captures_nothing() {
+        // An unresolved focused output must never reach a real backend: grim
+        // would grab every display and wlr would fall back to the first output.
+        // `grab("")` must fail closed rather than capture the wrong monitor.
+        // Serialize on the shared env lock and clear the synthetic-capture env
+        // var so a parallel test cannot flip `grab` onto the test backend.
+        let _env = crate::TEST_CAPTURE_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("REWIND_TEST_CAPTURE");
+        let mut session = CaptureSession::new();
+        assert!(
+            session.grab("").is_err(),
+            "empty output name must not produce a capture"
+        );
+    }
+
+    #[test]
+    fn grab_grim_empty_output_errors() {
+        assert!(
+            grab_grim("").is_err(),
+            "grim must refuse an empty output (would capture all displays)"
+        );
     }
 }

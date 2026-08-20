@@ -98,6 +98,13 @@ pub(crate) struct Shared {
     /// the blocking grab/read/tesseract and the frame/clip would otherwise still
     /// commit (the arm generation alone does not move on a non-disarm pause).
     privacy_epoch: AtomicU64,
+    /// Pause/resume transitions held in memory. Entering (or leaving) a pause
+    /// must not itself write to the database — that would be a write while
+    /// paused. Transitions are buffered here with their original timestamp and
+    /// flushed only inside an authorized, currently-unpaused transaction (see
+    /// `flush_pending_gaps`). Bounded so a long paused period cannot grow it
+    /// without limit.
+    pending_gaps: Mutex<Vec<(i64, &'static str, String)>>,
     tripwire: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
@@ -135,6 +142,7 @@ fn boot_shared(data_dir: &Path) -> Result<Arc<Shared>, String> {
         last_pause: Mutex::new(None),
         arm_gen: AtomicU64::new(if armed { 1 } else { 0 }),
         privacy_epoch: AtomicU64::new(0),
+        pending_gaps: Mutex::new(Vec::new()),
         tripwire: Mutex::new(None),
     }))
 }
@@ -582,6 +590,15 @@ fn current_pause(shared: &Shared) -> Option<PauseReason> {
     evaluate_pause(shared)
 }
 
+/// Whether OCR may commit given a pause reason. OCR runs opportunistically
+/// during genuine idle, so `None` (fully recording) and `Some(Idle)` permit a
+/// commit; every hard pause (Locked, Overlay, Portal, Excluded,
+/// PrivateBrowsing, TitlePattern, Disarmed) forbids it. Pure so the "locked
+/// screen blocks OCR writes" rule is testable without a compositor.
+fn ocr_write_ok(reason: &Option<PauseReason>) -> bool {
+    matches!(reason, None | Some(PauseReason::Idle))
+}
+
 fn evaluate_pause(shared: &Shared) -> Option<PauseReason> {
     if !shared.armed.load(Ordering::SeqCst) {
         return Some(PauseReason::Disarmed);
@@ -700,24 +717,74 @@ fn note_pause_change(shared: &Shared, reason: Option<PauseReason>) {
     // different one.
     shared.privacy_epoch.fetch_add(1, Ordering::SeqCst);
     clipboard::clear_cached();
-    with_arm_read(shared, |arm| {
-        // A pause/resume event is an in-the-moment write; authorize against the
-        // live generation held under this same read guard.
-        if write_allowed(shared, arm, arm.gen) {
-            let _ = shared.with_store_mut(|store| {
-                if !store.is_writable() {
-                    return;
-                }
-                let _ = store.record_event(
-                    now_ms(),
-                    if reason.is_some() { "pause" } else { "resume" },
-                    reason.as_ref().map(|r| r.as_str()).unwrap_or(""),
-                );
-            });
+    // Do NOT write the pause/resume event here: entering a pause must not itself
+    // produce a database write. Buffer the transition (with its real timestamp)
+    // in memory; it is persisted later, only inside an authorized and currently
+    // unpaused transaction (`flush_pending_gaps`). The buffer is bounded so a
+    // long paused stretch cannot grow it without limit.
+    {
+        let mut gaps = shared.pending_gaps.lock().unwrap();
+        let kind = if reason.is_some() { "pause" } else { "resume" };
+        gaps.push((
+            now_ms(),
+            kind,
+            reason.as_ref().map(|r| r.as_str()).unwrap_or("").to_string(),
+        ));
+        const MAX_PENDING_GAPS: usize = 512;
+        let len = gaps.len();
+        if len > MAX_PENDING_GAPS {
+            gaps.drain(0..len - MAX_PENDING_GAPS);
         }
-    });
+    }
     *prev = reason;
     emit(&Event::from_stats(stats_json(shared)));
+}
+
+/// Persist buffered pause/resume transitions, but only when the session is
+/// currently recording (armed and not paused). This is the single place a gap
+/// event reaches the database, so no write is ever a side effect of pausing.
+/// Called from the capture loop while recording; a no-op when paused/disarmed
+/// or when nothing is buffered.
+fn flush_pending_gaps(shared: &Shared) {
+    // Nothing to do unless there is buffered gap metadata AND we are recording
+    // right now. `refresh_pause` observes the live state (and advances the epoch
+    // on any freshly-seen transition), so a pause that engaged since the caller
+    // last checked is caught here and blocks the flush.
+    if shared.pending_gaps.lock().unwrap().is_empty() {
+        return;
+    }
+    if refresh_pause(shared).is_some() {
+        return;
+    }
+    with_arm_read(shared, |arm| {
+        if !write_allowed(shared, arm, arm.gen) {
+            return;
+        }
+        let pending: Vec<(i64, &'static str, String)> = {
+            let mut g = shared.pending_gaps.lock().unwrap();
+            std::mem::take(&mut *g)
+        };
+        if pending.is_empty() {
+            return;
+        }
+        let wrote = shared.with_store_mut(|store| {
+            if !store.is_writable() {
+                return false;
+            }
+            for (ts, kind, reason) in &pending {
+                let _ = store.record_event(*ts, *kind, reason.as_str());
+            }
+            true
+        });
+        // If the store was unavailable, put the transitions back so a later
+        // authorized flush can persist them rather than dropping the gaps.
+        if wrote != Some(true) {
+            let mut g = shared.pending_gaps.lock().unwrap();
+            let mut restored = pending;
+            restored.append(&mut *g);
+            *g = restored;
+        }
+    });
 }
 
 fn finalize_capture(
@@ -804,6 +871,11 @@ fn capture_loop(shared: Arc<Shared>) {
             continue;
         }
 
+        // Recording is live right now: persist any pause/resume transitions that
+        // were buffered in memory while paused. This is the authorized, unpaused
+        // window their gap metadata is allowed to reach the database.
+        flush_pending_gaps(&shared);
+
         match capture_once(&shared, &settings, &mut session) {
             Ok(true) => last_unchanged = true,
             Ok(false) => last_unchanged = false,
@@ -835,6 +907,14 @@ fn capture_once(
     // commit gate reject this frame even though the arm generation is unchanged.
     let epoch0 = shared.privacy_epoch.load(Ordering::SeqCst);
     let monitor = hypr::focused_monitor().unwrap_or_default();
+    // Fail closed on an unresolved focused output. An empty output name would
+    // make grim omit `-o` (capturing EVERY display, including a sensitive
+    // secondary monitor) and the wlr backend fall back to the first output.
+    // Capture nothing this tick rather than record the wrong display. The
+    // synthetic test-capture backend ignores the output name, so it is exempt.
+    if monitor.name.is_empty() && std::env::var("REWIND_TEST_CAPTURE").is_err() {
+        return Ok(false);
+    }
     let active = hypr::active_window().unwrap_or_default();
     let clients = hypr::clients().unwrap_or_default();
     let raw = session.grab(&monitor.name)?;
@@ -1168,6 +1248,18 @@ impl Shared {
             evaluate_pause(self),
             Some(PauseReason::Idle) | Some(PauseReason::Locked)
         )
+    }
+
+    /// Whether OCR may commit its extracted text right now. OCR's operating
+    /// window is genuine idle (no user activity), so `Idle` — and fully live
+    /// recording (`None`) — are permitted. Every OTHER pause reason (Locked,
+    /// Overlay, Portal, Excluded, PrivateBrowsing, TitlePattern, Disarmed) is a
+    /// hard pause during which no write may happen, so OCR must defer. This is
+    /// distinct from `is_idle()`, which deliberately treats Locked as idle for
+    /// the purpose of *running* tesseract cheaply — but a locked screen must not
+    /// receive database writes.
+    pub(crate) fn ocr_may_write(&self) -> bool {
+        ocr_write_ok(&evaluate_pause(self))
     }
 
     pub fn with_store<R>(&self, f: impl FnOnce(&Store) -> R) -> Option<R> {
@@ -2128,5 +2220,157 @@ mod tests {
             .unwrap();
         assert_eq!(counts.2, 0, "no ocr boxes");
         assert_eq!(counts.3, 0, "no clips");
+    }
+
+    #[test]
+    fn ocr_write_ok_blocks_locked_and_hard_pauses() {
+        // OCR may write only while genuinely recording or idle; every hard pause
+        // — above all a locked screen — must block the OCR commit.
+        assert!(ocr_write_ok(&None));
+        assert!(ocr_write_ok(&Some(PauseReason::Idle)));
+        for hard in [
+            PauseReason::Locked,
+            PauseReason::Overlay,
+            PauseReason::Portal,
+            PauseReason::Excluded,
+            PauseReason::PrivateBrowsing,
+            PauseReason::TitlePattern,
+            PauseReason::Disarmed,
+        ] {
+            assert!(
+                !ocr_write_ok(&Some(hard.clone())),
+                "{hard:?} must block an OCR write"
+            );
+        }
+    }
+
+    #[test]
+    fn ocr_may_write_false_while_hard_paused() {
+        // A live overlay pause is compositor-independent (checked before the
+        // test-capture shortcut), so it deterministically exercises the live
+        // OCR gate: OCR must not be permitted to write while paused.
+        let _env = TEST_CAPTURE_ENV_LOCK.lock().unwrap();
+        std::env::set_var("REWIND_TEST_CAPTURE", "1");
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("rewind");
+        let shared = boot_shared(&data).unwrap();
+        {
+            let mut st = shared.settings.lock().unwrap();
+            st.consent_at = now_ms();
+        }
+        persist_consent(&shared).unwrap();
+        arm_now(&shared).unwrap();
+        assert!(shared.ocr_may_write(), "recording session may OCR-write");
+        shared.overlay_open.store(true, Ordering::SeqCst);
+        assert!(
+            !shared.ocr_may_write(),
+            "a hard pause (overlay) must block OCR writes"
+        );
+        shared.overlay_open.store(false, Ordering::SeqCst);
+        std::env::remove_var("REWIND_TEST_CAPTURE");
+    }
+
+    #[test]
+    fn pause_transition_does_not_write_to_store() {
+        // Entering (or leaving) a pause must not itself write to the database.
+        // The transition is buffered in memory; the events table is untouched
+        // until an authorized, unpaused flush.
+        let _env = TEST_CAPTURE_ENV_LOCK.lock().unwrap();
+        std::env::set_var("REWIND_TEST_CAPTURE", "1");
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("rewind");
+        let shared = boot_shared(&data).unwrap();
+        {
+            let mut st = shared.settings.lock().unwrap();
+            st.consent_at = now_ms();
+        }
+        persist_consent(&shared).unwrap();
+        arm_now(&shared).unwrap();
+
+        let before = shared
+            .with_store(|s| s.mutation_counters().unwrap())
+            .unwrap();
+        // Simulate a pause transition (recording -> paused).
+        note_pause_change(&shared, Some(PauseReason::Overlay));
+        let after = shared
+            .with_store(|s| s.mutation_counters().unwrap())
+            .unwrap();
+        assert_eq!(
+            before.1, after.1,
+            "a pause transition must not write an events row"
+        );
+        assert!(
+            !shared.pending_gaps.lock().unwrap().is_empty(),
+            "the transition must be buffered in memory"
+        );
+        std::env::remove_var("REWIND_TEST_CAPTURE");
+    }
+
+    #[test]
+    fn flush_pending_gaps_persists_only_when_recording() {
+        // Buffered gaps reach the database only through an authorized, unpaused
+        // flush — never as a side effect of pausing.
+        let _env = TEST_CAPTURE_ENV_LOCK.lock().unwrap();
+        std::env::set_var("REWIND_TEST_CAPTURE", "1");
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("rewind");
+        let shared = boot_shared(&data).unwrap();
+        {
+            let mut st = shared.settings.lock().unwrap();
+            st.consent_at = now_ms();
+        }
+        persist_consent(&shared).unwrap();
+        arm_now(&shared).unwrap();
+
+        // Buffer a transition; the events table stays empty.
+        note_pause_change(&shared, Some(PauseReason::Overlay));
+        let mid = shared
+            .with_store(|s| s.mutation_counters().unwrap())
+            .unwrap();
+        assert_eq!(mid.1, 0, "no events written on pause");
+        assert!(!shared.pending_gaps.lock().unwrap().is_empty());
+
+        // Recording is live (overlay_open never set, test-capture active), so a
+        // flush persists the buffered gap(s) and drains the buffer.
+        flush_pending_gaps(&shared);
+        let after = shared
+            .with_store(|s| s.mutation_counters().unwrap())
+            .unwrap();
+        assert!(after.1 >= 1, "flush must persist buffered gap events");
+        assert!(
+            shared.pending_gaps.lock().unwrap().is_empty(),
+            "flush must drain the buffer"
+        );
+    }
+
+    #[test]
+    fn clipboard_commit_blocked_by_pause_engaged_after_ticket() {
+        // A pause that engages after the clipboard ticket is taken but before the
+        // commit must block the write: no clip row, nothing cached.
+        let _env = TEST_CAPTURE_ENV_LOCK.lock().unwrap();
+        std::env::set_var("REWIND_TEST_CAPTURE", "1");
+        clipboard::clear_cached();
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("rewind");
+        let shared = boot_shared(&data).unwrap();
+        {
+            let mut st = shared.settings.lock().unwrap();
+            st.consent_at = now_ms();
+        }
+        persist_consent(&shared).unwrap();
+        arm_now(&shared).unwrap();
+
+        // Engage a hard pause (overlay) that ingest's pre-commit refresh_pause
+        // will observe, then ingest a clip.
+        shared.overlay_open.store(true, Ordering::SeqCst);
+        clipboard::ingest(&shared, "AKIA-SHOULD-NOT-STORE");
+
+        let counts = shared
+            .with_store(|s| s.mutation_counters().unwrap())
+            .unwrap();
+        assert_eq!(counts.3, 0, "no clip row may be written while paused");
+        shared.overlay_open.store(false, Ordering::SeqCst);
+        clipboard::clear_cached();
+        std::env::remove_var("REWIND_TEST_CAPTURE");
     }
 }

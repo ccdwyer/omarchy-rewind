@@ -94,9 +94,24 @@ pub(crate) fn process_pending(shared: &DaemonState) -> i64 {
                         (app, title, clip)
                     })
                     .unwrap_or_default();
+                // Fresh live pause check right before committing. `refresh_pause`
+                // advances the epoch on any transition observed since entry (so
+                // the epoch check rejects an OCR result whose crop spanned a
+                // pause) AND lets us reject a HARD pause that is active now —
+                // most importantly a Locked screen, which `is_idle()` treats as
+                // idle but which must never receive a write. A committed OCR row
+                // (and the crop deletion that follows) is only allowed when the
+                // session is genuinely idle or fully recording.
+                crate::refresh_pause(shared);
+                if !shared.ocr_may_write() {
+                    // The frame's crop stays on disk for a later pass; leave
+                    // state consistent (no partial write, no deletion).
+                    break;
+                }
                 let committed = crate::with_arm_read(shared, |arm| {
                     if !crate::write_allowed(shared, arm, gen)
                         || shared.privacy_epoch() != epoch0
+                        || !shared.ocr_may_write()
                     {
                         return false;
                     }
@@ -105,12 +120,19 @@ pub(crate) fn process_pending(shared: &DaemonState) -> i64 {
                             store.commit_ocr_tx(ts, &text, &app, &title, &clip, &boxes, || {
                                 crate::write_allowed(shared, arm, gen)
                                     && shared.privacy_epoch() == epoch0
+                                    && shared.ocr_may_write()
                             })
                         })
                         .unwrap_or(Ok(false))
                         .unwrap_or(false)
                 });
-                if committed && crate::still_recording(shared, gen, epoch0) {
+                // Only delete the crop once its text is durably committed AND the
+                // session is still in an OCR-writable state — never delete a crop
+                // belonging to an unwritten frame.
+                if committed
+                    && crate::still_recording(shared, gen, epoch0)
+                    && shared.ocr_may_write()
+                {
                     let _ = std::fs::remove_file(&path);
                     done += 1;
                     emit(&Event::ocr_progress(done, queued));

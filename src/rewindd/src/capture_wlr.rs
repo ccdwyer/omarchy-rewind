@@ -204,9 +204,11 @@ impl Session {
 
 fn pick_output(state: &State) -> Option<WlOutput> {
     if state.want_output.is_empty() {
-        // No specific output requested (e.g. single-output session); the first
-        // is unambiguous.
-        return state.outputs.first().map(|o| o.1.clone());
+        // Fail closed: an empty output name is an unresolved focused monitor, not
+        // a request for "any" display. Never substitute one (it could be a
+        // sensitive secondary monitor). Return None so `grab` errors; callers do
+        // not reach here with an empty name anyway (guarded in `grab`).
+        return None;
     }
     // A focused output WAS named. Match it exactly and NEVER substitute a
     // different one — recording a sensitive secondary display would be a privacy
