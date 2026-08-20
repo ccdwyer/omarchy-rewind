@@ -33,6 +33,7 @@ chmod 700 "$DATA" "$FRAMES" "$LAYOUTS" 2>/dev/null || true
 chmod 600 "$CLIPS" "$INDEX" 2>/dev/null || true
 
 CONSENT=0
+CONSENT_AT=0
 ARMONLOGIN=0
 BYTECAP=2147483648
 CADENCE=3000
@@ -59,6 +60,7 @@ except Exception:
 def i(k,d=0):
     print("%s=%s"%(k,int(s.get(k) or d)))
 print("CONSENT=%d"%(1 if s.get("consentAt") else 0))
+print("CONSENT_AT=%d"%int(s.get("consentAt") or 0))
 print("ARMONLOGIN=%d"%(1 if s.get("armOnLogin") else 0))
 print("BYTECAP=%d"%int(s.get("byteCap") or 2147483648))
 print("CADENCE=%d"%int(s.get("cadenceMs") or 3000))
@@ -91,7 +93,7 @@ body={
   "reason": "compat-norecord",
 }
 json.dump(body, open(path,"w"))
-' "$STATE" "$([ "$CONSENT" -eq 1 ] && now_ms || echo 0)" "$ARMONLOGIN" "$BYTECAP" "$CADENCE" "$IDLEPAUSE" "$EXCLUDES" "$TITLEPAUSE" 2>/dev/null || true
+' "$STATE" "${CONSENT_AT:-0}" "$ARMONLOGIN" "$BYTECAP" "$CADENCE" "$IDLEPAUSE" "$EXCLUDES" "$TITLEPAUSE" 2>/dev/null || true
   chmod 600 "$STATE" 2>/dev/null || true
 }
 
@@ -428,10 +430,13 @@ while IFS= read -r line; do
   case "$cmd" in
     hello) reply "$id" "{\"version\":\"$VERSION\",\"record\":false}" ;;
     arm)
-      CONSENT=1
-      save_state
-      emit "{\"event\":\"error\",\"id\":$id,\"ok\":false,\"error\":\"compat helper does not record; run build.sh for rewindd\"}"
-      reply "$id" "$(stats_json)"
+      if [ "$CONSENT" -ne 1 ]; then
+        emit "{\"event\":\"error\",\"id\":$id,\"ok\":false,\"error\":\"consent required: arm rejected until the consent screen is recorded\"}"
+        reply "$id" "$(stats_json)"
+      else
+        emit "{\"event\":\"error\",\"id\":$id,\"ok\":false,\"error\":\"compat helper does not record; run build.sh for rewindd\"}"
+        reply "$id" "$(stats_json)"
+      fi
       emit "{\"event\":\"stats\",$(stats_json | sed 's/^{//;s/}$//')}"
       ;;
     disarm)
@@ -440,10 +445,20 @@ while IFS= read -r line; do
       ;;
     consent)
       CONSENT=1
+      CONSENT_AT=$(now_ms)
       armnow=$(field "$line" armNow)
-      [ "$armnow" = "true" ] && emit "{\"event\":\"error\",\"id\":$id,\"error\":\"compat helper does not record; run build.sh for rewindd\"}"
+      armlogin=$(field "$line" armOnLogin)
+      if [ "$armlogin" = "true" ]; then
+        ARMONLOGIN=1
+      else
+        ARMONLOGIN=0
+      fi
       save_state
+      if [ "$armnow" = "true" ]; then
+        emit "{\"event\":\"error\",\"id\":$id,\"error\":\"compat helper does not record; run build.sh for rewindd\"}"
+      fi
       reply "$id" "$(stats_json)"
+      emit "{\"event\":\"stats\",$(stats_json | sed 's/^{//;s/}$//')}"
       ;;
     set-pause|setPause) reply "$id" "{\"ok\":true}" ;;
     configure)

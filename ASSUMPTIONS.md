@@ -14,7 +14,8 @@ Conservative choices where the Omarchy / Quickshell / Hyprland API was not 100% 
 
 ## Quickshell
 
-- **`Process { stdinEnabled: true; write(line) }`** is how NDJSON commands reach rewindd. Isolated in `RewindAdapter.writeLine`. If `write` is missing, the adapter also appends to `cmd.ndjson` (daemon does not currently watch that file — documented last-ditch, not a second protocol).
+- **`Process { stdinEnabled: true; write(line) }`** is how NDJSON commands reach rewindd. Isolated in `RewindAdapter.writeLine`. A failed write is logged as `stdin-failed`; there is no second command file.
+- **Overlay IPC** is a FIFO queue (`ipcQueue` / `kickIpc`) over one `Process`. `open()` issues a single `refresh` call so timeline/clips/overlay-open cannot clobber each other.
 - **`stdout: SplitParser { onRead }`** is the documented line reader (same family as snitch’s Socket parser).
 - **`PanelWindow` + `WlrLayershell`** (`Overlay` layer, exclusive keyboard, `ExclusionMode.Ignore`) matches Desktop Undo / clipboard. Namespace `rewind`.
 - **Theme tokens** `Color.menu.*`, `Color.accent`, `Style.*`, `Border.*`, `BarWidget`, `WidgetButton`, `BorderSurface` — same first-party set as Desktop Undo. Reduced motion: `Style.reduceMotion` or `OMARCHY_REDUCED_MOTION=1`.

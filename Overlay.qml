@@ -32,6 +32,10 @@ Item {
   property bool showPlan: false
   property bool showWipe: false
   property string wipeScope: "today"
+  property double wipeFromTs: 0
+  property double wipeToTs: 0
+  property var ipcQueue: []
+  property bool ipcBusy: false
   property var highlightBoxes: []
   property bool firstRun: false
   property int seenHitsRevision: -1
@@ -70,9 +74,30 @@ Item {
     var cmd = ["omarchy-shell", "shell", "call", root.pluginId, name]
     if (payload !== undefined && payload !== null && String(payload).length)
       cmd.push(String(payload))
+    var q = []
+    for (var i = 0; i < root.ipcQueue.length; i++)
+      q.push(root.ipcQueue[i])
+    q.push(cmd)
+    root.ipcQueue = q
+    root.kickIpc()
+    return "queued"
+  }
+
+  function kickIpc() {
+    if (root.ipcBusy)
+      return
+    if (!root.ipcQueue.length)
+      return
+    if (ipcProc.running)
+      return
+    var cmd = root.ipcQueue[0]
+    var rest = []
+    for (var i = 1; i < root.ipcQueue.length; i++)
+      rest.push(root.ipcQueue[i])
+    root.ipcQueue = rest
+    root.ipcBusy = true
     ipcProc.command = cmd
     ipcProc.running = true
-    return "queued"
   }
 
   function onCallReply(text) {
@@ -125,9 +150,7 @@ Item {
       root.view = "consent"
     else if (payload.view === "clips")
       root.view = "clips"
-    root.callSvc("setOverlayOpen", "true")
-    root.callSvc("timeline", "")
-    root.callSvc("clips", "")
+    root.callSvc("refresh", { overlay: true })
     root.pull()
     Qt.callLater(root.focusForView)
   }
@@ -311,8 +334,36 @@ Item {
     root.showPlan = false
   }
 
+  function openWipe(scope) {
+    root.wipeScope = scope
+    if (scope === "range" && root.frames.length) {
+      root.wipeFromTs = Number(root.frames[0].ts)
+      var cur = root.currentFrame()
+      root.wipeToTs = cur ? Number(cur.ts) : Number(root.frames[root.frames.length - 1].ts)
+      if (root.wipeToTs < root.wipeFromTs) {
+        var tmp = root.wipeFromTs
+        root.wipeFromTs = root.wipeToTs
+        root.wipeToTs = tmp
+      }
+    }
+    root.showWipe = true
+  }
+
+  function setWipeBound(which) {
+    var f = root.currentFrame()
+    if (!f)
+      return
+    if (which === "from")
+      root.wipeFromTs = Number(f.ts)
+    else
+      root.wipeToTs = Number(f.ts)
+  }
+
   function doWipe() {
-    root.callSvc("wipe", root.wipeScope)
+    if (root.wipeScope === "range")
+      root.callSvc("wipe", { scope: "range", from: root.wipeFromTs, to: root.wipeToTs })
+    else
+      root.callSvc("wipe", { scope: root.wipeScope })
     root.showWipe = false
     Qt.callLater(root.pull)
   }
@@ -331,6 +382,10 @@ Item {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.onCallReply(text)
+    }
+    onExited: {
+      root.ipcBusy = false
+      root.kickIpc()
     }
   }
 
@@ -833,14 +888,37 @@ Item {
               }
             }
             Text {
-              text: "wipe today  ·  wipe all"
+              text: "Wipe"
               color: root.foreground
-              opacity: 0.55
               font.family: root.fontFamily
-              font.pixelSize: Style.font.bodySmall
-              MouseArea {
-                anchors.fill: parent
-                onClicked: { root.wipeScope = "today"; root.showWipe = true }
+              font.pixelSize: Style.font.body
+              font.bold: true
+            }
+            Row {
+              spacing: Style.space(6)
+              Rectangle {
+                width: wipeTodayLab.implicitWidth + Style.space(12)
+                height: Style.space(24)
+                radius: 4
+                color: Style.normalFillFor(root.foreground, root.accent)
+                Text { id: wipeTodayLab; anchors.centerIn: parent; text: "today"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+                MouseArea { anchors.fill: parent; onClicked: root.openWipe("today") }
+              }
+              Rectangle {
+                width: wipeAllLab.implicitWidth + Style.space(12)
+                height: Style.space(24)
+                radius: 4
+                color: Style.normalFillFor(root.foreground, root.accent)
+                Text { id: wipeAllLab; anchors.centerIn: parent; text: "all"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+                MouseArea { anchors.fill: parent; onClicked: root.openWipe("all") }
+              }
+              Rectangle {
+                width: wipeRangeLab.implicitWidth + Style.space(12)
+                height: Style.space(24)
+                radius: 4
+                color: Style.normalFillFor(root.foreground, root.accent)
+                Text { id: wipeRangeLab; anchors.centerIn: parent; text: "range"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+                MouseArea { anchors.fill: parent; onClicked: root.openWipe("range") }
               }
             }
           }
@@ -1125,21 +1203,57 @@ Item {
       visible: root.showWipe
       anchors.fill: parent
       color: Qt.rgba(0, 0, 0, 0.45)
+      MouseArea { anchors.fill: parent; onClicked: root.showWipe = false }
       BorderSurface {
-        width: Style.space(360)
-        height: Style.space(160)
+        width: Style.space(420)
+        height: root.wipeScope === "range" ? Style.space(260) : Style.space(160)
         anchors.centerIn: parent
         radius: root.cornerRadius
         color: root.background
         borderSpec: root.borderSpec
+        MouseArea { anchors.fill: parent; onClicked: {} }
         Column {
           anchors.centerIn: parent
+          width: parent.width - Style.space(32)
           spacing: Style.space(12)
           Text {
-            text: "Wipe " + root.wipeScope + "?"
+            text: root.wipeScope === "range" ? "Wipe a time range" : ("Wipe " + root.wipeScope + "?")
             color: root.foreground
             font.family: root.fontFamily
             font.pixelSize: Style.font.heading
+          }
+          Column {
+            visible: root.wipeScope === "range"
+            width: parent.width
+            spacing: Style.space(8)
+            Text {
+              width: parent.width
+              wrapMode: Text.WordWrap
+              text: "From " + Format.clockLabel(root.wipeFromTs) + "  →  " + Format.clockLabel(root.wipeToTs) + ". Scrub to a frame, then set start or end."
+              color: root.foreground
+              opacity: 0.75
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+            Row {
+              spacing: Style.space(8)
+              Rectangle {
+                width: fromLab.implicitWidth + Style.space(12)
+                height: Style.space(24)
+                radius: 4
+                color: Style.normalFillFor(root.foreground, root.accent)
+                Text { id: fromLab; anchors.centerIn: parent; text: "current as start"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+                MouseArea { anchors.fill: parent; onClicked: root.setWipeBound("from") }
+              }
+              Rectangle {
+                width: toLab.implicitWidth + Style.space(12)
+                height: Style.space(24)
+                radius: 4
+                color: Style.normalFillFor(root.foreground, root.accent)
+                Text { id: toLab; anchors.centerIn: parent; text: "current as end"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+                MouseArea { anchors.fill: parent; onClicked: root.setWipeBound("to") }
+              }
+            }
           }
           Row {
             spacing: Style.space(12)

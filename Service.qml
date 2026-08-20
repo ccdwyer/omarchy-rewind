@@ -24,6 +24,8 @@ Item {
   property bool usingFallback: false
   property string helperStatus: "starting"
   property int restarts: 0
+  property int maxRestarts: 8
+  property bool stopping: false
   property int nextCmdId: 1
   property var pending: ({})
 
@@ -103,14 +105,9 @@ Item {
     body.id = root.nextCmdId
     var line = JSON.stringify(body)
     var ok = adapter.writeLine(daemonProc, line)
-    if (!ok) {
-      fallbackWrite(line)
-    }
+    if (!ok)
+      root.lastStatus = "stdin-failed"
     return body.id
-  }
-
-  function fallbackWrite(line) {
-    cmdFile.setText(line + "\n")
   }
 
   function onDaemonLine(line) {
@@ -483,7 +480,14 @@ Item {
     }
     onExited: function() {
       root.helperStatus = "exited"
+      if (root.stopping)
+        return
       root.restarts += 1
+      if (root.restarts > root.maxRestarts) {
+        root.helperStatus = "gave-up"
+        root.lastStatus = "helper stopped after " + root.maxRestarts + " restarts"
+        return
+      }
       restartTimer.interval = Math.min(8000, 400 * Math.pow(2, Math.min(root.restarts, 5)))
       restartTimer.restart()
     }
@@ -494,17 +498,10 @@ Item {
     interval: 800
     repeat: false
     onTriggered: {
-      if (root.helperPath)
-        daemonProc.running = true
+      if (root.stopping || !root.helperPath)
+        return
+      daemonProc.running = true
     }
-  }
-
-  FileView {
-    id: cmdFile
-    path: root.dataDir + "/cmd.ndjson"
-    atomicWrites: true
-    printErrors: false
-    watchChanges: false
   }
 
   FileView { id: uiSnap; path: root.dataDir + "/ui.json"; atomicWrites: true; printErrors: false }
@@ -553,9 +550,29 @@ Item {
       var v = String(arg || "")
       return root.setOverlayOpen(v === "true" || v === "1")
     }
+    function refresh(arg: string): string {
+      var parsed = root.parseJsonArg(arg, {})
+      var overlay = true
+      if (parsed && typeof parsed === "object" && parsed.overlay !== undefined)
+        overlay = !!parsed.overlay
+      else if (String(arg) === "false")
+        overlay = false
+      root.setOverlayOpen(overlay)
+      root.refreshTimeline()
+      root.refreshClips()
+      root.publish()
+      return "ok"
+    }
   }
 
   Component.onCompleted: {
     root.findHelper()
+  }
+
+  Component.onDestruction: {
+    root.stopping = true
+    restartTimer.stop()
+    root.send("shutdown", {})
+    daemonProc.running = false
   }
 }

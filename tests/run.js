@@ -259,10 +259,29 @@ test("network-audit fails when binary is missing", () => {
 
 test("IpcHandler exposes JSON-arg methods", () => {
   const src = fs.readFileSync(path.join(ROOT, "Service.qml"), "utf8")
-  for (const name of ["consentNow", "copyClip", "executePlan", "wipe", "reopenPlan", "query"]) {
+  for (const name of ["consentNow", "copyClip", "executePlan", "wipe", "reopenPlan", "query", "refresh"]) {
     assert.ok(src.indexOf("function " + name + "(arg: string)") >= 0
       || src.indexOf("function " + name + "(q: string)") >= 0, name)
   }
+})
+
+test("overlay serializes IPC and opens via one refresh", () => {
+  const src = fs.readFileSync(path.join(ROOT, "Overlay.qml"), "utf8")
+  assert.ok(src.indexOf("function kickIpc()") >= 0)
+  assert.ok(src.indexOf("ipcQueue") >= 0)
+  assert.ok(src.indexOf('root.callSvc("refresh"') >= 0)
+  assert.ok(src.indexOf("if (ipcProc.running)") >= 0)
+})
+
+test("overlay wipe has today, all, and range JSON", () => {
+  const src = fs.readFileSync(path.join(ROOT, "Overlay.qml"), "utf8")
+  assert.ok(src.indexOf('root.openWipe("today")') >= 0)
+  assert.ok(src.indexOf('root.openWipe("all")') >= 0)
+  assert.ok(src.indexOf('root.openWipe("range")') >= 0)
+  assert.ok(src.indexOf('scope: "range"') >= 0)
+  assert.ok(src.indexOf("wipeFromTs") >= 0)
+  assert.ok(src.indexOf("wipeToTs") >= 0)
+  assert.ok(src.indexOf("wipe today") < 0)
 })
 
 test("compat query over index jsonl", () => {
@@ -282,7 +301,7 @@ test("compat query over index jsonl", () => {
   assert.ok(body.hits && body.hits.length >= 1)
 })
 
-test("compat does not record on arm", () => {
+test("compat arm without consent is rejected and does not record consent", () => {
   const os = require("os")
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "rewind-norecord-"))
   const env = Object.assign({}, process.env, { REWIND_DATA_DIR: tmp })
@@ -297,7 +316,32 @@ test("compat does not record on arm", () => {
   const framesDir = path.join(tmp, "frames")
   const files = fs.existsSync(framesDir) ? fs.readdirSync(framesDir) : []
   assert.strictEqual(files.length, 0)
-  assert.ok(r.stdout.indexOf("does not record") >= 0 || r.stdout.indexOf("compat-norecord") >= 0)
+  assert.ok(r.stdout.indexOf("consent required") >= 0, r.stdout)
+  const statePath = path.join(tmp, "state.json")
+  if (fs.existsSync(statePath)) {
+    const st = JSON.parse(fs.readFileSync(statePath, "utf8"))
+    assert.ok(!st.consentAt)
+  }
+})
+
+test("compat consent persists armOnLogin and still does not record", () => {
+  const os = require("os")
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "rewind-consent-"))
+  const env = Object.assign({}, process.env, { REWIND_DATA_DIR: tmp })
+  const p = path.join(ROOT, "compat", "rewindd.sh")
+  fs.chmodSync(p, 0o755)
+  const r = spawnSync(p, ["daemon"], {
+    encoding: "utf8",
+    env,
+    input: '{"cmd":"consent","id":1,"armNow":true,"armOnLogin":true}\n{"cmd":"arm","id":2}\n{"cmd":"shutdown","id":3}\n'
+  })
+  assert.strictEqual(r.status, 0, r.stderr + r.stdout)
+  const st = JSON.parse(fs.readFileSync(path.join(tmp, "state.json"), "utf8"))
+  assert.ok(st.consentAt > 0)
+  assert.strictEqual(st.armOnLogin, true)
+  assert.ok(r.stdout.indexOf("does not record") >= 0, r.stdout)
+  const files = fs.existsSync(path.join(tmp, "frames")) ? fs.readdirSync(path.join(tmp, "frames")) : []
+  assert.strictEqual(files.length, 0)
 })
 
 test("compat wipe rewrites index instead of leaving stale rows", () => {
