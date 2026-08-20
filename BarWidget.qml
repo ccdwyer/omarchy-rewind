@@ -18,6 +18,7 @@ BarWidget {
   property bool armOnLogin: false
 
   property bool holdFired: false
+  property int heldButton: 0
   property bool armed: false
   property bool paused: false
   property string pauseReason: "disarmed"
@@ -89,7 +90,7 @@ BarWidget {
 
   FileView {
     id: uiView
-    path: adapter.dataDir() + "/ui.json"
+    path: adapter.snapDir() + "/ui.json"
     watchChanges: true
     printErrors: false
     onLoaded: root.applyLive(text())
@@ -153,6 +154,7 @@ BarWidget {
       hoverEnabled: true
       pressAndHoldInterval: 450
       onPressed: function(mouse) {
+        root.heldButton = mouse.button
         if (mouse.button === Qt.LeftButton)
           root.holdFired = false
         else if (mouse.button === Qt.RightButton)
@@ -163,6 +165,11 @@ BarWidget {
           root.toggleArm()
       }
       onPressAndHold: {
+        // Press-and-hold opens clipboard history only for a LEFT-button hold.
+        // A right-button hold already opened the overlay on press; it must not
+        // also trigger the clips view.
+        if (root.heldButton !== Qt.LeftButton)
+          return
         root.holdFired = true
         root.summonOverlay("{\"view\":\"clips\"}")
       }

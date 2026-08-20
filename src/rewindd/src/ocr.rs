@@ -17,7 +17,13 @@ pub(crate) fn idle_loop(shared: Arc<DaemonState>) {
         return;
     }
     loop {
+        if shared.is_stopping() {
+            return;
+        }
         thread::sleep(Duration::from_secs(4));
+        if shared.is_stopping() {
+            return;
+        }
         let _ = process_pending(&shared);
     }
 }
@@ -134,6 +140,9 @@ pub(crate) fn process_pending(shared: &DaemonState) -> i64 {
                     && shared.ocr_may_write()
                 {
                     let _ = std::fs::remove_file(&path);
+                    // The crop file is gone; drop its bytes from the managed
+                    // budget and null its path so it is no longer counted.
+                    let _ = shared.with_store_mut(|s| s.clear_crop(ts));
                     done += 1;
                     emit(&Event::ocr_progress(done, queued));
                 }

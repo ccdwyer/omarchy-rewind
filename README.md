@@ -12,13 +12,15 @@ Recording starts **disarmed**. The bar chip is the truth: if it says disarmed, r
 omarchy plugin add <git-url> --enable
 ```
 
-Then build the helper on the machine:
+That is all for a normal Omarchy (Arch) machine: **on first run the service builds the recorder itself.** If `bin/rewindd` is absent and `cargo` is present (Arch ships Rust), the service runs `build.sh` in the background — the bar shows *"building recorder…"* — and starts the compiled `rewindd` when it finishes. So `omarchy plugin add … --enable`, then arm from the consent screen, and recording works.
+
+You can also build it ahead of time:
 
 ```sh
 ~/.config/omarchy/plugins/io.github.chris.rewind/build.sh
 ```
 
-`build.sh` compiles `rewindd` (Rust). Missing Wayland headers usually still produce a **grim-only Rust helper**. The POSIX `compat/rewindd.sh` fallback is installed only when `cargo` itself is missing or `cargo build` fails. That fallback **does not record** (it cannot honor the pause matrix); it still answers query/wipe/stats against existing data. Recording requires the Rust binary.
+`build.sh` compiles `rewindd` (Rust). Missing Wayland headers usually still produce a **grim-only Rust helper**. The POSIX `compat/rewindd.sh` fallback is used only when `cargo` is unavailable or the build fails. That fallback **does not record** (it cannot honor the pause matrix), but it does answer query/wipe/stats **against the real SQLite store** (`rewind.db`) — so a wipe there actually deletes your data, it never reports a false success. Recording itself requires the Rust binary.
 
 Linux CI (`.github/workflows/linux-helper.yml`) builds the Wayland helper, runs tests, `ldd`, and `strace -e trace=network`, and uploads `rewindd-linux`. This macOS authoring host cannot produce that ELF; `scripts/network-audit.sh` exits 1 when `bin/rewindd` is missing rather than pretending the audit passed.
 
@@ -131,7 +133,7 @@ Data lives at `$XDG_DATA_HOME/rewind` (default `~/.local/share/rewind`), created
 
 ## Honest limitations
 
-- **Armed-on-demand, not ambient.** Disarmed means zero writes — even if consent and history already exist. No frames, OCR, pause events, settings flushes, or UI snapshots until you arm. Persistent storage is created only after consent/arm. “Arm on login” is opt-in after consent.
+- **Armed-on-demand, not ambient.** Disarmed means zero *observation-data* writes — even if consent and history already exist. No new frames, OCR, clips, pause events, or settings reach disk until you arm; persistent storage is opened only after consent/arm. (Two deliberate exceptions that are *not* observation: cleaning up a rejected capture's own orphan temp file happens immediately — leaving screen content on disk during a pause would be worse — and the overlay's read-response channel lives in the ephemeral tmpfs runtime dir, not persistent storage, so browsing your history while paused serves already-recorded data without capturing anything new.) “Arm on login” is opt-in after consent.
 - **Focused output only.** Other monitors are not captured.
 - **Reopen & arrange is a reviewable plan**, not session restore. Missing apps launch by `.desktop` mapping; browser tabs, documents, and unsaved state are listed as unrecoverable.
 - **Clipboard is text only.** Images and passwords in password-manager windows should never be captured because those apps pause recording while visible — still, do not arm Rewind over a password field in a terminal.

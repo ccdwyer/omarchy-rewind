@@ -28,7 +28,7 @@ use serde_json::json;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as Proc, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -117,7 +117,22 @@ pub(crate) struct Shared {
     /// writes while paused. Consent writes are NOT routed through here — an
     /// explicit consent authorization persists immediately.
     pending_settings_save: AtomicBool,
+    /// Set on Shutdown so the capture/OCR/clipboard workers stop cooperatively
+    /// at the top of their loops instead of being torn down mid-iteration.
+    stopping: AtomicBool,
+    /// PID of the persistent `wl-paste` clipboard-watch child (0 = none), so
+    /// shutdown can explicitly terminate it rather than orphaning it.
+    clip_child: AtomicI32,
     tripwire: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+impl Shared {
+    pub(crate) fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
+    }
+    pub(crate) fn set_clip_child(&self, pid: i32) {
+        self.clip_child.store(pid, Ordering::SeqCst);
+    }
 }
 
 fn boot_shared(data_dir: &Path) -> Result<Arc<Shared>, String> {
@@ -157,6 +172,8 @@ fn boot_shared(data_dir: &Path) -> Result<Arc<Shared>, String> {
         pending_gaps: Mutex::new(Vec::new()),
         pending_checkpoint: AtomicBool::new(false),
         pending_settings_save: AtomicBool::new(false),
+        stopping: AtomicBool::new(false),
+        clip_child: AtomicI32::new(0),
         tripwire: Mutex::new(None),
     }))
 }
@@ -171,19 +188,19 @@ pub fn run_daemon(data_dir: PathBuf) -> io::Result<()> {
     ));
 
     let cap = Arc::clone(&shared);
-    thread::Builder::new()
+    let cap_h = thread::Builder::new()
         .name("rewind-capture".into())
         .spawn(move || capture_loop(cap))
         .ok();
 
     let clip = Arc::clone(&shared);
-    thread::Builder::new()
+    let clip_h = thread::Builder::new()
         .name("rewind-clipboard".into())
         .spawn(move || clipboard::watch(clip))
         .ok();
 
     let ocr = Arc::clone(&shared);
-    thread::Builder::new()
+    let ocr_h = thread::Builder::new()
         .name("rewind-ocr".into())
         .spawn(move || ocr::idle_loop(ocr))
         .ok();
@@ -208,6 +225,30 @@ pub fn run_daemon(data_dir: PathBuf) -> io::Result<()> {
             }
             Err(err) => emit(&Event::error(None, err)),
         }
+    }
+    // Cooperative shutdown: tell the workers to stop, explicitly terminate the
+    // persistent wl-paste clipboard child so it does not outlive us, then join
+    // the workers so no thread is torn down mid-iteration. A short watchdog
+    // guarantees the process still exits even if a join hangs.
+    shared.stopping.store(true, Ordering::SeqCst);
+    let pid = shared.clip_child.swap(0, Ordering::SeqCst);
+    if pid > 0 {
+        // Negative pid kills the child's process group (wl-paste spawns sh/cat);
+        // fall back to the bare pid if it was not made a group leader.
+        unsafe {
+            libc::kill(-pid, libc::SIGTERM);
+            libc::kill(pid, libc::SIGTERM);
+        }
+    }
+    thread::Builder::new()
+        .name("rewind-exit-watchdog".into())
+        .spawn(|| {
+            thread::sleep(Duration::from_secs(3));
+            std::process::exit(0);
+        })
+        .ok();
+    for h in [cap_h, clip_h, ocr_h].into_iter().flatten() {
+        let _ = h.join();
     }
     Ok(())
 }
@@ -271,6 +312,13 @@ fn handle_command(shared: &Arc<Shared>, cmd: Command) {
         } => {
             if reason == "overlay" {
                 shared.overlay_open.store(paused, Ordering::SeqCst);
+                // Advance the privacy epoch SYNCHRONOUSLY on the overlay
+                // transition so an in-flight capture/OCR/clip job that sampled
+                // the epoch at entry is invalidated the instant the overlay
+                // opens — not later when the capture loop happens to run
+                // refresh_pause. Without this a frame grabbed just before the
+                // overlay opened could still commit after it.
+                refresh_pause(shared);
             }
             emit_state(shared, id);
         }
@@ -651,7 +699,15 @@ fn evaluate_pause(shared: &Shared) -> Option<PauseReason> {
     let clients = if test_capture {
         Vec::new()
     } else {
-        hypr::clients().unwrap_or_default()
+        // Fail closed: if client visibility cannot be determined (hyprctl -j
+        // clients failed or returned garbage), we cannot verify that a private
+        // window / excluded app / title-pattern is NOT on screen. Treat unknown
+        // visibility as a hard pause rather than letting the exclusion checks
+        // pass open on empty input.
+        match hypr::clients() {
+            Ok(c) => c,
+            Err(_) => return Some(PauseReason::Unknown),
+        }
     };
     let locked = if test_capture { false } else { hypr::locked() };
     let idle_ms = if test_capture { 0 } else { hypr::idle_ms() };
@@ -923,6 +979,9 @@ fn capture_loop(shared: Arc<Shared>) {
     let mut session = capture::CaptureSession::new();
     let mut last_unchanged = false;
     loop {
+        if shared.is_stopping() {
+            return;
+        }
         let settings = shared.settings.lock().unwrap().clone();
         let grim = session.using_grim();
         let base_ms = if grim {
@@ -1047,6 +1106,7 @@ fn capture_once(
         .unwrap_or_else(|_| written.display().to_string());
 
     let mut crop_rel = None;
+    let mut crop_bytes = 0i64;
     let mut crop_x = 0i64;
     let mut crop_y = 0i64;
     let mut crop_w = raw.width as i64;
@@ -1071,6 +1131,11 @@ fn capture_once(
             roi.frame.height,
             &crop_path,
         )?;
+        // Count the crop against the managed byte budget so crops (which linger
+        // until OCR consumes them) can't grow unbounded under the cap.
+        crop_bytes = std::fs::metadata(&crop_path)
+            .map(|m| m.len() as i64)
+            .unwrap_or(0);
         files.push(crop_path);
         crop_rel = Some(crop_name);
     }
@@ -1107,6 +1172,7 @@ fn capture_once(
         dhash: hash as i64,
         encoder: enc.as_str().to_string(),
         crop_path: crop_rel,
+        crop_bytes,
     };
 
     if !finalize_capture(shared, settings, &insert, &files, &clients, gen, epoch0)? {
@@ -1561,6 +1627,7 @@ mod tests {
             dhash: 1,
             encoder: "png".into(),
             crop_path: Some(crop_rel.into()),
+            crop_bytes: 0,
         };
         store.insert_frame(&f).unwrap();
         store.record_event(f.ts, "pause", "overlay").unwrap();
@@ -1677,6 +1744,7 @@ mod tests {
             dhash: 9,
             encoder: "png".into(),
             crop_path: Some(crop_rel.into()),
+            crop_bytes: 0,
         };
         let settings = shared.settings.lock().unwrap().clone();
         let epoch0 = shared.privacy_epoch();
@@ -1921,6 +1989,7 @@ mod tests {
                     dhash: 1,
                     encoder: "png".into(),
                     crop_path: None,
+                    crop_bytes: 0,
                 })
             })
             .unwrap()
@@ -2064,6 +2133,7 @@ mod tests {
             dhash: 1,
             encoder: "png".into(),
             crop_path: None,
+            crop_bytes: 0,
         };
         let parked = Arc::new(Barrier::new(2));
         let writer = {
@@ -2178,6 +2248,7 @@ mod tests {
             dhash: 1,
             encoder: "png".into(),
             crop_path: None,
+            crop_bytes: 0,
         };
         let settings = shared.settings.lock().unwrap().clone();
         let epoch0 = shared.privacy_epoch();
@@ -2229,6 +2300,7 @@ mod tests {
                     dhash: 1,
                     encoder: "png".into(),
                     crop_path: None,
+                    crop_bytes: 0,
                 })
             })
             .unwrap()
@@ -2281,6 +2353,7 @@ mod tests {
             dhash: 1,
             encoder: "png".into(),
             crop_path: Some("crops/p.png".into()),
+            crop_bytes: 0,
         };
         shared
             .with_store_mut(|s| s.insert_frame(&frame))
@@ -2589,6 +2662,7 @@ mod tests {
             dhash: 1,
             encoder: "png".into(),
             crop_path: None,
+            crop_bytes: 0,
         };
         let settings = shared.settings.lock().unwrap().clone();
         let committed =
@@ -2623,11 +2697,13 @@ mod tests {
         arm_now(&shared).unwrap();
         let state = data.join("state.json");
         let before = std::fs::read_to_string(&state).unwrap_or_default();
-        // Engage a hard pause, then change + persist settings.
+        // Engage a hard pause, then change + persist a RUNTIME field. Only
+        // runtime consent/arm state is persisted (customization lives in
+        // shell.json, never on disk), so use arm_on_login here.
         shared.overlay_open.store(true, Ordering::SeqCst);
         {
             let mut st = shared.settings.lock().unwrap();
-            st.byte_cap = 9_999_999;
+            st.arm_on_login = true;
         }
         persist_settings(&shared);
         assert!(
@@ -2642,9 +2718,56 @@ mod tests {
         assert!(!shared.pending_settings_save.load(Ordering::SeqCst));
         let after = std::fs::read_to_string(&state).unwrap_or_default();
         assert!(
-            after.contains("9999999"),
-            "the deferred settings save is written once recording resumes"
+            after.contains("armOnLogin") && after.contains("true"),
+            "the deferred runtime-state save is written once recording resumes"
+        );
+        // Customization must never reach disk, paused or not.
+        assert!(
+            !after.contains("byteCap") && !after.contains("excludeApps"),
+            "customization settings must not be persisted to state.json"
         );
         std::env::remove_var("REWIND_TEST_CAPTURE");
+    }
+
+    #[test]
+    fn overlay_setpause_advances_epoch_synchronously() {
+        // Opening the overlay must bump the privacy epoch the instant the
+        // set-pause command is handled, so an in-flight capture/clip job that
+        // sampled the epoch at entry is invalidated immediately — not later when
+        // the capture loop happens to run refresh_pause.
+        let _env = TEST_CAPTURE_ENV_LOCK.lock().unwrap();
+        std::env::set_var("REWIND_TEST_CAPTURE", "1");
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = boot_shared(&tmp.path().join("rewind")).unwrap();
+        {
+            let mut st = shared.settings.lock().unwrap();
+            st.consent_at = now_ms();
+        }
+        arm_now(&shared).unwrap();
+        let before = shared.privacy_epoch.load(Ordering::SeqCst);
+        handle_command(
+            &shared,
+            Command::SetPause {
+                id: 1,
+                reason: "overlay".into(),
+                paused: true,
+            },
+        );
+        let after = shared.privacy_epoch.load(Ordering::SeqCst);
+        assert!(
+            after > before,
+            "overlay set-pause must advance the privacy epoch synchronously"
+        );
+        std::env::remove_var("REWIND_TEST_CAPTURE");
+    }
+
+    #[test]
+    fn unknown_pause_is_a_hard_pause_that_blocks_ocr() {
+        // Client visibility unknown (e.g. hyprctl -j clients failed) is treated
+        // as a hard pause: never None/Idle, so OCR (and every commit gated on
+        // ocr_write_ok) is blocked — the fail-closed guarantee.
+        assert!(!ocr_write_ok(&Some(PauseReason::Unknown)));
+        assert!(ocr_write_ok(&None));
+        assert!(ocr_write_ok(&Some(PauseReason::Idle)));
     }
 }

@@ -26,6 +26,10 @@ pub struct FrameInsert {
     pub dhash: i64,
     pub encoder: String,
     pub crop_path: Option<String>,
+    /// On-disk size of the full-resolution OCR crop file (crop_path), counted
+    /// in the managed byte budget alongside the thumbnail `bytes`. Zeroed when
+    /// OCR finishes and deletes the crop.
+    pub crop_bytes: i64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -172,6 +176,15 @@ impl Store {
                 "#,
             )
             .map_err(|e| e.to_string())?;
+        // Account full-resolution OCR crops in the managed byte budget. The crop
+        // is a separate on-disk file (crop_path) whose size is NOT the frame
+        // thumbnail's `bytes`; without this, crops could grow unbounded while
+        // reported usage (SUM(bytes)) stayed under the cap. Added via ALTER so
+        // existing databases migrate; the error when the column already exists is
+        // intentionally ignored.
+        let _ = self
+            .conn
+            .execute_batch("ALTER TABLE frames ADD COLUMN crop_bytes INTEGER DEFAULT 0;");
         let _ = self.conn.execute_batch(
             "CREATE VIRTUAL TABLE IF NOT EXISTS ocr USING fts5(
                 ts UNINDEXED, text, app, title, clip, tokenize='unicode61'
@@ -188,8 +201,8 @@ impl Store {
         tx.execute(
             "INSERT OR REPLACE INTO frames
              (ts,path,app,title,workspace,output,width,height,out_w,out_h,
-              crop_x,crop_y,crop_w,crop_h,bytes,dhash,encoder,crop_path)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+              crop_x,crop_y,crop_w,crop_h,bytes,dhash,encoder,crop_path,crop_bytes)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
             params![
                 f.ts,
                 f.path,
@@ -208,7 +221,8 @@ impl Store {
                 f.bytes,
                 f.dhash,
                 f.encoder,
-                f.crop_path
+                f.crop_path,
+                f.crop_bytes
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -231,7 +245,7 @@ impl Store {
         }
         loop {
             let total: i64 = tx
-                .query_row("SELECT COALESCE(SUM(bytes),0) FROM frames", [], |r| r.get(0))
+                .query_row("SELECT COALESCE(SUM(bytes),0)+COALESCE(SUM(crop_bytes),0) FROM frames", [], |r| r.get(0))
                 .map_err(|e| e.to_string())?;
             if total <= cap {
                 break;
@@ -298,7 +312,7 @@ impl Store {
         loop {
             let total: i64 = self
                 .conn
-                .query_row("SELECT COALESCE(SUM(bytes),0) FROM frames", [], |r| r.get(0))
+                .query_row("SELECT COALESCE(SUM(bytes),0)+COALESCE(SUM(crop_bytes),0) FROM frames", [], |r| r.get(0))
                 .map_err(|e| e.to_string())?;
             if total <= cap {
                 break;
@@ -553,8 +567,8 @@ impl Store {
         tx.execute(
             "INSERT OR REPLACE INTO frames
              (ts,path,app,title,workspace,output,width,height,out_w,out_h,
-              crop_x,crop_y,crop_w,crop_h,bytes,dhash,encoder,crop_path)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+              crop_x,crop_y,crop_w,crop_h,bytes,dhash,encoder,crop_path,crop_bytes)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
             params![
                 insert.ts,
                 insert.path,
@@ -573,7 +587,8 @@ impl Store {
                 insert.bytes,
                 insert.dhash,
                 insert.encoder,
-                insert.crop_path
+                insert.crop_path,
+                insert.crop_bytes
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -853,7 +868,7 @@ impl Store {
         }
         self.conn
             .execute(
-                "UPDATE frames SET crop_path=NULL WHERE ts=?1",
+                "UPDATE frames SET crop_path=NULL, crop_bytes=0 WHERE ts=?1",
                 params![ts],
             )
             .map_err(|e| e.to_string())?;
@@ -1180,7 +1195,7 @@ impl Store {
             .map_err(|e| e.to_string())?;
         let bytes: i64 = self
             .conn
-            .query_row("SELECT COALESCE(SUM(bytes),0) FROM frames", [], |r| r.get(0))
+            .query_row("SELECT COALESCE(SUM(bytes),0)+COALESCE(SUM(crop_bytes),0) FROM frames", [], |r| r.get(0))
             .map_err(|e| e.to_string())?;
         let first_ts: i64 = self
             .conn
@@ -1284,6 +1299,7 @@ impl Store {
             dhash: 1,
             encoder: "png".into(),
             crop_path: None,
+            crop_bytes: 0,
         };
         self.insert_frame(&f)?;
         self.insert_clip(f.ts, "text/plain", "abc123deadbeef")?;
@@ -1400,7 +1416,37 @@ mod tests {
             dhash: ts,
             encoder: "png".into(),
             crop_path: None,
+            crop_bytes: 0,
         }
+    }
+
+    #[test]
+    fn crop_bytes_count_in_managed_budget_and_prune() {
+        let dir = tempdir().unwrap();
+        let mut s = Store::open(&dir.path().join("db.sqlite")).unwrap();
+        // One frame: tiny thumbnail, a large OCR crop that hasn't been consumed.
+        let mut f = sample(1000, 10, "a");
+        f.crop_path = Some("crops/1000.png".into());
+        f.crop_bytes = 5_000;
+        s.insert_frame(&f).unwrap();
+        // The managed budget counts the crop, not just the thumbnail.
+        assert_eq!(s.stats().unwrap().bytes, 5_010);
+        // A cap between thumbnail-only and thumbnail+crop must trigger pruning,
+        // which it would not if crops were excluded from accounting.
+        assert!(s.prune_to(100).unwrap() >= 1, "crop bytes must drive pruning");
+        assert_eq!(s.stats().unwrap().bytes, 0);
+        // After OCR consumes+deletes a crop, its bytes leave the budget.
+        let mut g = sample(2000, 20, "b");
+        g.crop_path = Some("crops/2000.png".into());
+        g.crop_bytes = 9_000;
+        s.insert_frame(&g).unwrap();
+        assert_eq!(s.stats().unwrap().bytes, 9_020);
+        s.clear_crop(2000).unwrap();
+        assert_eq!(
+            s.stats().unwrap().bytes,
+            20,
+            "clearing a consumed crop drops its bytes from the budget"
+        );
     }
 
     #[test]

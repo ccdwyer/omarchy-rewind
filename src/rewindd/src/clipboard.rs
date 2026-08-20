@@ -1,6 +1,7 @@
 use crate::encode::which;
 use crate::{now_ms, DaemonState, CLIP_CAP};
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
@@ -104,21 +105,32 @@ pub(crate) fn watch(shared: Arc<DaemonState>) {
         return;
     }
     loop {
+        if shared.is_stopping() {
+            return;
+        }
         // Each clipboard change is written in full, then a NUL, so multiline
         // text is one event instead of one ingest per line.
-        let child = Command::new("wl-paste")
-            .args(["-w", "-t", "text", "sh", "-c", "cat; printf '\\0'"])
+        let mut cmd = Command::new("wl-paste");
+        cmd.args(["-w", "-t", "text", "sh", "-c", "cat; printf '\\0'"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn();
+            .stderr(Stdio::null());
+        // Run the watcher in its own process group so shutdown can terminate the
+        // whole wl-paste/sh/cat tree with one signal.
+        cmd.process_group(0);
+        let child = cmd.spawn();
         let Ok(mut child) = child else {
             thread::sleep(Duration::from_secs(5));
             continue;
         };
+        // Register the pid so run_daemon's shutdown can explicitly terminate it.
+        shared.set_clip_child(child.id() as i32);
         if let Some(stdout) = child.stdout.take() {
             let mut reader = BufReader::new(stdout);
             loop {
+                if shared.is_stopping() {
+                    break;
+                }
                 let mut buf = Vec::new();
                 match reader.read_until(0, &mut buf) {
                     Ok(0) => break,
@@ -136,7 +148,15 @@ pub(crate) fn watch(shared: Arc<DaemonState>) {
                 }
             }
         }
+        // On shutdown, make sure our own child is gone before returning.
+        if shared.is_stopping() {
+            let _ = child.kill();
+        }
         let _ = child.wait();
+        shared.set_clip_child(0);
+        if shared.is_stopping() {
+            return;
+        }
         thread::sleep(Duration::from_secs(1));
     }
 }

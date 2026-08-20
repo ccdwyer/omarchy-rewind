@@ -12,6 +12,10 @@ pub enum PauseReason {
     Portal,
     PrivateBrowsing,
     TitlePattern,
+    /// Client visibility could not be determined (e.g. `hyprctl -j clients`
+    /// failed). Fail closed: a hard pause, never Idle/None, so exclusion and
+    /// private-window checks cannot pass open on a transient IPC error.
+    Unknown,
 }
 
 impl PauseReason {
@@ -25,6 +29,7 @@ impl PauseReason {
             PauseReason::Portal => "portal",
             PauseReason::PrivateBrowsing => "private-browsing",
             PauseReason::TitlePattern => "title-pattern",
+            PauseReason::Unknown => "unknown",
         }
     }
 }

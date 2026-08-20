@@ -17,6 +17,7 @@ Item {
   readonly property string pluginId: "io.github.chris.rewind"
   readonly property string pluginDir: adapter.pluginDirFrom(Qt.resolvedUrl("."))
   readonly property string dataDir: adapter.dataDir()
+  readonly property string snapDir: adapter.snapDir()
 
   property string helperPath: ""
   property bool helperIsBinary: false
@@ -60,16 +61,18 @@ Item {
   property string lastQuery: ""
   property double firstTs: 0
   property double lastTs: 0
-  // Snapshot files are written only while genuinely recording — armed AND not
-  // paused. Writing them during any pause (lock, idle, overlay, portal,
-  // exclusion, private-browsing, title-pattern) would be a filesystem write
-  // while paused, violating the zero-writes-while-paused contract. `armed` and
-  // `paused` are set from the helper's authoritative events. The in-memory
-  // properties hold the latest values while paused; `onPersistUiChanged`
-  // flushes them once recording resumes.
-  readonly property bool persistUi: root.armed && !root.paused
-  onPersistUiChanged: {
-    if (root.persistUi)
+  // The six snapshot files are the overlay/bar READ-RESPONSE channel (timeline,
+  // clips, moment, hits, plan, stats), written to the ephemeral tmpfs snapDir —
+  // they carry only already-authorized data served back to the UI, never new
+  // observation. They are published whenever there is a live consumer that has
+  // consented: while recording (armed) OR while the overlay is open (even if the
+  // overlay's own pause is active, or the user is browsing history disarmed).
+  // A fresh, never-consented install publishes nothing. This is what makes the
+  // overlay functional the moment it opens (which itself pauses capture); the
+  // capture/OCR zero-writes-while-paused contract lives entirely in the helper.
+  readonly property bool publishUi: root.consent && (root.armed || root.overlayOpen)
+  onPublishUiChanged: {
+    if (root.publishUi)
       root.publish()
   }
 
@@ -137,7 +140,7 @@ Item {
       root.lastStatus = "ready"
       send("configure", root.settingsPayload())
       send("stats", {})
-      if (root.persistUi)
+      if (root.publishUi)
         root.publish()
       return
     }
@@ -255,7 +258,7 @@ Item {
   }
 
   function publish() {
-    if (!root.persistUi)
+    if (!root.publishUi)
       return
     uiSnap.setText(JSON.stringify(root.statsObject()) + "\n")
     timelineSnap.setText(JSON.stringify({
@@ -315,10 +318,13 @@ Item {
   }
 
   function disarm() {
+    // Do NOT optimistically flip armed/paused here. Recording is still on until
+    // the helper acknowledges the disarm (it replies with an authoritative
+    // `state` event that sets armed=false). If `send` fails (stdin-failed) the
+    // helper keeps recording and armed stays true — so the bar never shows
+    // "disarmed" while recording is actually still running, and never on a
+    // failed disarm. status() returns the current (pre-ack) truthful state.
     send("disarm", {})
-    root.armed = false
-    root.pauseReason = "disarmed"
-    root.paused = false
     return root.status()
   }
 
@@ -465,14 +471,30 @@ Item {
   function ping() { return "ok" }
   function status() { return JSON.stringify(root.statsObject()) }
 
+  property bool triedBuild: false
+
   function findHelper() {
     var paths = adapter.resolveHelper(root.pluginDir)
+    // Prefer the compiled recorder. If it is absent but the machine can build it
+    // (cargo present, build.sh shipped) and we have not already tried, report
+    // "buildable" so we compile it on first run — recording needs the Rust
+    // binary; the shell fallback cannot record. Only if neither the binary nor a
+    // build path exists do we fall back to the (non-recording) compat helper.
+    var buildable = root.triedBuild ? "" : "elif command -v cargo >/dev/null 2>&1 && [ -f \"$3\" ]; then echo buildable; "
     probeProc.command = [
       "sh", "-c",
-      "if [ -x \"$1\" ]; then echo binary; elif [ -x \"$2\" ]; then echo fallback; else echo missing; fi",
-      "sh", paths.binary, paths.fallback
+      "if [ -x \"$1\" ]; then echo binary; " + buildable + "elif [ -x \"$2\" ]; then echo fallback; else echo missing; fi",
+      "sh", paths.binary, paths.fallback, root.pluginDir + "/build.sh"
     ]
     probeProc.running = true
+  }
+
+  function buildHelper() {
+    root.triedBuild = true
+    root.helperStatus = "building"
+    root.lastStatus = "building recorder…"
+    buildProc.command = ["sh", "-c", "cd \"$1\" && sh build.sh >/dev/null 2>&1", "sh", root.pluginDir]
+    buildProc.running = true
   }
 
   function startHelper(kind) {
@@ -505,11 +527,25 @@ Item {
         var kind = String(text || "").trim()
         if (kind === "binary" || kind === "fallback")
           root.startHelper(kind)
+        else if (kind === "buildable")
+          root.buildHelper()
         else {
           root.helperStatus = "missing"
           root.lastStatus = "helper missing"
         }
       }
+    }
+  }
+
+  Process {
+    id: buildProc
+    running: false
+    stdout: StdioCollector { }
+    stderr: StdioCollector { }
+    onExited: {
+      // After building, re-probe: prefer the freshly built binary, else fall
+      // back. triedBuild is now set, so this cannot loop.
+      root.findHelper()
     }
   }
 
@@ -552,12 +588,12 @@ Item {
     }
   }
 
-  FileView { id: uiSnap; path: root.persistUi ? (root.dataDir + "/ui.json") : ""; atomicWrites: true; printErrors: false }
-  FileView { id: timelineSnap; path: root.persistUi ? (root.dataDir + "/timeline.json") : ""; atomicWrites: true; printErrors: false }
-  FileView { id: clipsSnap; path: root.persistUi ? (root.dataDir + "/clips.json") : ""; atomicWrites: true; printErrors: false }
-  FileView { id: momentSnap; path: root.persistUi ? (root.dataDir + "/moment.json") : ""; atomicWrites: true; printErrors: false }
-  FileView { id: hitsSnap; path: root.persistUi ? (root.dataDir + "/hits.json") : ""; atomicWrites: true; printErrors: false }
-  FileView { id: planSnap; path: root.persistUi ? (root.dataDir + "/plan.json") : ""; atomicWrites: true; printErrors: false }
+  FileView { id: uiSnap; path: root.publishUi ? (root.snapDir + "/ui.json") : ""; atomicWrites: true; printErrors: false }
+  FileView { id: timelineSnap; path: root.publishUi ? (root.snapDir + "/timeline.json") : ""; atomicWrites: true; printErrors: false }
+  FileView { id: clipsSnap; path: root.publishUi ? (root.snapDir + "/clips.json") : ""; atomicWrites: true; printErrors: false }
+  FileView { id: momentSnap; path: root.publishUi ? (root.snapDir + "/moment.json") : ""; atomicWrites: true; printErrors: false }
+  FileView { id: hitsSnap; path: root.publishUi ? (root.snapDir + "/hits.json") : ""; atomicWrites: true; printErrors: false }
+  FileView { id: planSnap; path: root.publishUi ? (root.snapDir + "/plan.json") : ""; atomicWrites: true; printErrors: false }
 
   Connections {
     target: Hyprland
@@ -620,6 +656,11 @@ Item {
   }
 
   Component.onCompleted: {
+    // Ensure the ephemeral snapshot dir exists (tmpfs runtime dir), 0700, before
+    // any FileView publishes into it.
+    try {
+      Quickshell.execDetached(["mkdir", "-p", "-m", "700", root.snapDir])
+    } catch (e) {}
     root.findHelper()
   }
 

@@ -183,3 +183,50 @@ Conservative choices where the Omarchy / Quickshell / Hyprland API was not 100% 
   This env var is used only by tests and `scripts/network-audit.sh`.
 - Rust unit tests run in Linux CI; the JS harness skips them cleanly when
   `cargo` is absent (the macOS authoring host).
+
+## Round 15 review
+
+- **Overlay read-response channel (snapshots) is separate from capture
+  gating.** Opening the overlay pauses *capture* (we must not record the overlay
+  itself), but the overlay still needs to show your history. The six snapshot
+  files (timeline/clips/moment/hits/plan/stats) are published whenever there is a
+  consented consumer — while recording **or** while the overlay is open — and
+  they live in the ephemeral tmpfs runtime dir (`$XDG_RUNTIME_DIR/rewind`, 0700,
+  cleared on logout), not the persistent data dir. They carry only
+  already-authorized data served back to the UI, never new observation, so this
+  does not weaken "zero observation-data writes while paused." A fresh,
+  never-consented install publishes nothing.
+- **Bar truth on disarm.** `Service.disarm()` no longer optimistically flips
+  `armed`/`paused`; the chip changes only when the helper's authoritative `state`
+  event arrives. So the dot never shows "disarmed" while recording is still on,
+  and never after a failed disarm write (`send` failure leaves armed=true).
+- **Fresh-install recorder.** On first run, if `bin/rewindd` is absent but
+  `cargo` is present, the service builds it via `build.sh` (bar shows
+  "building recorder…") and starts the compiled binary; `triedBuild` prevents a
+  build loop. Recording works from a clean `omarchy plugin add … --enable`.
+- **Fallback operates on the real SQLite store.** `compat/rewindd.sh`
+  query/timeline/moment/clips/stats/copy-clip/wipe use python3's `sqlite3` module
+  against `rewind.db` (never a legacy JSONL index). A wipe deletes the real
+  frame/ocr/clip/layout/event rows **and** unlinks the frame/crop files inside a
+  transaction, then reports the true count; a missing DB reports 0 honestly. No
+  `eval` of untrusted settings strings (load_state/merge_configure read only
+  numeric/bool runtime fields via a safe read).
+- **Quattro settings.** `state.json` persists only runtime consent/arm state
+  (`consentAt`, `armed`, `armOnLogin`). Every customization value (byte cap,
+  cadence, idle, excludes, title patterns) comes exclusively from the inline
+  shell.json entry via `configure`, never duplicated to disk.
+- **Fail-closed pause.** If `hyprctl -j clients` errors, `evaluate_pause` returns
+  the hard `Unknown` pause (never None/Idle) — a transient IPC failure while a
+  private/excluded window is on screen cannot let capture proceed.
+- **Synchronous overlay epoch.** Handling `set-pause reason=overlay` advances the
+  privacy epoch synchronously, so an in-flight capture/clip job is invalidated
+  the instant the overlay opens.
+- **OCR crops are in the managed byte budget.** `frames.crop_bytes` counts the
+  full-resolution OCR crop; the cap sums `bytes + crop_bytes` and prunes
+  frame/crop pairs together. OCR zeroes `crop_bytes` when it consumes+deletes a
+  crop, so crops cannot grow unbounded under the cap.
+- **Cooperative shutdown.** On `shutdown` the daemon sets a `stopping` flag (the
+  capture/OCR/clipboard workers check it and exit their loops), explicitly
+  terminates the persistent `wl-paste` clipboard child (its own process group),
+  and joins the workers; a 3 s watchdog guarantees the process still exits if a
+  join hangs.

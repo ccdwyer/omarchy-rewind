@@ -58,19 +58,38 @@ impl Default for Settings {
     }
 }
 
+/// The ONLY thing persisted to `state.json`: runtime consent/arm state. Every
+/// customization value (byte cap, cadence, idle, excludes, title patterns) comes
+/// exclusively from the inline plugin entry in `shell.json`, pushed to the
+/// daemon via `configure` — never duplicated to disk, per the Quattro single
+/// source-of-truth settings model. Persisting these three is not customization;
+/// it is the durable consent boundary the privacy contract requires.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct PersistedState {
+    #[serde(default)]
+    consent_at: i64,
+    #[serde(default)]
+    armed: bool,
+    #[serde(default)]
+    arm_on_login: bool,
+}
+
 impl Settings {
     pub fn load(path: &Path) -> Result<Self, String> {
         if !path.exists() {
             return Ok(Self::default());
         }
         let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-        let mut s: Settings = serde_json::from_str(&raw).unwrap_or_default();
-        if s.exclude_apps.is_empty() {
-            s.exclude_apps = default_excludes();
-        }
-        if s.byte_cap <= 0 {
-            s.byte_cap = DEFAULT_BYTE_CAP;
-        }
+        // Read ONLY the runtime consent/arm fields from disk; all configurable
+        // values stay at their defaults until the shell pushes them via
+        // `configure`. (Tolerates a legacy full-settings state.json — the extra
+        // keys are simply ignored by PersistedState.)
+        let p: PersistedState = serde_json::from_str(&raw).unwrap_or_default();
+        let mut s = Settings::default();
+        s.consent_at = p.consent_at;
+        s.armed = p.armed;
+        s.arm_on_login = p.arm_on_login;
         Ok(s)
     }
 
@@ -78,7 +97,12 @@ impl Settings {
         if let Some(parent) = path.parent() {
             perms::secure_dir(parent).map_err(|e| e.to_string())?;
         }
-        let body = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
+        let persisted = PersistedState {
+            consent_at: self.consent_at,
+            armed: self.armed,
+            arm_on_login: self.arm_on_login,
+        };
+        let body = serde_json::to_string_pretty(&persisted).map_err(|e| e.to_string())?;
         let tmp = path.with_file_name(format!(
             ".state-{}.tmp",
             std::process::id()
@@ -218,8 +242,8 @@ mod tests {
         let mut s = Settings::default();
         s.consent_at = 99;
         s.save(&path).unwrap();
-        let parsed: Settings =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        // state.json holds only runtime state; load reads it back.
+        let parsed = Settings::load(&path).unwrap();
         assert_eq!(parsed.consent_at, 99);
         let tmps: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()

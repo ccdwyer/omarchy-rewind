@@ -37,6 +37,23 @@ Item {
     return homeDir() + "/.local/share/rewind"
   }
 
+  // Ephemeral IPC snapshot channel: the service publishes overlay/bar read
+  // responses (timeline, clips, moment, search hits, plan, stats) here, and the
+  // overlay/bar read them. It lives in the tmpfs runtime dir (XDG_RUNTIME_DIR,
+  // per-user 0700, cleared on logout), NOT the persistent data dir — these are
+  // transient query responses derived from already-authorized data, never stored
+  // observation. Serving them works while a privacy pause (e.g. the overlay's own
+  // pause) is active, because reading already-recorded data is not a write of new
+  // content. Falls back to the data dir only if no runtime dir exists.
+  function snapDir() {
+    try {
+      var rt = Quickshell.env("XDG_RUNTIME_DIR")
+      if (rt && rt.length)
+        return rt + "/rewind"
+    } catch (e) {}
+    return dataDir()
+  }
+
   function resolveHelper(dir) {
     return {
       binary: dir + "/bin/rewindd",

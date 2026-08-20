@@ -21,17 +21,17 @@ if [ -z "$DATA" ]; then
   fi
 fi
 FRAMES="$DATA/frames"
-CLIPS="$DATA/clips.jsonl"
-INDEX="$DATA/index.jsonl"
 STATE="$DATA/state.json"
 LAYOUTS="$DATA/layouts"
+# The Rust recorder stores everything in this SQLite database. The fallback
+# reads/wipes THAT store (via python3's built-in sqlite3), never a legacy JSONL
+# index — so query/stats reflect real recordings and a wipe actually deletes
+# sensitive data instead of reporting a false success against an empty index.
+DB="$DATA/rewind.db"
 
 prepare_data() {
   mkdir -p "$FRAMES" "$LAYOUTS"
   chmod 700 "$DATA" "$FRAMES" "$LAYOUTS" 2>/dev/null || true
-  [ -f "$CLIPS" ] || : >"$CLIPS"
-  [ -f "$INDEX" ] || : >"$INDEX"
-  chmod 600 "$CLIPS" "$INDEX" 2>/dev/null || true
 }
 
 CONSENT=0
@@ -56,29 +56,22 @@ load_state() {
   if [ ! -f "$STATE" ]; then
     return 0
   fi
-  eval "$(python3 -c '
+  # Read ONLY the runtime consent/arm fields (ints/bool), one per line — never
+  # eval() a string field from disk, so a crafted state.json cannot inject shell.
+  vals=$(python3 -c '
 import json,sys
 try:
     s=json.load(open(sys.argv[1]))
 except Exception:
     s={}
-def i(k,d=0):
-    print("%s=%s"%(k,int(s.get(k) or d)))
-print("CONSENT=%d"%(1 if s.get("consentAt") else 0))
-print("CONSENT_AT=%d"%int(s.get("consentAt") or 0))
-print("ARMONLOGIN=%d"%(1 if s.get("armOnLogin") else 0))
-print("BYTECAP=%d"%int(s.get("byteCap") or 2147483648))
-print("CADENCE=%d"%int(s.get("cadenceMs") or 3000))
-print("IDLEPAUSE=%d"%int(s.get("idlePauseSec") or 120))
-ex=s.get("excludeApps") or ""
-if isinstance(ex,list):
-    ex=",".join(ex)
-print("EXCLUDES=%r"%ex)
-tp=s.get("titlePausePatterns") or ""
-if isinstance(tp,list):
-    tp=",".join(tp)
-print("TITLEPAUSE=%r"%tp)
-' "$STATE" 2>/dev/null || true)"
+print(int(s.get("consentAt") or 0))
+print(1 if s.get("armOnLogin") else 0)
+' "$STATE" 2>/dev/null) || return 0
+  CONSENT_AT=$(printf '%s\n' "$vals" | sed -n 1p)
+  ARMONLOGIN=$(printf '%s\n' "$vals" | sed -n 2p)
+  case "$CONSENT_AT" in ''|*[!0-9]*) CONSENT_AT=0 ;; esac
+  case "$ARMONLOGIN" in ''|*[!0-9]*) ARMONLOGIN=0 ;; esac
+  if [ "$CONSENT_AT" -gt 0 ]; then CONSENT=1; else CONSENT=0; fi
 }
 
 # Persist state atomically: write a private temp file in the same directory,
@@ -134,67 +127,52 @@ except Exception:
 
 merge_configure() {
   line="$1"
-  eval "$(python3 -c '
+  # Only the numeric byte cap and the armOnLogin bool matter for the
+  # non-recording fallback (it never captures, so excludes/title patterns are
+  # unused). Emit them as plain integers, one per line, and assign via a safe
+  # read loop — no eval, so a crafted excludeApps/title value cannot inject
+  # shell metacharacters.
+  vals=$(python3 -c '
 import json,sys
-v=json.loads(sys.argv[1])
+try:
+    v=json.loads(sys.argv[1])
+except Exception:
+    v={}
+cap=""
 if v.get("byteCapGb") not in (None, ""):
-    print("BYTECAP=%d" % int(float(v["byteCapGb"])*1024*1024*1024))
+    cap=str(int(float(v["byteCapGb"])*1024*1024*1024))
 elif v.get("byteCap") not in (None, ""):
-    print("BYTECAP=%d" % int(v["byteCap"]))
-if v.get("cadenceMs") not in (None, ""):
-    print("CADENCE=%d" % int(v["cadenceMs"]))
-if v.get("idlePauseSec") not in (None, ""):
-    print("IDLEPAUSE=%d" % int(v["idlePauseSec"]))
-ex=v.get("excludeApps") if v.get("excludeApps") not in (None, "") else v.get("exclude")
-if ex not in (None, ""):
-    if isinstance(ex, list):
-        ex=",".join(str(x) for x in ex)
-    print("EXCLUDES=%r" % ex)
-tp=v.get("titlePausePatterns") if v.get("titlePausePatterns") not in (None, "") else v.get("titlePause")
-if tp not in (None, ""):
-    if isinstance(tp, list):
-        tp=",".join(str(x) for x in tp)
-    print("TITLEPAUSE=%r" % tp)
-if "armOnLogin" in v:
-    print("ARMONLOGIN=%d" % (1 if v.get("armOnLogin") else 0))
-' "$line" 2>/dev/null || true)"
-}
-
-bytes_used() {
-  if [ ! -d "$FRAMES" ]; then
-    printf '0\n'
-    return 0
-  fi
-  du -sk "$FRAMES" 2>/dev/null | awk '{print $1 * 1024; found=1} END {if (!found) print 0}'
-}
-
-frame_count() {
-  if [ ! -d "$FRAMES" ]; then
-    printf '0\n'
-    return 0
-  fi
-  n=$(find "$FRAMES" -type f 2>/dev/null | wc -l | tr -d ' ')
-  printf '%s\n' "${n:-0}"
+    cap=str(int(v["byteCap"]))
+print(cap)
+print("1" if v.get("armOnLogin") else "0" if "armOnLogin" in v else "")
+' "$line" 2>/dev/null) || return 0
+  cap=$(printf '%s\n' "$vals" | sed -n 1p)
+  al=$(printf '%s\n' "$vals" | sed -n 2p)
+  case "$cap" in ''|*[!0-9]*) : ;; *) BYTECAP="$cap" ;; esac
+  case "$al" in 0|1) ARMONLOGIN="$al" ;; esac
 }
 
 stats_json() {
-  used=$(bytes_used)
-  n=$(frame_count)
-  python3 -c 'import json,sys
+  python3 -c '
+import json,sys,sqlite3,os
+db=sys.argv[1]; consent=sys.argv[2]=="1"; cap=int(sys.argv[3]); ver=sys.argv[4]
+frames=0; used=0; first=0; last=0
+if os.path.exists(db):
+    try:
+        c=sqlite3.connect("file:%s?mode=ro"%db, uri=True)
+        frames=c.execute("SELECT COUNT(*) FROM frames").fetchone()[0] or 0
+        used=c.execute("SELECT COALESCE(SUM(bytes),0)+COALESCE(SUM(crop_bytes),0) FROM frames").fetchone()[0] or 0
+        row=c.execute("SELECT COALESCE(MIN(ts),0),COALESCE(MAX(ts),0) FROM frames").fetchone()
+        first,last=row[0] or 0,row[1] or 0
+        c.close()
+    except Exception:
+        pass
 print(json.dumps({
-  "armed": False,
-  "consent": sys.argv[1]=="1",
-  "paused": True,
-  "reason": "compat-norecord",
-  "frames": int(sys.argv[2]),
-  "framesToday": int(sys.argv[2]),
-  "bytes": int(sys.argv[3]),
-  "byteCap": int(sys.argv[4]),
-  "encoder": "none",
-  "ocrAvailable": False,
-  "capture": "none",
-  "version": sys.argv[5],
-}))' "$CONSENT" "$n" "$used" "$BYTECAP" "$VERSION"
+  "armed": False, "consent": consent, "paused": True, "reason": "compat-norecord",
+  "frames": frames, "framesToday": frames, "bytes": used, "byteCap": cap,
+  "firstTs": first, "lastTs": last,
+  "encoder": "none", "ocrAvailable": False, "capture": "none", "version": ver,
+}))' "$DB" "$CONSENT" "$BYTECAP" "$VERSION"
 }
 
 reply() {
@@ -228,206 +206,167 @@ else:
 }
 
 query_index() {
-  q="$1"
   python3 -c '
-import json,sys,os
-q=sys.argv[1].lower()
-idx=sys.argv[2]
-clips=sys.argv[3]
-frames=[]
+import json,sys,os,sqlite3
+q=sys.argv[1]; db=sys.argv[2]
+if not q or not os.path.exists(db):
+    print(json.dumps({"hits":[],"ocrAvailable":False,"query":q})); sys.exit(0)
 try:
-    for line in open(idx, encoding="utf-8"):
-        line=line.strip()
-        if not line: continue
-        try: frames.append(json.loads(line))
-        except Exception: pass
-except FileNotFoundError:
-    pass
-clip_rows=[]
+    c=sqlite3.connect("file:%s?mode=ro"%db, uri=True); c.row_factory=sqlite3.Row
+except Exception:
+    print(json.dumps({"hits":[],"ocrAvailable":False,"query":q})); sys.exit(0)
+ocr_ok=False
 try:
-    for line in open(clips, encoding="utf-8"):
-        line=line.strip()
-        if not line: continue
-        try: clip_rows.append(json.loads(line))
-        except Exception: pass
-except FileNotFoundError:
+    c.execute("SELECT 1 FROM ocr LIMIT 1"); ocr_ok=True
+except Exception:
+    ocr_ok=False
+like="%"+q.lower()+"%"
+hits=[]; seen=set()
+def add(ts,f,snippet=""):
+    ts=int(ts or 0)
+    if ts in seen: return
+    seen.add(ts)
+    row={"ts":ts,"path":f["path"] if f else "","app":(f["app"] if f else "clipboard") or "",
+         "title":(f["title"] if f else "") or "","snippet":snippet,"boxes":[]}
+    hits.append(row)
+def frame_at(ts):
+    try:
+        return c.execute("SELECT ts,path,app,title FROM frames WHERE ts<=? ORDER BY ts DESC LIMIT 1",(ts,)).fetchone() \
+            or c.execute("SELECT ts,path,app,title FROM frames WHERE ts>=? ORDER BY ts ASC LIMIT 1",(ts,)).fetchone()
+    except Exception:
+        return None
+try:
+    if ocr_ok:
+        for r in c.execute("SELECT ts,text FROM ocr WHERE ocr MATCH ? LIMIT 60",(q,)):
+            f=frame_at(r["ts"]); add(r["ts"],f,(r["text"] or "")[:80])
+except Exception:
     pass
-
-def nearest(ts):
-    before=[f for f in frames if int(f.get("ts") or 0)<=ts]
-    if before:
-        return max(before, key=lambda f: int(f.get("ts") or 0))
-    after=[f for f in frames if int(f.get("ts") or 0)>=ts]
-    if after:
-        return min(after, key=lambda f: int(f.get("ts") or 0))
-    return None
-
-hits=[]
-seen=set()
-for f in frames:
-    blob=" ".join([str(f.get("title","")), str(f.get("app","")), str(f.get("path",""))]).lower()
-    if q and q in blob:
-        ts=int(f.get("ts") or 0)
-        if ts in seen: continue
-        seen.add(ts)
-        hits.append(f)
-for c in clip_rows:
-    content=str(c.get("content",""))
-    if q and q in content.lower():
-        f=nearest(int(c.get("ts") or 0))
-        row=dict(f) if f else {"ts": c.get("ts"), "path":"", "app":"clipboard", "title":""}
-        ts=int(row.get("ts") or 0)
-        if ts in seen: continue
-        seen.add(ts)
-        row=dict(row)
-        row["snippet"]=content[:80]
-        row["boxes"]=[]
-        hits.append(row)
-print(json.dumps({"hits":hits[-50:],"ocrAvailable":False,"query":q}))
-' "$q" "$INDEX" "$CLIPS" 2>/dev/null || echo '{"hits":[],"ocrAvailable":false}'
+try:
+    for r in c.execute("SELECT ts,path,app,title FROM frames WHERE lower(title) LIKE ? OR lower(app) LIKE ? ORDER BY ts DESC LIMIT 60",(like,like)):
+        add(r["ts"],r,(r["title"] or ""))
+except Exception:
+    pass
+try:
+    for r in c.execute("SELECT ts,content FROM clips WHERE lower(content) LIKE ? ORDER BY ts DESC LIMIT 60",(like,)):
+        add(r["ts"],frame_at(r["ts"]),(r["content"] or "")[:80])
+except Exception:
+    pass
+c.close()
+hits.sort(key=lambda h:h["ts"])
+print(json.dumps({"hits":hits[-50:],"ocrAvailable":ocr_ok,"query":q}))
+' "$1" "$DB" 2>/dev/null || echo '{"hits":[],"ocrAvailable":false,"query":""}'
 }
 
 timeline_json() {
   python3 -c '
-import json,sys
-frames=[]
-try:
-    for line in open(sys.argv[1], encoding="utf-8"):
-        line=line.strip()
-        if not line: continue
-        try: frames.append(json.loads(line))
-        except Exception: pass
-except FileNotFoundError:
-    pass
-print(json.dumps({"frames":frames[-400:],"gaps":[]}))
-' "$INDEX" 2>/dev/null || echo '{"frames":[],"gaps":[]}'
+import json,sys,os,sqlite3
+db=sys.argv[1]; frames=[]
+if os.path.exists(db):
+    try:
+        c=sqlite3.connect("file:%s?mode=ro"%db, uri=True); c.row_factory=sqlite3.Row
+        rows=c.execute("SELECT ts,path,app,title,workspace,output FROM frames ORDER BY ts DESC LIMIT 400").fetchall()
+        frames=[{"ts":r["ts"],"path":r["path"],"app":r["app"] or "","title":r["title"] or "",
+                 "workspace":r["workspace"] or "","output":r["output"] or ""} for r in reversed(rows)]
+        c.close()
+    except Exception:
+        frames=[]
+gaps=[]
+for a,b in zip(frames,frames[1:]):
+    if int(b["ts"])-int(a["ts"])>15000:
+        gaps.append({"from":a["ts"],"to":b["ts"],"reason":"gap"})
+print(json.dumps({"frames":frames,"gaps":gaps}))
+' "$DB" 2>/dev/null || echo '{"frames":[],"gaps":[]}'
 }
 
 clips_json() {
   python3 -c '
-import json,sys
-clips=[]
-try:
-    for line in open(sys.argv[1], encoding="utf-8"):
-        line=line.strip()
-        if not line: continue
-        try: clips.append(json.loads(line))
-        except Exception: pass
-except FileNotFoundError:
-    pass
-print(json.dumps({"clips":list(reversed(clips[-120:]))}))
-' "$CLIPS" 2>/dev/null || echo '{"clips":[]}'
+import json,sys,os,sqlite3
+db=sys.argv[1]; clips=[]
+if os.path.exists(db):
+    try:
+        c=sqlite3.connect("file:%s?mode=ro"%db, uri=True); c.row_factory=sqlite3.Row
+        for r in c.execute("SELECT ts,content,mime FROM clips ORDER BY ts DESC LIMIT 120"):
+            clips.append({"ts":r["ts"],"content":r["content"] or "","mime":r["mime"] or "text/plain"})
+        c.close()
+    except Exception:
+        clips=[]
+print(json.dumps({"clips":clips}))
+' "$DB" 2>/dev/null || echo '{"clips":[]}'
 }
 
 moment_json() {
-  ts="$1"
   python3 -c '
-import json,sys,os
-ts=int(sys.argv[1] or 0)
-idx, clips_path, root = sys.argv[2], sys.argv[3], sys.argv[4]
-frames=[]
-try:
-    for line in open(idx, encoding="utf-8"):
-        try: frames.append(json.loads(line))
-        except Exception: pass
-except FileNotFoundError:
-    pass
-frame=None
-for f in frames:
-    if int(f.get("ts") or 0)==ts:
-        frame=f
-if frame is None:
-    before=[f for f in frames if int(f.get("ts") or 0)<=ts]
-    frame=max(before, key=lambda f: int(f.get("ts") or 0)) if before else None
-clip=""
-try:
-    for line in open(clips_path, encoding="utf-8"):
-        try: row=json.loads(line)
-        except Exception: continue
-        if int(row.get("ts") or 0)<=ts:
-            clip=row.get("content","")
-except FileNotFoundError:
-    pass
-windows=[]
-if frame:
-    lp=os.path.join(root,"layouts","%s.json"%frame.get("ts"))
-    if os.path.exists(lp):
-        try: windows=json.load(open(lp))
-        except Exception: windows=[]
+import json,sys,os,sqlite3
+ts=int(sys.argv[1] or 0); db=sys.argv[2]; root=sys.argv[3]
+frame=None; clip=""; windows=[]
+if os.path.exists(db):
+    try:
+        c=sqlite3.connect("file:%s?mode=ro"%db, uri=True); c.row_factory=sqlite3.Row
+        r=c.execute("SELECT ts,path,app,title,workspace,output FROM frames WHERE ts=?",(ts,)).fetchone() \
+          or c.execute("SELECT ts,path,app,title,workspace,output FROM frames WHERE ts<=? ORDER BY ts DESC LIMIT 1",(ts,)).fetchone()
+        if r:
+            frame={"ts":r["ts"],"path":r["path"],"app":r["app"] or "","title":r["title"] or "",
+                   "workspace":r["workspace"] or "","output":r["output"] or ""}
+            cr=c.execute("SELECT content FROM clips WHERE ts<=? ORDER BY ts DESC LIMIT 1",(r["ts"],)).fetchone()
+            clip=(cr["content"] if cr else "") or ""
+            lr=c.execute("SELECT json FROM layouts WHERE ts<=? ORDER BY ts DESC LIMIT 1",(r["ts"],)).fetchone()
+            if lr and lr["json"]:
+                try: windows=json.loads(lr["json"])
+                except Exception: windows=[]
+        c.close()
+    except Exception:
+        pass
 print(json.dumps({"frame":frame,"clip":clip,"windows":windows,"boxes":[]}))
-' "$ts" "$INDEX" "$CLIPS" "$DATA" 2>/dev/null || echo '{"frame":null,"clip":"","windows":[],"boxes":[]}'
+' "$1" "$DB" "$DATA" 2>/dev/null || echo '{"frame":null,"clip":"","windows":[],"boxes":[]}'
 }
 
-# Atomically drop missing files from the index and remove matching clip/layout rows.
+# Wipe operates on the REAL SQLite store: delete the frame/ocr/clip/layout/event
+# rows in range AND unlink the on-disk frame + crop files, then report the true
+# deleted count. A missing DB reports 0 honestly. Never a false "wiped" while
+# sensitive data survives. Exits non-zero (caller emits an error) on failure.
 rewrite_index() {
   python3 -c '
-import json,os,sys,tempfile
-root, idx_path, clips_path = sys.argv[1], sys.argv[2], sys.argv[3]
-scope, lo, hi = sys.argv[4], int(sys.argv[5] or 0), int(sys.argv[6] or 0)
-now=int(sys.argv[7] or 0)
+import json,os,sys,sqlite3,time
+db=sys.argv[1]; root=sys.argv[2]
+scope=sys.argv[3]; lo=int(sys.argv[4] or 0); hi=int(sys.argv[5] or 0); now=int(sys.argv[6] or 0)
 if scope=="all":
-    lo, hi = 0, 2**62
+    lo,hi=0,2**62
 elif scope=="today":
-    import time
     t=time.localtime(now/1000.0 if now>10**12 else now)
-    start=int(time.mktime((t.tm_year,t.tm_mon,t.tm_mday,0,0,0,t.tm_wday,t.tm_yday,t.tm_isdst))*1000)
-    lo, hi = start, now
+    lo=int(time.mktime((t.tm_year,t.tm_mon,t.tm_mday,0,0,0,t.tm_wday,t.tm_yday,t.tm_isdst))*1000); hi=now
 elif scope=="range":
     if hi==0: hi=now
 else:
-    lo, hi = 0, -1  # keep all; just drop missing files
-
-def load(path):
-    rows=[]
-    try:
-        for line in open(path, encoding="utf-8"):
-            line=line.strip()
-            if not line: continue
-            try: rows.append(json.loads(line))
-            except Exception: pass
-    except FileNotFoundError:
-        pass
-    return rows
-
-def atomic_write(path, rows):
-    d=os.path.dirname(path) or "."
-    fd, tmp=tempfile.mkstemp(dir=d, prefix=".idx-")
-    os.close(fd)
-    with open(tmp,"w",encoding="utf-8") as f:
-        for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False)+"\n")
-    os.replace(tmp, path)
-    os.chmod(path, 0o600)
-
-frames=load(idx_path)
-keep=[]
-for f in frames:
-    ts=int(f.get("ts") or 0)
-    path=f.get("path") or ""
-    gone = (lo<=ts<=hi) if hi>=lo else False
-    if gone:
-        if path and os.path.exists(path):
-            try: os.remove(path)
-            except Exception: pass
-        lp=os.path.join(root,"layouts","%s.json"%ts)
-        if os.path.exists(lp):
-            try: os.remove(lp)
-            except Exception: pass
-        continue
-    if path and not os.path.exists(path) and not os.path.exists(os.path.join(root, path)):
-        continue
-    keep.append(f)
-atomic_write(idx_path, keep)
-clips=load(clips_path)
-ck=[]
-for c in clips:
-    ts=int(c.get("ts") or 0)
-    if hi>=lo and lo<=ts<=hi:
-        continue
-    ck.append(c)
-atomic_write(clips_path, ck)
-print(json.dumps({"wiped": len(frames)-len(keep), "scope": scope}))
-' "$DATA" "$INDEX" "$CLIPS" "$1" "${2:-0}" "${3:-0}" "$(now_ms)"
+    print(json.dumps({"wiped":0,"scope":scope})); sys.exit(0)
+if not os.path.exists(db):
+    print(json.dumps({"wiped":0,"scope":scope})); sys.exit(0)
+try:
+    c=sqlite3.connect(db); c.row_factory=sqlite3.Row
+    c.execute("BEGIN IMMEDIATE")
+    files=[]
+    for r in c.execute("SELECT path,crop_path FROM frames WHERE ts>=? AND ts<=?",(lo,hi)):
+        if r["path"]: files.append(r["path"])
+        if r["crop_path"]: files.append(r["crop_path"])
+    n=c.execute("SELECT COUNT(*) FROM frames WHERE ts>=? AND ts<=?",(lo,hi)).fetchone()[0] or 0
+    for tbl in ("frames","clips","layouts","events","ocr_boxes"):
+        try: c.execute("DELETE FROM %s WHERE ts>=? AND ts<=?"%tbl,(lo,hi))
+        except Exception: pass
+    for tbl in ("ocr","search_fallback"):
+        try: c.execute("DELETE FROM %s WHERE ts>=? AND ts<=?"%tbl,(lo,hi))
+        except Exception: pass
+    c.commit()
+    try: c.execute("PRAGMA wal_checkpoint(TRUNCATE)");
+    except Exception: pass
+    c.close()
+except Exception as e:
+    sys.stderr.write(str(e)); sys.exit(1)
+# Only after the DB rows are gone do we unlink the files (relative to root).
+for p in files:
+    fp=p if os.path.isabs(p) else os.path.join(root,p)
+    try: os.remove(fp)
+    except Exception: pass
+print(json.dumps({"wiped":n,"scope":scope}))
+' "$DB" "$DATA" "$1" "${2:-0}" "${3:-0}" "$(now_ms)"
 }
 
 usage() {
@@ -563,23 +502,30 @@ while IFS= read -r line; do
       reply "$id" "$(rewrite_index "$scope" "${from:-0}" "${to:-0}")"
       ;;
     copy-clip|copyClip)
-      if command -v wl-copy >/dev/null 2>&1; then
-        python3 -c '
-import json,sys
-ts=str(sys.argv[1]); path=sys.argv[2]
-hit=""
-try:
-    for line in open(path, encoding="utf-8"):
-        try: row=json.loads(line)
-        except Exception: continue
-        if str(row.get("ts"))==ts:
-            hit=row.get("content","")
-except FileNotFoundError:
-    pass
-sys.stdout.write(hit)
-' "$(field "$line" ts)" "$CLIPS" 2>/dev/null | wl-copy -t text/plain || true
+      cts=$(field "$line" ts)
+      if ! command -v wl-copy >/dev/null 2>&1; then
+        reply "$id" '{"ok":false,"error":"wl-copy not installed"}'
+      else
+        content=$(python3 -c '
+import sys,os,sqlite3
+ts=int(sys.argv[1] or 0); db=sys.argv[2]
+if os.path.exists(db):
+    try:
+        c=sqlite3.connect("file:%s?mode=ro"%db, uri=True)
+        r=c.execute("SELECT content FROM clips WHERE ts=?",(ts,)).fetchone()
+        if r and r[0]: sys.stdout.write(r[0])
+        c.close()
+    except Exception:
+        pass
+' "$cts" "$DB" 2>/dev/null)
+        if [ -z "$content" ]; then
+          reply "$id" '{"ok":false,"error":"no clip at that time"}'
+        elif printf '%s' "$content" | wl-copy -t text/plain 2>/dev/null; then
+          reply "$id" '{"ok":true}'
+        else
+          reply "$id" '{"ok":false,"error":"wl-copy failed"}'
+        fi
       fi
-      reply "$id" '{"ok":true}'
       ;;
     stats|status)
       reply "$id" "$(stats_json)"

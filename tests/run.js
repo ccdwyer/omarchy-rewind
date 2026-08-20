@@ -330,21 +330,36 @@ test("overlay wipe has today, all, and range JSON", () => {
   assert.ok(src.indexOf("wipe today") < 0)
 })
 
-test("compat query over index jsonl", () => {
+// Build a minimal rewind.db matching the Rust helper's schema, so the compat
+// fallback tests exercise the REAL SQLite store (not a legacy JSONL index).
+function seedDb(dir, sql) {
+  fs.mkdirSync(path.join(dir, "frames"), { recursive: true })
+  const schema = `
+CREATE TABLE frames(ts INTEGER PRIMARY KEY,path TEXT,app TEXT,title TEXT,workspace TEXT,output TEXT,width INT,height INT,out_w INT,out_h INT,crop_x INT,crop_y INT,crop_w INT,crop_h INT,bytes INT,dhash INT,encoder TEXT,crop_path TEXT,crop_bytes INT DEFAULT 0);
+CREATE TABLE clips(ts INTEGER PRIMARY KEY,mime TEXT,content TEXT,bytes INT);
+CREATE TABLE layouts(ts INTEGER PRIMARY KEY,json TEXT);
+CREATE TABLE ocr_boxes(ts INT,word TEXT,x REAL,y REAL,w REAL,h REAL);
+CREATE TABLE events(ts INT,kind TEXT,reason TEXT);
+CREATE VIRTUAL TABLE ocr USING fts5(ts UNINDEXED,text,app,title,clip);
+`
+  const r = spawnSync("sqlite3", [path.join(dir, "rewind.db"), schema + "\n" + (sql || "")], { encoding: "utf8" })
+  if (r.status !== 0) throw new Error("sqlite3 seed failed: " + r.stderr)
+}
+
+test("compat query reads the real sqlite store", () => {
+  if (spawnSync("sqlite3", ["--version"], { encoding: "utf8" }).status !== 0) return
   const tmp = fs.mkdtempSync(path.join(require("os").tmpdir(), "rewind-"))
   process.env.REWIND_DATA_DIR = tmp
-  fs.mkdirSync(path.join(tmp, "frames"), { recursive: true })
-  fs.writeFileSync(
-    path.join(tmp, "index.jsonl"),
-    JSON.stringify({ ts: 1, path: "/x.png", app: "kitty", title: "unique-xyz phrase", workspace: "1", bytes: 10 }) + "\n"
-  )
-  fs.writeFileSync(path.join(tmp, "clips.jsonl"), "")
+  seedDb(tmp, `
+INSERT INTO frames VALUES(1,'frames/1.webp','kitty','unique-xyz phrase','1','eDP-1',0,0,0,0,0,0,0,0,10,1,'cwebp',NULL,0);
+INSERT INTO ocr VALUES(1,'unique-xyz phrase','kitty','unique-xyz phrase','');
+`)
   const p = path.join(ROOT, "compat", "rewindd.sh")
   fs.chmodSync(p, 0o755)
   const r = spawnSync(p, ["query", "unique-xyz"], { encoding: "utf8", env: process.env })
   assert.strictEqual(r.status, 0, r.stderr + r.stdout)
   const body = JSON.parse(r.stdout)
-  assert.ok(body.hits && body.hits.length >= 1)
+  assert.ok(body.hits && body.hits.length >= 1, r.stdout)
 })
 
 test("compat daemon writes nothing while disarmed", () => {
@@ -405,9 +420,17 @@ test("compat configure with existing consent is memory-only", () => {
   assert.deepStrictEqual(fs.readdirSync(tmp).sort(), before)
 })
 
-test("service keeps snapshots in memory until consent/arm", () => {
+test("service gates snapshots on consent and serves the overlay while open", () => {
   const src = fs.readFileSync(path.join(ROOT, "Service.qml"), "utf8")
-  assert.ok(/persistUi:\s*root\.armed/.test(src))
+  // Publishing the UI read-response channel requires consent (a fresh,
+  // never-consented install writes nothing) and happens while recording OR
+  // while the overlay is open — so the overlay is functional even though opening
+  // it pauses capture (blocker r15/1).
+  assert.ok(/publishUi:\s*root\.consent\s*&&\s*\(root\.armed\s*\|\|\s*root\.overlayOpen\)/.test(src))
+  assert.ok(/publish\(\)\s*\{\s*\n\s*if \(!root\.publishUi\)/.test(src))
+  // The read-response channel lives in the ephemeral tmpfs snapDir, not the
+  // persistent data dir.
+  assert.ok(/snapDir\s*\+\s*"\/timeline\.json"/.test(src))
   assert.ok(src.indexOf("data.wiped") >= 0)
   assert.ok(src.indexOf("root.refreshTimeline()") >= 0)
   assert.ok(src.indexOf("root.armed = true") < 0)
@@ -417,6 +440,37 @@ test("service keeps snapshots in memory until consent/arm", () => {
   assert.ok(src.indexOf("root.helperReady = true") >= 0)
   const start = src.split("function startHelper")[1] || ""
   assert.ok(start.indexOf("root.helperReady = false") >= 0)
+})
+
+test("disarm never optimistically flips state; helper ack is authoritative", () => {
+  const src = fs.readFileSync(path.join(ROOT, "Service.qml"), "utf8")
+  const dis = (src.split("function disarm()")[1] || "").split("function toggleArm")[0]
+  // No optimistic local mutation — the helper's state event flips armed.
+  assert.ok(dis.indexOf("root.armed = false") < 0, "disarm must not optimistically set armed")
+  assert.ok(dis.indexOf('send("disarm"') >= 0)
+})
+
+test("service builds the recorder on a fresh install when cargo is present", () => {
+  const src = fs.readFileSync(path.join(ROOT, "Service.qml"), "utf8")
+  assert.ok(src.indexOf("function buildHelper") >= 0)
+  assert.ok(/command -v cargo/.test(src), "probe must detect cargo to build")
+  assert.ok(src.indexOf("buildable") >= 0)
+  assert.ok(src.indexOf("sh build.sh") >= 0)
+  assert.ok(src.indexOf("root.triedBuild = true") >= 0, "must not loop on build")
+})
+
+test("bar press-and-hold opens clips only for a left-button hold", () => {
+  const bar = fs.readFileSync(path.join(ROOT, "BarWidget.qml"), "utf8")
+  const hold = (bar.split("onPressAndHold")[1] || "").split("}")[0] + (bar.split("onPressAndHold")[1] || "")
+  assert.ok(/heldButton !== Qt\.LeftButton/.test(bar), "hold must be gated on left button")
+})
+
+test("compat fallback operates on the sqlite store, not a legacy jsonl index", () => {
+  const sh = fs.readFileSync(path.join(ROOT, "compat", "rewindd.sh"), "utf8")
+  assert.ok(sh.indexOf("rewind.db") >= 0, "fallback must target rewind.db")
+  assert.ok(sh.indexOf("index.jsonl") < 0 && sh.indexOf("clips.jsonl") < 0, "no legacy JSONL")
+  assert.ok(/DELETE FROM %s WHERE ts>=\? AND ts<=\?/.test(sh) && /"frames","clips","layouts","events","ocr_boxes"/.test(sh), "wipe must delete real sqlite rows")
+  assert.ok(!/eval\s+"\$\(/.test(sh), "no eval of untrusted python/settings output")
 })
 
 test("bar polls live status and toggleArm always sends an arg", () => {
@@ -446,31 +500,29 @@ test("bar polls live status and toggleArm always sends an arg", () => {
   assert.ok(fs.existsSync(path.join(ROOT, "preview.png")))
 })
 
-test("rewind launcher forwards wipe range bounds", () => {
+test("rewind launcher forwards wipe range bounds to the sqlite store", () => {
+  if (spawnSync("sqlite3", ["--version"], { encoding: "utf8" }).status !== 0) return
   const launcher = path.join(ROOT, "scripts", "rewind")
   assert.ok(fs.existsSync(launcher))
   fs.chmodSync(launcher, 0o755)
   const os = require("os")
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "rewind-range-"))
-  fs.mkdirSync(path.join(tmp, "frames"), { recursive: true })
-  const gone = path.join(tmp, "frames", "1.png")
-  const stay = path.join(tmp, "frames", "2.png")
+  const gone = path.join(tmp, "frames", "1.webp")
+  const stay = path.join(tmp, "frames", "2.webp")
+  seedDb(tmp, `
+INSERT INTO frames VALUES(10,'frames/1.webp','a','a','1','o',0,0,0,0,0,0,0,0,10,1,'cwebp',NULL,0);
+INSERT INTO frames VALUES(50,'frames/2.webp','b','b','1','o',0,0,0,0,0,0,0,0,10,2,'cwebp',NULL,0);
+`)
   fs.writeFileSync(gone, "a")
   fs.writeFileSync(stay, "b")
-  fs.writeFileSync(
-    path.join(tmp, "index.jsonl"),
-    JSON.stringify({ ts: 10, path: gone }) + "\n" + JSON.stringify({ ts: 50, path: stay }) + "\n"
-  )
-  fs.writeFileSync(path.join(tmp, "clips.jsonl"), "")
   const env = Object.assign({}, process.env, { REWIND_DATA_DIR: tmp })
-  const r = spawnSync(launcher, ["wipe", "range", "--from", "1", "--to", "20"], {
-    encoding: "utf8",
-    env
-  })
+  const r = spawnSync(launcher, ["wipe", "range", "--from", "1", "--to", "20"], { encoding: "utf8", env })
   assert.strictEqual(r.status, 0, r.stderr + r.stdout)
-  const idx = fs.readFileSync(path.join(tmp, "index.jsonl"), "utf8").trim()
-  assert.ok(idx.indexOf('"ts": 50') >= 0 || idx.indexOf('"ts":50') >= 0, idx)
-  assert.ok(idx.indexOf('"ts": 10') < 0 && idx.indexOf('"ts":10') < 0, idx)
+  // Row 10 (in range) and its file are gone; row 50 (out of range) survives.
+  const rows = spawnSync("sqlite3", [path.join(tmp, "rewind.db"), "SELECT ts FROM frames ORDER BY ts"], { encoding: "utf8" }).stdout.trim()
+  assert.strictEqual(rows, "50", rows)
+  assert.ok(!fs.existsSync(gone), "in-range frame file must be deleted")
+  assert.ok(fs.existsSync(stay), "out-of-range frame file must survive")
 })
 
 test("ocr does not treat disarmed as idle and capture reports runtime backend", () => {
@@ -563,29 +615,30 @@ test("compat consent persists armOnLogin and still does not record", () => {
   assert.strictEqual(files.length, 0)
 })
 
-test("compat wipe rewrites index instead of leaving stale rows", () => {
+test("compat wipe deletes real sqlite rows and files (no false success)", () => {
+  if (spawnSync("sqlite3", ["--version"], { encoding: "utf8" }).status !== 0) return
   const os = require("os")
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "rewind-wipe-"))
-  fs.mkdirSync(path.join(tmp, "frames"), { recursive: true })
-  const gone = path.join(tmp, "frames", "1.png")
-  const stay = path.join(tmp, "frames", "2.png")
+  const gone = path.join(tmp, "frames", "1.webp")
+  const stay = path.join(tmp, "frames", "2.webp")
+  seedDb(tmp, `
+INSERT INTO frames VALUES(1,'frames/1.webp','a','a','1','o',0,0,0,0,0,0,0,0,10,1,'cwebp',NULL,0);
+INSERT INTO frames VALUES(2,'frames/2.webp','b','b','1','o',0,0,0,0,0,0,0,0,10,2,'cwebp',NULL,0);
+INSERT INTO clips VALUES(1,'text/plain','old',3);
+`)
   fs.writeFileSync(gone, "a")
   fs.writeFileSync(stay, "b")
-  fs.writeFileSync(
-    path.join(tmp, "index.jsonl"),
-    JSON.stringify({ ts: 1, path: gone }) + "\n" + JSON.stringify({ ts: 2, path: stay }) + "\n"
-  )
-  fs.writeFileSync(path.join(tmp, "clips.jsonl"), JSON.stringify({ ts: 1, content: "old" }) + "\n")
   const env = Object.assign({}, process.env, { REWIND_DATA_DIR: tmp })
   const p = path.join(ROOT, "compat", "rewindd.sh")
   const r = spawnSync(p, ["wipe", "all"], { encoding: "utf8", env })
   assert.strictEqual(r.status, 0, r.stderr + r.stdout)
-  const idx = fs.readFileSync(path.join(tmp, "index.jsonl"), "utf8").trim()
-  assert.strictEqual(idx, "")
-  const clips = fs.readFileSync(path.join(tmp, "clips.jsonl"), "utf8").trim()
-  assert.strictEqual(clips, "")
-  assert.ok(!fs.existsSync(gone))
-  assert.ok(!fs.existsSync(stay))
+  assert.strictEqual(JSON.parse(r.stdout).wiped, 2, r.stdout)
+  // The real store is actually empty — no false "wiped" while data survives.
+  const frames = spawnSync("sqlite3", [path.join(tmp, "rewind.db"), "SELECT COUNT(*) FROM frames"], { encoding: "utf8" }).stdout.trim()
+  const clips = spawnSync("sqlite3", [path.join(tmp, "rewind.db"), "SELECT COUNT(*) FROM clips"], { encoding: "utf8" }).stdout.trim()
+  assert.strictEqual(frames, "0", "frames must be deleted from sqlite")
+  assert.strictEqual(clips, "0", "clips must be deleted from sqlite")
+  assert.ok(!fs.existsSync(gone) && !fs.existsSync(stay), "frame files must be unlinked")
 })
 
 const cargoAvailable = spawnSync("cargo", ["--version"], { encoding: "utf8" }).status === 0

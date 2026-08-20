@@ -54,6 +54,7 @@ Item {
 
   RewindAdapter { id: adapter }
   readonly property string dataDir: adapter.dataDir()
+  readonly property string snapDir: adapter.snapDir()
 
   property color background: Color.menu.background
   property color foreground: Color.menu.text
@@ -479,7 +480,7 @@ Item {
 
   FileView {
     id: uiView
-    path: root.dataDir + "/ui.json"
+    path: root.snapDir + "/ui.json"
     watchChanges: true
     printErrors: false
     onLoaded: root.applyUi(text())
@@ -487,7 +488,7 @@ Item {
   }
   FileView {
     id: timelineView
-    path: root.dataDir + "/timeline.json"
+    path: root.snapDir + "/timeline.json"
     watchChanges: true
     printErrors: false
     onLoaded: root.applyTimeline(text())
@@ -495,7 +496,7 @@ Item {
   }
   FileView {
     id: clipsView
-    path: root.dataDir + "/clips.json"
+    path: root.snapDir + "/clips.json"
     watchChanges: true
     printErrors: false
     onLoaded: root.applyClips(text())
@@ -503,7 +504,7 @@ Item {
   }
   FileView {
     id: momentView
-    path: root.dataDir + "/moment.json"
+    path: root.snapDir + "/moment.json"
     watchChanges: true
     printErrors: false
     onLoaded: root.applyMoment(text())
@@ -511,7 +512,7 @@ Item {
   }
   FileView {
     id: hitsView
-    path: root.dataDir + "/hits.json"
+    path: root.snapDir + "/hits.json"
     watchChanges: true
     printErrors: false
     onLoaded: root.applyHits(text())
@@ -519,7 +520,7 @@ Item {
   }
   FileView {
     id: planView
-    path: root.dataDir + "/plan.json"
+    path: root.snapDir + "/plan.json"
     watchChanges: true
     printErrors: false
     onLoaded: root.applyPlanFile(text())
