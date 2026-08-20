@@ -767,13 +767,19 @@ fn capture_once(
     settings: &Settings,
     session: &mut capture::CaptureSession,
 ) -> Result<bool, String> {
+    // Acquire the generation ticket at function entry, BEFORE any metadata
+    // collection or the blocking screen grab. If disarmed now, capture nothing.
+    // Reading the ticket late (after grab) would let a disarm→re-arm that
+    // happens *during* the grab hand this pre-disarm frame a fresh valid
+    // generation, so it would commit after a disarm — defeating the zero-write
+    // contract. The original ticket flows through every later check and commit.
+    let Some(gen) = arm_ticket(shared) else {
+        return Ok(false);
+    };
     let monitor = hypr::focused_monitor().unwrap_or_default();
     let active = hypr::active_window().unwrap_or_default();
     let clients = hypr::clients().unwrap_or_default();
     let raw = session.grab(&monitor.name)?;
-    let Some(gen) = arm_ticket(shared) else {
-        return Ok(false);
-    };
     if !still_armed(shared, gen) {
         return Ok(false);
     }
@@ -1131,6 +1137,12 @@ impl Shared {
 // clipboard/ocr modules need Shared
 pub(crate) use Shared as DaemonState;
 
+/// Serializes tests that toggle the process-global `REWIND_TEST_CAPTURE` env
+/// var (capture/clipboard race tests), so they can't observe each other's
+/// setting under the default parallel test runner.
+#[cfg(test)]
+pub(crate) static TEST_CAPTURE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1447,6 +1459,53 @@ mod tests {
             .unwrap();
         assert_eq!(counts.0, 0, "no frame rows");
         assert_eq!(counts.1, 0, "no event rows");
+    }
+
+    #[test]
+    fn capture_grab_spanning_disarm_rearm_does_not_commit() {
+        // The ticket is taken at capture_once entry, BEFORE the blocking grab.
+        // If a disarm→re-arm happens *during* grab (fresh generation, armed
+        // again by the time the post-grab checks run), the pre-disarm frame
+        // must still be rejected. With the old ordering (ticket read after
+        // grab) this frame would commit under the re-armed generation — the
+        // exact race this guards against.
+        let _env = TEST_CAPTURE_ENV_LOCK.lock().unwrap();
+        std::env::set_var("REWIND_TEST_CAPTURE", "1");
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("rewind");
+        let shared = boot_shared(&data).unwrap();
+        {
+            let mut st = shared.settings.lock().unwrap();
+            st.consent_at = now_ms();
+        }
+        persist_consent(&shared).unwrap();
+        arm_now(&shared).unwrap();
+        let settings = shared.settings.lock().unwrap().clone();
+
+        let mut session = capture::CaptureSession::new();
+        // Fired at the start of grab: disarm then re-arm, so the generation
+        // advances twice and `armed` is true again when grab returns.
+        let hook_shared = shared.clone();
+        session.set_grab_hook(Box::new(move || {
+            disarm_now(&hook_shared);
+            arm_now(&hook_shared).unwrap();
+        }));
+
+        let kept = capture_once(&shared, &settings, &mut session).unwrap();
+        assert!(
+            !kept,
+            "a capture whose grab spanned disarm/re-arm must not report a kept frame"
+        );
+
+        let counts = shared
+            .with_store(|s| s.mutation_counters().unwrap())
+            .unwrap();
+        assert_eq!(
+            counts.0, 0,
+            "no frame rows for a capture whose grab spanned disarm/re-arm"
+        );
+        assert_eq!(counts.1, 0, "no event rows either");
+        std::env::remove_var("REWIND_TEST_CAPTURE");
     }
 
     #[test]

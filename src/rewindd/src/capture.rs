@@ -45,6 +45,11 @@ pub struct CaptureSession {
     wlr_retry_at: Instant,
     /// Frame counter for the env-gated synthetic test backend only.
     test_seq: u32,
+    /// Test-only hook fired at the start of every `grab()`, letting a test
+    /// interleave an arm-state change *during* the blocking grab window to
+    /// exercise the disarm/re-arm race. Never compiled into release builds.
+    #[cfg(test)]
+    grab_hook: Option<Box<dyn FnMut() + Send>>,
 }
 
 impl Default for CaptureSession {
@@ -61,7 +66,15 @@ impl CaptureSession {
             #[cfg(feature = "wayland")]
             wlr_retry_at: Instant::now(),
             test_seq: 0,
+            #[cfg(test)]
+            grab_hook: None,
         }
+    }
+
+    /// Install a hook invoked at the start of every `grab()`. Test-only.
+    #[cfg(test)]
+    pub fn set_grab_hook(&mut self, hook: Box<dyn FnMut() + Send>) {
+        self.grab_hook = Some(hook);
     }
 
     pub fn using_grim(&self) -> bool {
@@ -96,6 +109,13 @@ impl CaptureSession {
     }
 
     pub fn grab(&mut self, output: &str) -> Result<RawFrame, String> {
+        // Test-only: fire the interleave hook at the start of the grab window so
+        // a test can disarm/re-arm *during* the grab and prove the ticket taken
+        // before grab (not after) is what gates the commit.
+        #[cfg(test)]
+        if let Some(hook) = self.grab_hook.as_mut() {
+            hook();
+        }
         // Deterministic synthetic backend for the no-network audit / CI, where
         // no real compositor is present. Produces a fixed off-white frame with
         // a moving pixel so dedup does not skip it. Never used unless the env
