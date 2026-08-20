@@ -120,20 +120,29 @@ Conservative choices where the Omarchy / Quickshell / Hyprland API was not 100% 
   cap pruned between queue and commit). Regressions:
   `ocr_write_ok_blocks_locked_and_hard_pauses`,
   `ocr_only_annotates_an_existing_committed_frame`.
-- **Pause/disarm perform zero filesystem/DB mutation; cleanup is deferred.**
-  Entering a pause (or disarming) never writes: pause/resume gap metadata buffers
-  in memory (`pending_gaps`); a rejected uncommitted capture's temp-file deletion
-  buffers in memory (`pending_deletes`) — the files are unreferenced by any row,
-  so nothing can read them while they wait; the WAL checkpoint the disarm path
-  would perform is deferred (`pending_checkpoint`); and a settings save that
-  comes due while paused is deferred (`pending_settings_save`). All four are
-  applied only by `flush_deferred`, called from the capture loop **while
-  recording** (armed and unpaused, re-verified via `refresh_pause`), so nothing
-  deferred is ever a side effect of pausing/disarming. The deferred checkpoint
-  only merges already-committed authorized data — it never persists new content.
-  Regressions: `disarm_defers_checkpoint_and_flush_applies_it`,
-  `rejected_capture_delete_is_deferred_while_paused_then_flushed`,
-  `settings_save_deferred_while_paused`, `pause_transition_does_not_write_to_store`.
+- **Pause/disarm perform zero mutation of *observation data*; own-orphan cleanup
+  is immediate.** The zero-write contract governs OBSERVATION DATA — frames, OCR,
+  clips, events, settings, and the SQLite/WAL database: none of it is written or
+  mutated while paused or disarmed. Persisting new observation content IS deferred:
+  pause/resume gap metadata buffers in memory (`pending_gaps`); the WAL checkpoint
+  the disarm path would perform is deferred (`pending_checkpoint`, and it only ever
+  merges already-committed authorized data); and a settings save that comes due
+  while paused is deferred (`pending_settings_save`). These are applied only by
+  `flush_deferred`, called from the capture loop **while recording** (armed and
+  unpaused, re-verified via `refresh_pause`), so nothing deferred is a side effect
+  of pausing/disarming.
+  **Deleting a rejected capture's OWN uncommitted, unreferenced temp/staging file
+  is NOT deferred — it is unlinked IMMEDIATELY, even while paused/disarmed.** That
+  orphan holds screen content from the moment a pause was engaging (that is *why*
+  the capture was rejected); leaving it on disk during the pause is the exact leak
+  the product prevents, so cleaning up our own orphan is required privacy cleanup,
+  not an observation-data write. Committed-frame file deletions (byte-cap pruning,
+  wipe) run inline inside their own authorized store transaction, never via the
+  pause path. Regressions: `disarm_defers_checkpoint_and_flush_applies_it`,
+  `rejected_capture_temp_file_is_unlinked_immediately_even_while_paused`,
+  `disarm_during_capture_discards_files_and_rows` (own temp files removed
+  immediately), `settings_save_deferred_while_paused`,
+  `pause_transition_does_not_write_to_store`.
 - **Snapshot files are recording-only.** The QML service writes its
   `ui/timeline/clips/moment/hits/plan.json` snapshots only while `armed && !paused`
   (`persistUi`); a pause freezes them and `onPersistUiChanged` flushes the latest
