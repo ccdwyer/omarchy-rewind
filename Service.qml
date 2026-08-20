@@ -299,15 +299,19 @@ Item {
       return "consent"
     }
     send("arm", root.settingsPayload())
-    return "ok"
+    return root.status()
   }
 
   function disarm() {
     send("disarm", {})
-    return "ok"
+    root.armed = false
+    root.pauseReason = "disarmed"
+    root.paused = false
+    return root.status()
   }
 
-  function toggleArm() {
+  function toggleArm(arg) {
+    var _ = arg
     if (root.armed)
       return root.disarm()
     return root.arm()
@@ -549,7 +553,7 @@ Item {
     function status(): string { return root.status() }
     function arm(): string { return root.arm() }
     function disarm(): string { return root.disarm() }
-    function toggleArm(): string { return root.toggleArm() }
+    function toggleArm(arg: string): string { return root.toggleArm(arg) }
     function summon(arg: string): string {
       var raw = String(arg || "").trim()
       if (raw && raw !== "undefined" && raw !== "null")
@@ -584,7 +588,7 @@ Item {
       root.refreshTimeline()
       root.refreshClips()
       root.publish()
-      return "ok"
+      return root.status()
     }
   }
 

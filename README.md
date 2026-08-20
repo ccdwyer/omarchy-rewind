@@ -22,10 +22,11 @@ Then build the helper on the machine:
 
 Linux CI (`.github/workflows/linux-helper.yml`) builds the Wayland helper, runs tests, `ldd`, and `strace -e trace=network`, and uploads `rewindd-linux`. This macOS authoring host cannot produce that ELF; `scripts/network-audit.sh` exits 1 when `bin/rewindd` is missing rather than pretending the audit passed.
 
-Put the chip on the bar if `--enable` did not:
+`omarchy plugin enable io.github.chris.rewind` places the chip in `barWidget.defaultSection` (`right`). To move it later:
 
 ```sh
-omarchy bar put io.github.chris.rewind --section right
+omarchy bar move io.github.chris.rewind right
+# or: omarchy bar set …
 ```
 
 Reload plugins if the shell was already running:
@@ -56,7 +57,7 @@ The plugin does **not** write Hyprland binds. Add them yourself:
 
 ```
 bind = SUPER, R, exec, omarchy-shell shell summon io.github.chris.rewind '{}'
-bind = SUPER SHIFT, R, exec, omarchy-shell shell call io.github.chris.rewind toggleArm
+bind = SUPER SHIFT, R, exec, omarchy-shell shell call io.github.chris.rewind toggleArm '{}'
 ```
 
 In the overlay:
@@ -90,7 +91,7 @@ A 720p WebP of text-heavy UI is **25–80 KB**, not single-digit KB. Retention i
 
 The bar and consent screen report **≈N days at your usage** once rewindd has measured this machine. Until then they show the planning band for 25–80 KB at a 10 s write average (dHash skip), not a promised calendar window.
 
-This plugin was authored on macOS without Hyprland, so there is **no 8-hour soak CPU% or GB/day number committed here**. After you arm it, `rewindd stats` prints frames, bytes, and the encoder actually used. `scripts/network-audit.sh` prints `ldd` and, on Linux, runs `strace -e trace=network` through a capture cycle.
+This plugin was authored on macOS without Hyprland or Quickshell. Hyprland/Quickshell runtime, a fresh-VM install, soak, and QML validation are **runtime-unverified on this host**. After you arm it, `rewindd stats` prints frames, bytes, and the encoder actually used. `scripts/network-audit.sh` prints `ldd` and, on Linux, runs `strace -e trace=network` through a capture cycle.
 
 ## 60-second demo (self-contained)
 

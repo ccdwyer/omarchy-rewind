@@ -103,7 +103,7 @@ pub(crate) fn watch(shared: Arc<DaemonState>) {
     }
 }
 
-fn ingest(shared: &DaemonState, raw: &str) {
+pub(crate) fn ingest(shared: &DaemonState, raw: &str) {
     if raw.is_empty() {
         return;
     }
@@ -121,10 +121,15 @@ fn ingest(shared: &DaemonState, raw: &str) {
         }
         *g = text.clone();
     }
+    let Some(gen) = crate::arm_ticket(shared) else {
+        return;
+    };
+    if !crate::still_armed(shared, gen) {
+        return;
+    }
     let ts = now_ms();
-    let _ = shared.with_store(|store| {
-        let _ = store.insert_clip(ts, "text/plain", &text);
-        let _ = store.record_clip_search(ts, &text);
+    let _ = shared.with_store_mut(|store| {
+        let _ = store.commit_clip_tx(ts, "text/plain", &text, || crate::still_armed(shared, gen));
     });
 }
 

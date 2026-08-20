@@ -2,7 +2,7 @@ use crate::hypr::Client;
 use crate::now_ms;
 use crate::perms;
 use crate::query::{self, Hit, WordBox};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -52,9 +52,40 @@ pub struct FrameGeom {
 pub struct Store {
     conn: Connection,
     root: PathBuf,
+    writable: bool,
 }
 
 impl Store {
+    pub fn is_writable(&self) -> bool {
+        self.writable
+    }
+
+    /// Read-only open: no WAL, no migrate, no chmod, no path creation.
+    pub fn open_read_only(db: &Path) -> Result<Self, String> {
+        if !db.exists() {
+            return Err("no database".into());
+        }
+        let uri = format!(
+            "file:{}?mode=ro&immutable=1",
+            db.display().to_string().replace('\\', "/")
+        );
+        let conn = Connection::open_with_flags(
+            &uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .or_else(|_| {
+            Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        })
+        .map_err(|e| e.to_string())?;
+        let _ = conn.busy_timeout(std::time::Duration::from_millis(2500));
+        let _ = conn.pragma_update(None, "query_only", true);
+        Ok(Self {
+            conn,
+            root: db.parent().unwrap_or(Path::new(".")).to_path_buf(),
+            writable: false,
+        })
+    }
+
     pub fn open(db: &Path) -> Result<Self, String> {
         if let Some(parent) = db.parent() {
             perms::secure_dir(parent).map_err(|e| e.to_string())?;
@@ -70,9 +101,19 @@ impl Store {
         let store = Self {
             conn,
             root: db.parent().unwrap_or(Path::new(".")).to_path_buf(),
+            writable: true,
         };
         store.migrate()?;
         Ok(store)
+    }
+
+    pub fn checkpoint(&self) -> Result<(), String> {
+        if !self.writable {
+            return Ok(());
+        }
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(|e| e.to_string())
     }
 
     fn migrate(&self) -> Result<(), String> {
@@ -140,6 +181,9 @@ impl Store {
     }
 
     pub fn insert_frame(&mut self, f: &FrameInsert) -> Result<(), String> {
+        if !self.writable {
+            return Err("read-only store".into());
+        }
         let tx = self.conn.transaction().map_err(|e| e.to_string())?;
         tx.execute(
             "INSERT OR REPLACE INTO frames
@@ -410,6 +454,257 @@ impl Store {
                 );",
             )
             .map_err(|e| e.to_string())
+    }
+
+    /// One transaction for frame + layout + search. `still` is polled before each write
+    /// and immediately before commit; false rolls back.
+    pub fn commit_capture_tx<F>(
+        &mut self,
+        insert: &FrameInsert,
+        clients: &[Client],
+        clip: &str,
+        byte_cap: i64,
+        mut still: F,
+    ) -> Result<bool, String>
+    where
+        F: FnMut() -> bool,
+    {
+        if !self.writable {
+            return Err("read-only store".into());
+        }
+        if !still() {
+            return Ok(false);
+        }
+        let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR REPLACE INTO frames
+             (ts,path,app,title,workspace,output,width,height,out_w,out_h,
+              crop_x,crop_y,crop_w,crop_h,bytes,dhash,encoder,crop_path)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+            params![
+                insert.ts,
+                insert.path,
+                insert.app,
+                insert.title,
+                insert.workspace,
+                insert.output,
+                insert.width,
+                insert.height,
+                insert.out_w,
+                insert.out_h,
+                insert.crop_x,
+                insert.crop_y,
+                insert.crop_w,
+                insert.crop_h,
+                insert.bytes,
+                insert.dhash,
+                insert.encoder,
+                insert.crop_path
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        if !still() {
+            return Ok(false);
+        }
+        let body = serde_json::to_string(clients).map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR REPLACE INTO layouts (ts,json) VALUES (?1,?2)",
+            params![insert.ts, body],
+        )
+        .map_err(|e| e.to_string())?;
+        if !still() {
+            return Ok(false);
+        }
+        let _ = tx.execute("DELETE FROM ocr WHERE ts=?1", params![insert.ts]);
+        if tx
+            .execute(
+                "INSERT INTO ocr (ts,text,app,title,clip) VALUES (?1,?2,?3,?4,?5)",
+                params![insert.ts, "", insert.app, insert.title, clip],
+            )
+            .is_err()
+        {
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS search_fallback (
+                    ts INTEGER PRIMARY KEY, text TEXT, app TEXT, title TEXT, clip TEXT
+                );",
+            )
+            .map_err(|e| e.to_string())?;
+            tx.execute(
+                "INSERT OR REPLACE INTO search_fallback (ts,text,app,title,clip)
+                 VALUES (?1,?2,?3,?4,?5)",
+                params![insert.ts, "", insert.app, insert.title, clip],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        if !still() {
+            return Ok(false);
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        if still() {
+            let _ = self.prune_to(byte_cap);
+        }
+        Ok(true)
+    }
+
+    pub fn commit_ocr_tx<F>(
+        &mut self,
+        ts: i64,
+        text: &str,
+        app: &str,
+        title: &str,
+        clip: &str,
+        boxes: &[WordBox],
+        mut still: F,
+    ) -> Result<bool, String>
+    where
+        F: FnMut() -> bool,
+    {
+        if !self.writable {
+            return Err("read-only store".into());
+        }
+        if !still() {
+            return Ok(false);
+        }
+        let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+        let _ = tx.execute("DELETE FROM ocr WHERE ts=?1", params![ts]);
+        if tx
+            .execute(
+                "INSERT INTO ocr (ts,text,app,title,clip) VALUES (?1,?2,?3,?4,?5)",
+                params![ts, text, app, title, clip],
+            )
+            .is_err()
+        {
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS search_fallback (
+                    ts INTEGER PRIMARY KEY, text TEXT, app TEXT, title TEXT, clip TEXT
+                );",
+            )
+            .map_err(|e| e.to_string())?;
+            tx.execute(
+                "INSERT OR REPLACE INTO search_fallback (ts,text,app,title,clip)
+                 VALUES (?1,?2,?3,?4,?5)",
+                params![ts, text, app, title, clip],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        if !still() {
+            return Ok(false);
+        }
+        tx.execute("DELETE FROM ocr_boxes WHERE ts=?1", params![ts])
+            .map_err(|e| e.to_string())?;
+        for b in boxes {
+            if !still() {
+                return Ok(false);
+            }
+            tx.execute(
+                "INSERT INTO ocr_boxes (ts,word,x,y,w,h) VALUES (?1,?2,?3,?4,?5,?6)",
+                params![ts, b.word, b.x, b.y, b.w, b.h],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        if !still() {
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE frames SET crop_path=NULL WHERE ts=?1",
+            params![ts],
+        )
+        .map_err(|e| e.to_string())?;
+        if !still() {
+            return Ok(false);
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(true)
+    }
+
+    pub fn commit_clip_tx<F>(
+        &mut self,
+        ts: i64,
+        mime: &str,
+        content: &str,
+        mut still: F,
+    ) -> Result<bool, String>
+    where
+        F: FnMut() -> bool,
+    {
+        if !self.writable {
+            return Err("read-only store".into());
+        }
+        if !still() {
+            return Ok(false);
+        }
+        let bytes = content.len() as i64;
+        let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR REPLACE INTO clips (ts,mime,content,bytes) VALUES (?1,?2,?3,?4)",
+            params![ts, mime, content, bytes],
+        )
+        .map_err(|e| e.to_string())?;
+        if !still() {
+            return Ok(false);
+        }
+        let frame_ts = {
+            let before: Option<i64> = tx
+                .query_row(
+                    "SELECT ts FROM frames WHERE ts <= ?1 ORDER BY ts DESC LIMIT 1",
+                    params![ts],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            before.or_else(|| {
+                tx.query_row(
+                    "SELECT ts FROM frames WHERE ts >= ?1 ORDER BY ts ASC LIMIT 1",
+                    params![ts],
+                    |r| r.get(0),
+                )
+                .optional()
+                .ok()
+                .flatten()
+            })
+            .unwrap_or(ts)
+        };
+        if !still() {
+            return Ok(false);
+        }
+        let (text, app, title) = {
+            let from_fts: Option<(String, String, String)> = tx
+                .query_row(
+                    "SELECT text, app, title FROM ocr WHERE ts=?1",
+                    params![frame_ts],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()
+                .ok()
+                .flatten();
+            from_fts.unwrap_or_else(|| (String::new(), String::new(), String::new()))
+        };
+        let _ = tx.execute("DELETE FROM ocr WHERE ts=?1", params![frame_ts]);
+        if tx
+            .execute(
+                "INSERT INTO ocr (ts,text,app,title,clip) VALUES (?1,?2,?3,?4,?5)",
+                params![frame_ts, text, app, title, content],
+            )
+            .is_err()
+        {
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS search_fallback (
+                    ts INTEGER PRIMARY KEY, text TEXT, app TEXT, title TEXT, clip TEXT
+                );",
+            )
+            .map_err(|e| e.to_string())?;
+            tx.execute(
+                "INSERT OR REPLACE INTO search_fallback (ts,text,app,title,clip)
+                 VALUES (?1,?2,?3,?4,?5)",
+                params![frame_ts, text, app, title, content],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        if !still() {
+            return Ok(false);
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(true)
     }
 
     pub fn insert_ocr_boxes(&self, ts: i64, boxes: &[WordBox]) -> Result<(), String> {
@@ -1027,6 +1322,86 @@ mod tests {
         assert_eq!(g.crop_w, 800.0);
         assert_eq!(g.out_w, 1920.0);
         assert_eq!(g.stored_w, 1280.0);
+    }
+
+    #[test]
+    fn capture_tx_rolls_back_when_still_fails_mid_commit() {
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("rewind.db")).unwrap();
+        let f = sample(7, 10, "race");
+        let mut n = 0;
+        let ok = store
+            .commit_capture_tx(&f, &[], "", 1_000_000, || {
+                n += 1;
+                n < 2
+            })
+            .unwrap();
+        assert!(!ok);
+        assert_eq!(store.mutation_counters().unwrap().0, 0);
+    }
+
+    #[test]
+    fn ocr_tx_rolls_back_when_still_fails_mid_commit() {
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("rewind.db")).unwrap();
+        store.insert_frame(&sample(7, 10, "ocr")).unwrap();
+        let boxes = [crate::query::WordBox {
+            word: "hi".into(),
+            x: 0.1,
+            y: 0.1,
+            w: 0.2,
+            h: 0.1,
+        }];
+        let mut n = 0;
+        let ok = store
+            .commit_ocr_tx(7, "hi", "kitty", "t", "", &boxes, || {
+                n += 1;
+                n < 2
+            })
+            .unwrap();
+        assert!(!ok);
+        assert_eq!(store.mutation_counters().unwrap().2, 0);
+        assert_eq!(store.pending_crop_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn clip_tx_rolls_back_when_still_fails_mid_commit() {
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("rewind.db")).unwrap();
+        store.insert_frame(&sample(7, 10, "clip")).unwrap();
+        let mut n = 0;
+        let ok = store
+            .commit_clip_tx(7, "text/plain", "secret", || {
+                n += 1;
+                n < 2
+            })
+            .unwrap();
+        assert!(!ok);
+        assert_eq!(store.mutation_counters().unwrap().3, 0);
+    }
+
+    #[test]
+    fn read_only_open_does_not_create_sidecar() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("rewind.db");
+        {
+            let mut store = Store::open(&db).unwrap();
+            store.insert_frame(&sample(1, 10, "a")).unwrap();
+            store.checkpoint().unwrap();
+        }
+        let before: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        let ro = Store::open_read_only(&db).unwrap();
+        assert!(!ro.is_writable());
+        assert_eq!(ro.stats().unwrap().frames, 1);
+        drop(ro);
+        let after: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(before.len(), after.len());
     }
 
     #[test]

@@ -455,7 +455,6 @@ while IFS= read -r line; do
       emit "{\"event\":\"stats\",$(stats_json | sed 's/^{//;s/}$//')}"
       ;;
     disarm)
-      save_state
       reply "$id" "$(stats_json)"
       ;;
     consent)
@@ -478,7 +477,6 @@ while IFS= read -r line; do
     set-pause|setPause) reply "$id" "{\"ok\":true}" ;;
     configure)
       merge_configure "$line"
-      save_state
       reply "$id" "{\"ok\":true}"
       ;;
     query)

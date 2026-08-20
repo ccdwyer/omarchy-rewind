@@ -78,6 +78,8 @@ pub(crate) struct Shared {
     encoder: Mutex<String>,
     capture_backend: Mutex<String>,
     last_pause: Mutex<Option<PauseReason>>,
+    arm_gen: AtomicU64,
+    tripwire: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 fn boot_shared(data_dir: &Path) -> Result<Arc<Shared>, String> {
@@ -89,9 +91,11 @@ fn boot_shared(data_dir: &Path) -> Result<Arc<Shared>, String> {
         settings.arm_on_login,
         settings.armed,
     );
-    let store = if paths.db.exists() {
+    let store = if armed {
         DataPaths::prepare(data_dir)?;
         Some(Store::open(&paths.db)?)
+    } else if paths.db.exists() {
+        Store::open_read_only(&paths.db).ok()
     } else {
         None
     };
@@ -106,6 +110,8 @@ fn boot_shared(data_dir: &Path) -> Result<Arc<Shared>, String> {
         encoder: Mutex::new(encode::preferred_name().to_string()),
         capture_backend: Mutex::new(capture::backend_name().to_string()),
         last_pause: Mutex::new(None),
+        arm_gen: AtomicU64::new(if armed { 1 } else { 0 }),
+        tripwire: Mutex::new(None),
     }))
 }
 
@@ -182,15 +188,16 @@ fn handle_command(shared: &Arc<Shared>, cmd: Command) {
                 emit_state(shared, id);
                 return;
             }
-            persist_settings(shared);
+            shared.arm_gen.fetch_add(1, Ordering::SeqCst);
             shared.armed.store(true, Ordering::SeqCst);
+            persist_settings(shared);
             emit_state(shared, id);
         }
         Command::Disarm { id } => {
             let mut st = shared.settings.lock().unwrap();
             st.armed = false;
             drop(st);
-            persist_settings(shared);
+            shared.arm_gen.fetch_add(1, Ordering::SeqCst);
             shared.armed.store(false, Ordering::SeqCst);
             emit_state(shared, id);
         }
@@ -204,15 +211,19 @@ fn handle_command(shared: &Arc<Shared>, cmd: Command) {
             st.arm_on_login = arm_on_login;
             st.armed = arm_now;
             drop(st);
-            persist_settings(shared);
+            let _ = persist_consent(shared);
             if arm_now {
                 if let Err(e) = ensure_store(shared) {
                     emit(&Event::error(Some(id), e));
                     emit_state(shared, id);
                     return;
                 }
+                shared.arm_gen.fetch_add(1, Ordering::SeqCst);
             }
             shared.armed.store(arm_now, Ordering::SeqCst);
+            if arm_now {
+                persist_settings(shared);
+            }
             emit_state(shared, id);
         }
         Command::SetPause {
@@ -308,9 +319,17 @@ fn persist_settings(shared: &Shared) {
     let _ = st.save(&shared.paths.state);
 }
 
+fn persist_consent(shared: &Shared) -> Result<(), String> {
+    let st = shared.settings.lock().unwrap();
+    if st.consent_at == 0 {
+        return Ok(());
+    }
+    st.save(&shared.paths.state)
+}
+
 fn ensure_store(shared: &Shared) -> Result<(), String> {
     let mut g = shared.store.lock().unwrap();
-    if g.is_some() {
+    if g.as_ref().map(|s| s.is_writable()).unwrap_or(false) {
         return Ok(());
     }
     DataPaths::prepare(&shared.paths.root)?;
@@ -469,8 +488,22 @@ fn evaluate_pause(shared: &Shared) -> Option<PauseReason> {
     pause::evaluate(&input)
 }
 
+#[cfg(test)]
 fn recording_now(shared: &Shared) -> bool {
     evaluate_pause(shared).is_none()
+}
+
+pub(crate) fn arm_ticket(shared: &Shared) -> Option<u64> {
+    if shared.armed.load(Ordering::SeqCst) {
+        Some(shared.arm_gen.load(Ordering::SeqCst))
+    } else {
+        None
+    }
+}
+
+pub(crate) fn still_armed(shared: &Shared, gen: u64) -> bool {
+    shared.fire_tripwire();
+    shared.armed.load(Ordering::SeqCst) && shared.arm_gen.load(Ordering::SeqCst) == gen
 }
 
 fn discard_capture_files(files: &[PathBuf]) {
@@ -488,14 +521,19 @@ fn note_pause_change(shared: &Shared, reason: Option<PauseReason>) {
     if prev.as_ref() == reason.as_ref() {
         return;
     }
-    if shared.armed.load(Ordering::SeqCst) {
-        let _ = shared.with_store(|store| {
-            store.record_event(
-                now_ms(),
-                if reason.is_some() { "pause" } else { "resume" },
-                reason.as_ref().map(|r| r.as_str()).unwrap_or(""),
-            )
-        });
+    if let Some(gen) = arm_ticket(shared) {
+        if still_armed(shared, gen) {
+            let _ = shared.with_store_mut(|store| {
+                if !store.is_writable() {
+                    return;
+                }
+                let _ = store.record_event(
+                    now_ms(),
+                    if reason.is_some() { "pause" } else { "resume" },
+                    reason.as_ref().map(|r| r.as_str()).unwrap_or(""),
+                );
+            });
+        }
     }
     *prev = reason;
     emit(&Event::from_stats(stats_json(shared)));
@@ -508,19 +546,32 @@ fn finalize_capture(
     files: &[PathBuf],
     clients: &[hypr::Client],
 ) -> Result<bool, String> {
-    if !recording_now(shared) {
+    let Some(gen) = arm_ticket(shared) else {
+        discard_capture_files(files);
+        return Ok(false);
+    };
+    if !still_armed(shared, gen) {
         discard_capture_files(files);
         return Ok(false);
     }
-    match shared.with_store_mut(|store| -> Result<(), String> {
-        store.insert_frame(insert)?;
-        store.insert_layout(insert.ts, clients)?;
-        let clip = clipboard::latest_cached().unwrap_or_default();
-        store.index_search_row(insert.ts, "", &insert.app, &insert.title, &clip)?;
-        store.prune_to(settings.byte_cap)?;
-        Ok(())
+    let clip = clipboard::latest_cached().unwrap_or_default();
+    match shared.with_store_mut(|store| {
+        store.commit_capture_tx(insert, clients, &clip, settings.byte_cap, || {
+            still_armed(shared, gen)
+        })
     }) {
-        Some(Ok(())) => Ok(true),
+        Some(Ok(true)) => {
+            if still_armed(shared, gen) {
+                Ok(true)
+            } else {
+                discard_capture_files(files);
+                Ok(false)
+            }
+        }
+        Some(Ok(false)) => {
+            discard_capture_files(files);
+            Ok(false)
+        }
         Some(Err(e)) => {
             discard_capture_files(files);
             Err(e)
@@ -575,7 +626,10 @@ fn capture_once(
     let active = hypr::active_window().unwrap_or_default();
     let clients = hypr::clients().unwrap_or_default();
     let raw = session.grab(&monitor.name)?;
-    if !recording_now(shared) {
+    let Some(gen) = arm_ticket(shared) else {
+        return Ok(false);
+    };
+    if !still_armed(shared, gen) {
         return Ok(false);
     }
     let hash = dhash::compute(&raw.rgba, raw.width, raw.height);
@@ -586,12 +640,15 @@ fn capture_once(
     }
 
     let scaled = encode::downscale_720p(&raw.rgba, raw.width, raw.height);
-    if !recording_now(shared) {
+    if !still_armed(shared, gen) {
         return Ok(false);
     }
 
+    if !still_armed(shared, gen) {
+        return Ok(false);
+    }
     ensure_store(shared)?;
-    if !recording_now(shared) {
+    if !still_armed(shared, gen) {
         return Ok(false);
     }
 
@@ -606,12 +663,12 @@ fn capture_once(
     if let Some(parent) = dest.parent() {
         perms::secure_dir(parent).map_err(|e| e.to_string())?;
     }
-    if !recording_now(shared) {
+    if !still_armed(shared, gen) {
         return Ok(false);
     }
     let (enc, written) = encode::encode_frame(&scaled.bytes, scaled.width, scaled.height, &dest)?;
     let mut files = vec![written.clone()];
-    if !recording_now(shared) {
+    if !still_armed(shared, gen) {
         discard_capture_files(&files);
         return Ok(false);
     }
@@ -627,7 +684,7 @@ fn capture_once(
     let mut crop_w = raw.width as i64;
     let mut crop_h = raw.height as i64;
     if let Some(roi) = encode::crop_roi(&raw.rgba, raw.width, raw.height, &active, &monitor) {
-        if !recording_now(shared) {
+        if !still_armed(shared, gen) {
             discard_capture_files(&files);
             return Ok(false);
         }
@@ -650,7 +707,7 @@ fn capture_once(
         crop_rel = Some(crop_name);
     }
 
-    if !recording_now(shared) {
+    if !still_armed(shared, gen) {
         discard_capture_files(&files);
         return Ok(false);
     }
@@ -884,7 +941,27 @@ impl Shared {
 
     pub fn with_store_mut<R>(&self, f: impl FnOnce(&mut Store) -> R) -> Option<R> {
         let mut g = self.store.lock().unwrap();
-        g.as_mut().map(f)
+        match g.as_mut() {
+            Some(s) if s.is_writable() => Some(f(s)),
+            _ => None,
+        }
+    }
+
+    fn fire_tripwire(&self) {
+        let hook = self.tripwire.lock().unwrap().clone();
+        if let Some(h) = hook {
+            h();
+        }
+    }
+
+    #[cfg(test)]
+    fn set_tripwire(&self, f: impl Fn() + Send + Sync + 'static) {
+        *self.tripwire.lock().unwrap() = Some(Arc::new(f));
+    }
+
+    #[cfg(test)]
+    fn clear_tripwire(&self) {
+        *self.tripwire.lock().unwrap() = None;
     }
 }
 
@@ -1021,14 +1098,6 @@ mod tests {
             };
             for entry in entries.flatten() {
                 let path = entry.path();
-                let name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("")
-                    .to_string();
-                if name.ends_with("-wal") || name.ends_with("-shm") || name.ends_with("-journal") {
-                    continue;
-                }
                 if path.is_dir() {
                     walk(&path, acc, root);
                     continue;
@@ -1080,6 +1149,7 @@ mod tests {
         };
         store.insert_frame(&f).unwrap();
         store.record_event(f.ts, "pause", "overlay").unwrap();
+        store.checkpoint().unwrap();
         drop(store);
         let mut settings = Settings::default();
         settings.consent_at = 1;
@@ -1095,11 +1165,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path().join("rewind");
         let seeded = seed_archive(&data);
+        let before_files = content_fingerprint(&data);
+        let before_names = list_files(&data);
+
         let shared = boot_shared(&data).unwrap();
         assert!(!shared.armed.load(Ordering::SeqCst));
-        assert!(shared.store.lock().unwrap().is_some());
+        let after_boot = content_fingerprint(&data);
+        assert_eq!(
+            before_files, after_boot,
+            "boot_shared mutated a disarmed archive:\nbefore={before_files:?}\nafter={after_boot:?}"
+        );
+        assert_eq!(before_names, list_files(&data));
 
-        let before_files = content_fingerprint(&data);
         let before_counts = shared
             .with_store(|s| s.mutation_counters().unwrap())
             .unwrap();
@@ -1120,6 +1197,7 @@ mod tests {
         note_pause_change(&shared, evaluate_pause(&shared));
         assert_eq!(ocr::process_pending(&shared), 0);
         assert!(!shared.is_idle());
+        clipboard::ingest(&shared, "should-not-store");
 
         let after_files = content_fingerprint(&data);
         let after_counts = shared
@@ -1132,10 +1210,14 @@ mod tests {
             before_files, after_files,
             "disarmed session mutated files:\nbefore={before_files:?}\nafter={after_files:?}"
         );
+        assert_eq!(before_names, list_files(&data));
         assert_eq!(before_counts, after_counts);
         assert_eq!(before_pending, after_pending);
         assert!(data.join("crops/pending.png").exists());
         assert_eq!(seeded.path, "frames/old.png");
+        assert!(shared
+            .with_store(|s| !s.is_writable())
+            .unwrap_or(true));
     }
 
     #[test]
@@ -1215,5 +1297,172 @@ mod tests {
         assert!(!shared.is_armed());
         assert!(!shared.is_idle());
         assert!(!recording_now(&shared));
+    }
+
+    #[test]
+    fn keep_disarmed_consent_persists_across_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("rewind");
+        let shared = boot_shared(&data).unwrap();
+        handle_command(
+            &shared,
+            Command::Consent {
+                id: 1,
+                arm_now: false,
+                arm_on_login: false,
+            },
+        );
+        assert!(!shared.armed.load(Ordering::SeqCst));
+        assert!(shared.paths.state.exists());
+        let at = shared.settings.lock().unwrap().consent_at;
+        assert!(at > 0);
+        drop(shared);
+
+        let again = boot_shared(&data).unwrap();
+        let st = again.settings.lock().unwrap().clone();
+        assert!(st.consent_at > 0);
+        assert!(!st.arm_on_login);
+        assert!(!st.armed);
+        assert!(!again.armed.load(Ordering::SeqCst));
+        assert!(again
+            .with_store(|s| s.is_writable())
+            .unwrap_or(false)
+            == false);
+    }
+
+    #[test]
+    fn capture_rolls_back_when_disarmed_mid_transaction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("rewind");
+        let shared = boot_shared(&data).unwrap();
+        {
+            let mut st = shared.settings.lock().unwrap();
+            st.consent_at = now_ms();
+            st.armed = true;
+        }
+        persist_settings(&shared);
+        ensure_store(&shared).unwrap();
+        shared.arm_gen.store(1, Ordering::SeqCst);
+        shared.armed.store(true, Ordering::SeqCst);
+
+        let written = data.join("frames/1/in-flight.webp");
+        fs::create_dir_all(written.parent().unwrap()).unwrap();
+        fs::write(&written, b"in-flight").unwrap();
+        let insert = FrameInsert {
+            ts: 99,
+            path: "frames/1/in-flight.webp".into(),
+            app: "kitty".into(),
+            title: "race".into(),
+            workspace: "1".into(),
+            output: "eDP-1".into(),
+            width: 8,
+            height: 8,
+            out_w: 8,
+            out_h: 8,
+            crop_x: 0,
+            crop_y: 0,
+            crop_w: 8,
+            crop_h: 8,
+            bytes: 9,
+            dhash: 1,
+            encoder: "png".into(),
+            crop_path: None,
+        };
+        let settings = shared.settings.lock().unwrap().clone();
+        let hits = std::sync::atomic::AtomicU64::new(0);
+        let s = Arc::clone(&shared);
+        shared.set_tripwire(move || {
+            if hits.fetch_add(1, Ordering::SeqCst) >= 1 {
+                s.arm_gen.fetch_add(1, Ordering::SeqCst);
+                s.armed.store(false, Ordering::SeqCst);
+            }
+        });
+        let committed = finalize_capture(&shared, &settings, &insert, &[written.clone()], &[])
+            .unwrap();
+        shared.clear_tripwire();
+        assert!(!committed);
+        assert!(!written.exists());
+        let counts = shared
+            .with_store(|s| s.mutation_counters().unwrap())
+            .unwrap();
+        assert_eq!(counts.0, 0);
+    }
+
+    #[test]
+    fn ocr_and_clipboard_roll_back_when_disarmed_mid_transaction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("rewind");
+        let shared = boot_shared(&data).unwrap();
+        {
+            let mut st = shared.settings.lock().unwrap();
+            st.consent_at = now_ms();
+            st.armed = true;
+        }
+        persist_settings(&shared);
+        ensure_store(&shared).unwrap();
+        shared.arm_gen.store(1, Ordering::SeqCst);
+        shared.armed.store(true, Ordering::SeqCst);
+        let frame = FrameInsert {
+            ts: 50,
+            path: "frames/old.png".into(),
+            app: "kitty".into(),
+            title: "seed".into(),
+            workspace: "1".into(),
+            output: "eDP-1".into(),
+            width: 8,
+            height: 8,
+            out_w: 8,
+            out_h: 8,
+            crop_x: 0,
+            crop_y: 0,
+            crop_w: 8,
+            crop_h: 8,
+            bytes: 4,
+            dhash: 1,
+            encoder: "png".into(),
+            crop_path: Some("crops/p.png".into()),
+        };
+        shared
+            .with_store_mut(|s| s.insert_frame(&frame))
+            .unwrap()
+            .unwrap();
+
+        let hits = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let hits_ocr = Arc::clone(&hits);
+        let s = Arc::clone(&shared);
+        shared.set_tripwire(move || {
+            if hits_ocr.fetch_add(1, Ordering::SeqCst) >= 1 {
+                s.arm_gen.fetch_add(1, Ordering::SeqCst);
+                s.armed.store(false, Ordering::SeqCst);
+            }
+        });
+        let boxes = [crate::query::WordBox {
+            word: "x".into(),
+            x: 0.0,
+            y: 0.0,
+            w: 0.1,
+            h: 0.1,
+        }];
+        let ocr_ok = shared
+            .with_store_mut(|store| {
+                store.commit_ocr_tx(50, "x", "kitty", "seed", "", &boxes, || {
+                    still_armed(&shared, 1)
+                })
+            })
+            .unwrap()
+            .unwrap();
+        assert!(!ocr_ok);
+
+        shared.armed.store(true, Ordering::SeqCst);
+        shared.arm_gen.store(1, Ordering::SeqCst);
+        hits.store(0, Ordering::SeqCst);
+        clipboard::ingest(&shared, "clipboard-secret");
+        shared.clear_tripwire();
+
+        let counts = shared
+            .with_store(|s| s.mutation_counters().unwrap())
+            .unwrap();
+        assert_eq!(counts.2, 0, "no ocr boxes");
+        assert_eq!(counts.3, 0, "no clips");
     }
 }

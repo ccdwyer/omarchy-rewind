@@ -33,6 +33,10 @@ pub(crate) fn process_pending(shared: &DaemonState) -> i64 {
     if !tesseract_available() {
         return 0;
     }
+    let gen = match crate::arm_ticket(shared) {
+        Some(g) => g,
+        None => return 0,
+    };
     let pending = match shared.with_store(|s| s.pending_crops()) {
         Some(Ok(p)) => p,
         _ => return 0,
@@ -40,17 +44,16 @@ pub(crate) fn process_pending(shared: &DaemonState) -> i64 {
     let queued = pending.len() as i64;
     let mut done = 0i64;
     for (ts, rel) in pending {
-        if !shared.is_armed() || !shared.is_idle() {
+        if !crate::still_armed(shared, gen) || !shared.is_idle() {
             break;
         }
         let path = shared.data_paths().root.join(&rel);
         if !path.exists() {
-            let _ = shared.with_store(|s| s.clear_crop(ts));
             continue;
         }
         match run_tesseract(&path) {
             Ok((text, raw_boxes)) => {
-                if !shared.is_armed() {
+                if !crate::still_armed(shared, gen) {
                     break;
                 }
                 let meta = frame_geom(shared, ts);
@@ -75,21 +78,28 @@ pub(crate) fn process_pending(shared: &DaemonState) -> i64 {
                         }
                     })
                     .collect();
-                let _ = shared.with_store(|store| {
-                    let (app, title) = store_app_title(store, ts);
-                    let clip = store.clip_at(ts).unwrap_or_default();
-                    let _ = store.index_search_row(ts, &text, &app, &title, &clip);
-                    let _ = store.insert_ocr_boxes(ts, &boxes);
-                    let _ = store.clear_crop(ts);
-                });
-                done += 1;
-                emit(&Event::ocr_progress(done, queued));
-            }
-            Err(_) => {
-                if shared.is_armed() {
-                    let _ = shared.with_store(|s| s.clear_crop(ts));
+                let (app, title, clip) = shared
+                    .with_store(|store| {
+                        let (app, title) = store_app_title(store, ts);
+                        let clip = store.clip_at(ts).unwrap_or_default();
+                        (app, title, clip)
+                    })
+                    .unwrap_or_default();
+                let committed = shared
+                    .with_store_mut(|store| {
+                        store.commit_ocr_tx(ts, &text, &app, &title, &clip, &boxes, || {
+                            crate::still_armed(shared, gen)
+                        })
+                    })
+                    .unwrap_or(Ok(false))
+                    .unwrap_or(false);
+                if committed && crate::still_armed(shared, gen) {
+                    let _ = std::fs::remove_file(&path);
+                    done += 1;
+                    emit(&Event::ocr_progress(done, queued));
                 }
             }
+            Err(_) => {}
         }
     }
     done

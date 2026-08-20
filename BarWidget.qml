@@ -32,10 +32,8 @@ BarWidget {
   function toggle() { root.toggleArm() }
 
   function callShell(method, arg) {
-    var cmd = ["omarchy-shell", "shell", "call", root.moduleName, method]
-    if (arg !== undefined && arg !== null && String(arg).length)
-      cmd.push(String(arg))
-    Quickshell.execDetached(cmd)
+    var payload = arg === undefined || arg === null || String(arg).length === 0 ? "{}" : String(arg)
+    Quickshell.execDetached(["omarchy-shell", "shell", "call", root.moduleName, method, payload])
   }
 
   function pushSettings() {
@@ -50,7 +48,21 @@ BarWidget {
   }
 
   function toggleArm() {
-    root.callShell("toggleArm", "")
+    root.callShell("toggleArm", "{}")
+  }
+
+  function applyLive(raw) {
+    var u = Channel.parse(raw, {})
+    if (u.armed !== undefined)
+      root.armed = u.armed === true
+    if (u.paused !== undefined)
+      root.paused = u.paused === true
+    if (u.reason !== undefined)
+      root.pauseReason = u.reason || (root.armed ? "" : "disarmed")
+    if (u.framesToday !== undefined)
+      root.framesToday = Number(u.framesToday) || 0
+    if (u.bytes !== undefined)
+      root.bytesUsed = Number(u.bytes) || 0
   }
 
   function summonOverlay(payload) {
@@ -65,15 +77,29 @@ BarWidget {
     path: adapter.dataDir() + "/ui.json"
     watchChanges: true
     printErrors: false
-    onLoaded: {
-      var u = Channel.parse(text(), {})
-      root.armed = u.armed === true
-      root.paused = u.paused === true
-      root.pauseReason = u.reason || (root.armed ? "" : "disarmed")
-      root.framesToday = Number(u.framesToday || 0)
-      root.bytesUsed = Number(u.bytes || 0)
-    }
+    onLoaded: root.applyLive(text())
     onFileChanged: reload()
+  }
+
+  Process {
+    id: statusProc
+    running: false
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.applyLive(text)
+    }
+  }
+
+  Timer {
+    interval: 400
+    running: true
+    repeat: true
+    onTriggered: {
+      if (statusProc.running)
+        return
+      statusProc.command = ["omarchy-shell", "shell", "call", root.moduleName, "status", "{}"]
+      statusProc.running = true
+    }
   }
 
   WidgetButton {

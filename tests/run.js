@@ -272,7 +272,7 @@ test("network-audit fails when binary is missing", () => {
 
 test("IpcHandler exposes JSON-arg methods", () => {
   const src = fs.readFileSync(path.join(ROOT, "Service.qml"), "utf8")
-  for (const name of ["consentNow", "copyClip", "executePlan", "wipe", "reopenPlan", "query", "refresh", "summon"]) {
+  for (const name of ["consentNow", "copyClip", "executePlan", "wipe", "reopenPlan", "query", "refresh", "summon", "toggleArm"]) {
     assert.ok(src.indexOf("function " + name + "(arg: string)") >= 0
       || src.indexOf("function " + name + "(q: string)") >= 0, name)
   }
@@ -344,6 +344,34 @@ test("compat daemon writes nothing while disarmed", () => {
   assert.deepStrictEqual(walked, [], "disarmed fallback wrote " + JSON.stringify(walked))
 })
 
+test("compat configure with existing consent is memory-only", () => {
+  const os = require("os")
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "rewind-cfg-"))
+  const env = Object.assign({}, process.env, { REWIND_DATA_DIR: tmp })
+  const state = path.join(tmp, "state.json")
+  const original = JSON.stringify({
+    armed: false,
+    consentAt: 1700000000000,
+    armOnLogin: false,
+    byteCap: 2147483648,
+    cadenceMs: 3000,
+    idlePauseSec: 120
+  })
+  fs.writeFileSync(state, original)
+  const before = fs.readdirSync(tmp).sort()
+  const p = path.join(ROOT, "compat", "rewindd.sh")
+  fs.chmodSync(p, 0o755)
+  const r = spawnSync(p, ["daemon"], {
+    encoding: "utf8",
+    env,
+    input: '{"cmd":"configure","id":1,"byteCapGb":4,"cadenceMs":5000}\n{"cmd":"shutdown","id":2}\n'
+  })
+  assert.strictEqual(r.status, 0, r.stderr + r.stdout)
+  assert.ok(r.stdout.indexOf('"event":"ready"') >= 0, r.stdout)
+  assert.strictEqual(fs.readFileSync(state, "utf8"), original)
+  assert.deepStrictEqual(fs.readdirSync(tmp).sort(), before)
+})
+
 test("service keeps snapshots in memory until consent/arm", () => {
   const src = fs.readFileSync(path.join(ROOT, "Service.qml"), "utf8")
   assert.ok(/persistUi:\s*root\.armed/.test(src))
@@ -351,6 +379,20 @@ test("service keeps snapshots in memory until consent/arm", () => {
   assert.ok(src.indexOf("root.refreshTimeline()") >= 0)
   assert.ok(src.indexOf("root.armed = true") < 0)
   assert.ok(src.indexOf("function summon(arg: string)") >= 0)
+  assert.ok(src.indexOf("function toggleArm(arg: string)") >= 0)
+})
+
+test("bar polls live status and toggleArm always sends an arg", () => {
+  const bar = fs.readFileSync(path.join(ROOT, "BarWidget.qml"), "utf8")
+  assert.ok(bar.indexOf("function applyLive") >= 0)
+  assert.ok(bar.indexOf('"status"') >= 0)
+  assert.ok(bar.indexOf('callShell("toggleArm", "{}")') >= 0)
+  const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8")
+  assert.ok(readme.indexOf("toggleArm '{}'") >= 0)
+  assert.ok(readme.indexOf("omarchy bar put") < 0)
+  assert.ok(readme.indexOf("omarchy plugin enable") >= 0)
+  assert.ok(readme.indexOf("omarchy bar move") >= 0)
+  assert.ok(fs.existsSync(path.join(ROOT, "preview.png")))
 })
 
 test("ocr does not treat disarmed as idle and capture reports runtime backend", () => {
