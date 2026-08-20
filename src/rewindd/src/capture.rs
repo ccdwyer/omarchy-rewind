@@ -43,6 +43,8 @@ pub struct CaptureSession {
     wlr: Option<capture_wlr::Session>,
     #[cfg(feature = "wayland")]
     wlr_retry_at: Instant,
+    /// Frame counter for the env-gated synthetic test backend only.
+    test_seq: u32,
 }
 
 impl Default for CaptureSession {
@@ -58,6 +60,7 @@ impl CaptureSession {
             wlr: None,
             #[cfg(feature = "wayland")]
             wlr_retry_at: Instant::now(),
+            test_seq: 0,
         }
     }
 
@@ -93,6 +96,27 @@ impl CaptureSession {
     }
 
     pub fn grab(&mut self, output: &str) -> Result<RawFrame, String> {
+        // Deterministic synthetic backend for the no-network audit / CI, where
+        // no real compositor is present. Produces a fixed off-white frame with
+        // a moving pixel so dedup does not skip it. Never used unless the env
+        // var is explicitly set (tests and scripts/network-audit.sh only).
+        if std::env::var("REWIND_TEST_CAPTURE").is_ok() {
+            let (w, h) = (64u32, 64u32);
+            let mut rgba = vec![0xF0u8; (w * h * 4) as usize];
+            // Move one pixel each grab so successive frames differ and dedup
+            // does not skip them.
+            let idx = ((self.test_seq as usize) % (w * h) as usize) * 4;
+            self.test_seq = self.test_seq.wrapping_add(1);
+            rgba[idx] = 0x10;
+            rgba[idx + 1] = 0x20;
+            rgba[idx + 2] = 0x30;
+            let _ = output;
+            return Ok(RawFrame {
+                rgba,
+                width: w,
+                height: h,
+            });
+        }
         #[cfg(feature = "wayland")]
         {
             if self.wlr.is_none() && Instant::now() >= self.wlr_retry_at {

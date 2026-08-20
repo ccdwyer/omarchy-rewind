@@ -40,7 +40,10 @@ ARMONLOGIN=0
 BYTECAP=2147483648
 CADENCE=3000
 IDLEPAUSE=120
-EXCLUDES="keepassxc,1Password,1password,Bitwarden,bitwarden,seahorse"
+# Keep in sync with default_excludes() in src/rewindd/src/config.rs and the
+# manifest defaults — the fallback must not exclude fewer sensitive apps than
+# the Rust helper.
+EXCLUDES="keepassxc,1Password,1password,Bitwarden,bitwarden,seahorse,polkit-gnome-authentication-agent-1,polkit-kde-authentication-agent-1,lxqt-policykit-agent,mate-polkit,xfce-polkit"
 TITLEPAUSE=""
 
 emit() { printf '%s\n' "$1"; }
@@ -78,13 +81,17 @@ print("TITLEPAUSE=%r"%tp)
 ' "$STATE" 2>/dev/null || true)"
 }
 
+# Persist state atomically: write a private temp file in the same directory,
+# fsync it, then os.replace() over the target so a crash can never leave a
+# truncated state.json. Errors propagate (non-zero return) so the caller can
+# roll back consent rather than claim a durable write that did not happen.
 save_state() {
   if [ "${CONSENT_AT:-0}" -eq 0 ]; then
     return 0
   fi
   prepare_data
   python3 -c '
-import json,sys
+import json,os,sys,tempfile
 path=sys.argv[1]
 body={
   "armed": False,
@@ -98,9 +105,31 @@ body={
   "record": False,
   "reason": "compat-norecord",
 }
-json.dump(body, open(path,"w"))
-' "$STATE" "${CONSENT_AT:-0}" "$ARMONLOGIN" "$BYTECAP" "$CADENCE" "$IDLEPAUSE" "$EXCLUDES" "$TITLEPAUSE" 2>/dev/null || true
-  chmod 600 "$STATE" 2>/dev/null || true
+d=os.path.dirname(path) or "."
+fd,tmp=tempfile.mkstemp(prefix=".state.",dir=d)
+try:
+    with os.fdopen(fd,"w") as f:
+        json.dump(body,f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp,0o600)
+    os.replace(tmp,path)
+    # fsync the directory so the rename itself is durable.
+    try:
+        dfd=os.open(d,os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass
+except Exception:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    sys.exit(1)
+' "$STATE" "${CONSENT_AT:-0}" "$ARMONLOGIN" "$BYTECAP" "$CADENCE" "$IDLEPAUSE" "$EXCLUDES" "$TITLEPAUSE"
 }
 
 merge_configure() {
@@ -482,6 +511,11 @@ while IFS= read -r line; do
       reply "$id" "$(stats_json)"
       ;;
     consent)
+      # Stage the new consent, but only keep it if the atomic save succeeds;
+      # otherwise roll back so we never report consent that was not persisted.
+      prev_consent=$CONSENT
+      prev_consent_at=$CONSENT_AT
+      prev_armonlogin=$ARMONLOGIN
       CONSENT=1
       CONSENT_AT=$(now_ms)
       armnow=$(field "$line" armNow)
@@ -491,7 +525,13 @@ while IFS= read -r line; do
       else
         ARMONLOGIN=0
       fi
-      save_state
+      if ! save_state; then
+        CONSENT=$prev_consent
+        CONSENT_AT=$prev_consent_at
+        ARMONLOGIN=$prev_armonlogin
+        emit "{\"event\":\"error\",\"id\":$id,\"ok\":false,\"error\":\"failed to persist consent; not recorded\"}"
+        continue
+      fi
       if [ "$armnow" = "true" ]; then
         emit "{\"event\":\"error\",\"id\":$id,\"error\":\"compat helper does not record; run build.sh for rewindd\"}"
       fi

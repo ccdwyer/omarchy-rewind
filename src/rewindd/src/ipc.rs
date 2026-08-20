@@ -52,6 +52,11 @@ pub enum Command {
         id: u64,
         ts: i64,
     },
+    ReopenWindow {
+        id: u64,
+        ts: i64,
+        target: Value,
+    },
     ReopenExec {
         id: u64,
         plan: Value,
@@ -139,6 +144,11 @@ impl Command {
             "reopen-plan" | "reopenPlan" => Ok(Command::ReopenPlan {
                 id,
                 ts: v.get("ts").and_then(|x| x.as_i64()).unwrap_or(0),
+            }),
+            "reopen-window" | "reopenWindow" => Ok(Command::ReopenWindow {
+                id,
+                ts: v.get("ts").and_then(|x| x.as_i64()).unwrap_or(0),
+                target: v.get("target").cloned().unwrap_or(json!({})),
             }),
             "reopen-exec" | "reopenExec" => Ok(Command::ReopenExec {
                 id,

@@ -376,10 +376,21 @@ Item {
   function askOneWindow(win) {
     if (!win)
       return
-    root.plan = Plan.oneWindowPlan(win)
-    root.planReady = true
-    root.planRequestTs = Number(win.ts || (root.currentFrame() ? root.currentFrame().ts : 0))
+    // The reopen plan (including the launch command) is built by the helper
+    // from the desktop-file map + live clients — the UI must not fabricate a
+    // command from stored window data that has no exec/cmd. Request it async
+    // and show it for confirmation once it arrives.
+    var ts = Number(win.ts || (root.currentFrame() ? root.currentFrame().ts : 0))
+    var target = {
+      "address": String(win.address || ""),
+      "class": String(win.class || win.app || ""),
+      "title": String(win.title || "")
+    }
+    root.plan = {}
+    root.planReady = false
+    root.planRequestTs = ts
     root.showPlan = true
+    root.callSvc("reopenWindow", { "ts": ts, "target": target })
   }
 
   function execPlan() {

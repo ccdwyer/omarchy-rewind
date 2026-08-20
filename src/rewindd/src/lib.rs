@@ -69,6 +69,11 @@ fn tempfile_dir() -> Result<PathBuf, String> {
 
 pub(crate) struct ArmState {
     pub armed: bool,
+    /// Monotonic arm generation. Bumped under the exclusive gate lock on every
+    /// arm/disarm transition. A write is authorized only if the capturing job's
+    /// ticket generation still matches, so a job that began before a
+    /// disarm/re-arm cannot commit stale material across the disarmed boundary.
+    pub gen: u64,
 }
 
 pub(crate) struct Shared {
@@ -105,7 +110,10 @@ fn boot_shared(data_dir: &Path) -> Result<Arc<Shared>, String> {
         None
     };
     Ok(Arc::new(Shared {
-        gate: RwLock::new(ArmState { armed }),
+        gate: RwLock::new(ArmState {
+            armed,
+            gen: if armed { 1 } else { 0 },
+        }),
         settings: Mutex::new(settings),
         store: Mutex::new(store),
         paths,
@@ -274,6 +282,10 @@ fn handle_command(shared: &Arc<Shared>, cmd: Command) {
             Ok(data) => emit(&Event::reply(id, data)),
             Err(e) => emit(&Event::error(Some(id), e.to_string())),
         },
+        Command::ReopenWindow { id, ts, target } => match build_one_plan(shared, ts, &target) {
+            Ok(plan) => emit(&Event::reply(id, plan)),
+            Err(e) => emit(&Event::error(Some(id), e)),
+        },
         Command::ReopenExec { id, plan } => match execute_plan(plan) {
             Ok(data) => emit(&Event::reply(id, data)),
             Err(e) => emit(&Event::error(Some(id), e.to_string())),
@@ -385,19 +397,25 @@ fn arm_now(shared: &Shared) -> Result<(), String> {
         shared.armed.store(false, Ordering::SeqCst);
         return Err(e);
     }
+    // Bump the generation under the exclusive gate lock so it stays consistent
+    // with `armed`; mirror to the lock-free atomic for cheap reads.
+    let next = shared.arm_gen.fetch_add(1, Ordering::SeqCst) + 1;
     arm.armed = true;
+    arm.gen = next;
     shared.armed.store(true, Ordering::SeqCst);
-    shared.arm_gen.fetch_add(1, Ordering::SeqCst);
     drop(arm);
     persist_settings(shared);
     Ok(())
 }
 
 fn disarm_now(shared: &Shared) {
-    shared.armed.store(false, Ordering::SeqCst);
-    shared.arm_gen.fetch_add(1, Ordering::SeqCst);
+    // Take the exclusive gate first so no in-flight capture can observe a
+    // half-updated state; bump the generation and flip armed together.
     let mut arm = shared.gate.write().unwrap();
+    let next = shared.arm_gen.fetch_add(1, Ordering::SeqCst) + 1;
     arm.armed = false;
+    arm.gen = next;
+    shared.armed.store(false, Ordering::SeqCst);
     {
         let mut st = shared.settings.lock().unwrap();
         st.armed = false;
@@ -432,6 +450,21 @@ fn build_plan(shared: &Shared, ts: i64) -> Result<serde_json::Value, String> {
     let live = hypr::clients().unwrap_or_default();
     let map = plan::desktop_map(plan::application_dirs());
     Ok(plan::build(&stored, &live, &map))
+}
+
+fn build_one_plan(
+    shared: &Shared,
+    ts: i64,
+    target: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let stored = match shared.with_store(|s| s.layout_at(ts)) {
+        Some(Ok(v)) => v,
+        Some(Err(e)) => return Err(e.to_string()),
+        None => Vec::new(),
+    };
+    let live = hypr::clients().unwrap_or_default();
+    let map = plan::desktop_map(plan::application_dirs());
+    Ok(plan::build_one(&stored, &live, &map, target))
 }
 
 fn execute_plan(plan: serde_json::Value) -> Result<serde_json::Value, String> {
@@ -543,10 +576,23 @@ fn evaluate_pause(shared: &Shared) -> Option<PauseReason> {
         return Some(PauseReason::Overlay);
     }
     let settings = shared.settings.lock().unwrap().clone();
-    let clients = hypr::clients().unwrap_or_default();
-    let locked = hypr::locked();
-    let idle_ms = hypr::idle_ms();
-    let portal = hypr::portal_screencast_active();
+    // With the synthetic test-capture backend (CI / no-network audit) there is
+    // no compositor to report idle/lock/portal, so treat the session as active
+    // to prove that an armed daemon actually writes frames. Never set outside
+    // tests/audit.
+    let test_capture = std::env::var("REWIND_TEST_CAPTURE").is_ok();
+    let clients = if test_capture {
+        Vec::new()
+    } else {
+        hypr::clients().unwrap_or_default()
+    };
+    let locked = if test_capture { false } else { hypr::locked() };
+    let idle_ms = if test_capture { 0 } else { hypr::idle_ms() };
+    let portal = if test_capture {
+        false
+    } else {
+        hypr::portal_screencast_active()
+    };
     let input = PauseInput {
         armed: true,
         locked,
@@ -566,26 +612,39 @@ fn recording_now(shared: &Shared) -> bool {
     evaluate_pause(shared).is_none()
 }
 
+/// Capture a ticket at the start of a capture/OCR job: the arm generation read
+/// under the gate's read lock. `None` if disarmed. The returned generation is
+/// what every later `still_armed`/`write_allowed` check must match, so a
+/// disarm (which bumps the generation) invalidates the job even if a
+/// subsequent re-arm sets `armed` back to true.
 pub(crate) fn arm_ticket(shared: &Shared) -> Option<u64> {
-    if shared.armed.load(Ordering::SeqCst) {
-        Some(shared.arm_gen.load(Ordering::SeqCst))
+    let g = shared.gate.read().unwrap();
+    if g.armed {
+        Some(g.gen)
     } else {
         None
     }
 }
 
-pub(crate) fn write_allowed(shared: &Shared, arm: &ArmState) -> bool {
+/// Authorize a write against a held gate read-guard and the job's ticket.
+/// Both the armed flag and the generation are read from the same gate-protected
+/// snapshot, so this is race-free with respect to arm/disarm (which hold the
+/// write lock). A generation mismatch means a disarm happened since the ticket
+/// was issued — reject even if currently re-armed.
+pub(crate) fn write_allowed(shared: &Shared, arm: &ArmState, ticket: u64) -> bool {
     shared.fire_tripwire();
-    arm.armed && shared.armed.load(Ordering::SeqCst)
+    // Gate-protected armed flag and generation are the authority (race-free vs
+    // arm/disarm, which hold the write lock); the atomic mirror is an extra
+    // belt-and-suspenders read that also lets an interrupted disarm be observed
+    // immediately. A generation mismatch means a disarm happened since the
+    // ticket was issued, so re-arming does not resurrect a stale job.
+    arm.armed && arm.gen == ticket && shared.armed.load(Ordering::SeqCst)
 }
 
-pub(crate) fn still_armed(shared: &Shared, _gen: u64) -> bool {
-    write_allowed(
-        shared,
-        &ArmState {
-            armed: shared.armed.load(Ordering::SeqCst),
-        },
-    )
+/// Convenience check used at each step of a capture: acquires the gate read
+/// lock and verifies the job's ticket is still the live generation.
+pub(crate) fn still_armed(shared: &Shared, gen: u64) -> bool {
+    with_arm_read(shared, |arm| write_allowed(shared, arm, gen))
 }
 
 fn discard_capture_files(files: &[PathBuf]) {
@@ -604,7 +663,9 @@ fn note_pause_change(shared: &Shared, reason: Option<PauseReason>) {
         return;
     }
     with_arm_read(shared, |arm| {
-        if write_allowed(shared, arm) {
+        // A pause/resume event is an in-the-moment write; authorize against the
+        // live generation held under this same read guard.
+        if write_allowed(shared, arm, arm.gen) {
             let _ = shared.with_store_mut(|store| {
                 if !store.is_writable() {
                     return;
@@ -627,20 +688,24 @@ fn finalize_capture(
     insert: &FrameInsert,
     files: &[PathBuf],
     clients: &[hypr::Client],
+    ticket: u64,
 ) -> Result<bool, String> {
+    // Hold the gate read lock across the whole commit so a concurrent disarm
+    // (which needs the write lock) cannot interleave between the authorization
+    // check and the transaction commit.
     with_arm_read(shared, |arm| {
-        if !write_allowed(shared, arm) {
+        if !write_allowed(shared, arm, ticket) {
             discard_capture_files(files);
             return Ok(false);
         }
         let clip = clipboard::latest_cached().unwrap_or_default();
         match shared.with_store_mut(|store| {
             store.commit_capture_tx(insert, clients, &clip, settings.byte_cap, || {
-                write_allowed(shared, arm)
+                write_allowed(shared, arm, ticket)
             })
         }) {
             Some(Ok(true)) => {
-                if write_allowed(shared, arm) {
+                if write_allowed(shared, arm, ticket) {
                     Ok(true)
                 } else {
                     discard_capture_files(files);
@@ -816,7 +881,7 @@ fn capture_once(
         crop_path: crop_rel,
     };
 
-    if !finalize_capture(shared, settings, &insert, &files, &clients)? {
+    if !finalize_capture(shared, settings, &insert, &files, &clients, gen)? {
         return Ok(false);
     }
 
@@ -1326,11 +1391,10 @@ mod tests {
         {
             let mut st = shared.settings.lock().unwrap();
             st.consent_at = now_ms();
-            st.armed = true;
         }
-        persist_settings(&shared);
-        ensure_store(&shared).unwrap();
-        shared.armed.store(true, Ordering::SeqCst);
+        persist_consent(&shared).unwrap();
+        arm_now(&shared).unwrap();
+        let ticket = arm_ticket(&shared).expect("armed");
 
         let frame_rel = "frames/1/in-flight.webp";
         let crop_rel = "crops/in-flight.png";
@@ -1363,11 +1427,8 @@ mod tests {
         };
         let settings = shared.settings.lock().unwrap().clone();
 
-        shared.armed.store(false, Ordering::SeqCst);
-        {
-            let mut st = shared.settings.lock().unwrap();
-            st.armed = false;
-        }
+        // Disarm through the real path (drops the writable store, bumps gen).
+        disarm_now(&shared);
 
         let committed = finalize_capture(
             &shared,
@@ -1375,6 +1436,7 @@ mod tests {
             &insert,
             &[written.clone(), crop.clone()],
             &[],
+            ticket,
         )
         .unwrap();
         assert!(!committed);
@@ -1581,9 +1643,10 @@ mod tests {
             let shared = Arc::clone(&shared);
             let parked = Arc::clone(&parked);
             let written = written.clone();
+            let ticket = arm_ticket(&shared).expect("armed at start");
             thread::spawn(move || {
                 let committed = with_arm_read(&shared, |arm| {
-                    if !write_allowed(&shared, arm) {
+                    if !write_allowed(&shared, arm, ticket) {
                         discard_capture_files(&[written.clone()]);
                         return false;
                     }
@@ -1629,6 +1692,74 @@ mod tests {
             .with_store(|s| s.mutation_counters().unwrap())
             .unwrap();
         assert_eq!(counts.0, 0);
+    }
+
+    #[test]
+    fn stale_ticket_after_disarm_rearm_cannot_commit() {
+        // A capture job takes its ticket while armed, then the user disarms and
+        // re-arms (a fresh generation). The stale job must NOT commit, even
+        // though the daemon is armed again by the time it reaches finalize.
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("rewind");
+        let shared = boot_shared(&data).unwrap();
+        {
+            let mut st = shared.settings.lock().unwrap();
+            st.consent_at = now_ms();
+        }
+        persist_consent(&shared).unwrap();
+        arm_now(&shared).unwrap();
+
+        // Ticket issued under the first armed generation.
+        let ticket = arm_ticket(&shared).expect("armed");
+
+        // Disarm then re-arm: generation advances twice; armed is true again.
+        disarm_now(&shared);
+        arm_now(&shared).unwrap();
+        assert!(shared.armed.load(Ordering::SeqCst));
+        assert_ne!(
+            arm_ticket(&shared).expect("re-armed"),
+            ticket,
+            "generation must advance across disarm/re-arm"
+        );
+
+        // The stale job's authorization must be denied despite being armed.
+        assert!(
+            !still_armed(&shared, ticket),
+            "stale ticket must not authorize a write after disarm/re-arm"
+        );
+
+        let written = data.join("frames/1/stale.webp");
+        fs::create_dir_all(written.parent().unwrap()).unwrap();
+        fs::write(&written, b"stale").unwrap();
+        let insert = FrameInsert {
+            ts: 123,
+            path: "frames/1/stale.webp".into(),
+            app: "kitty".into(),
+            title: "stale".into(),
+            workspace: "1".into(),
+            output: "eDP-1".into(),
+            width: 8,
+            height: 8,
+            out_w: 8,
+            out_h: 8,
+            crop_x: 0,
+            crop_y: 0,
+            crop_w: 8,
+            crop_h: 8,
+            bytes: 5,
+            dhash: 1,
+            encoder: "png".into(),
+            crop_path: None,
+        };
+        let settings = shared.settings.lock().unwrap().clone();
+        let committed =
+            finalize_capture(&shared, &settings, &insert, &[written.clone()], &[], ticket).unwrap();
+        assert!(!committed, "stale-ticket finalize must not commit");
+        assert!(!written.exists(), "stale capture file must be discarded");
+        let counts = shared
+            .with_store(|s| s.mutation_counters().unwrap())
+            .unwrap();
+        assert_eq!(counts.0, 0, "no rows written for a stale-ticket job");
     }
 
     #[test]
@@ -1690,12 +1821,12 @@ mod tests {
         {
             let mut st = shared.settings.lock().unwrap();
             st.consent_at = now_ms();
-            st.armed = true;
         }
-        persist_settings(&shared);
-        ensure_store(&shared).unwrap();
-        shared.arm_gen.store(1, Ordering::SeqCst);
-        shared.armed.store(true, Ordering::SeqCst);
+        persist_consent(&shared).unwrap();
+        arm_now(&shared).unwrap();
+        // Gate is now armed at generation 1; the tripwire below simulates a
+        // mid-transaction disarm by flipping the atomic mirror, which
+        // write_allowed observes and rejects.
         let frame = FrameInsert {
             ts: 50,
             path: "frames/old.png".into(),

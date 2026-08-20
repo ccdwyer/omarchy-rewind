@@ -192,6 +192,61 @@ pub fn build(stored: &[Client], live: &[Client], map: &HashMap<String, Desktop>)
     })
 }
 
+/// Build a reviewable plan for a SINGLE stored window, selected from the
+/// moment's layout by `target` (address, else class+title, else class). The
+/// exec command is resolved here in the helper from the desktop-file map — the
+/// UI never fabricates a launch command from stored data that lacks one.
+pub fn build_one(
+    stored: &[Client],
+    live: &[Client],
+    map: &HashMap<String, Desktop>,
+    target: &Value,
+) -> Value {
+    let t_addr = target.get("address").and_then(|v| v.as_str()).unwrap_or("");
+    let t_class = target.get("class").and_then(|v| v.as_str()).unwrap_or("");
+    let t_title = target.get("title").and_then(|v| v.as_str()).unwrap_or("");
+
+    let matched: Vec<Client> = stored
+        .iter()
+        .filter(|w| {
+            if !t_addr.is_empty() && w.address == t_addr {
+                return true;
+            }
+            if !t_class.is_empty() && w.class.eq_ignore_ascii_case(t_class) {
+                // If a title was supplied, require it too so we pick one window.
+                return t_title.is_empty() || w.title == t_title;
+            }
+            false
+        })
+        .cloned()
+        .collect();
+
+    // Keep only the first match so the plan is genuinely one window.
+    let one: Vec<Client> = matched.into_iter().take(1).collect();
+    if one.is_empty() {
+        return json!({
+            "title": "Reopen this window",
+            "honest": true,
+            "steps": [],
+            "unrecoverable": [{
+                "class": t_class,
+                "title": t_title,
+                "reason": "that window is not in this moment's snapshot"
+            }],
+            "note": "Nothing to reopen for the selected window."
+        });
+    }
+    let mut plan = build(&one, live, map);
+    if let Some(obj) = plan.as_object_mut() {
+        obj.insert("title".into(), json!("Reopen this window"));
+        obj.insert(
+            "note".into(),
+            json!("Reopens the selected window only. It is not session restore."),
+        );
+    }
+    plan
+}
+
 pub fn self_test() -> Result<(), String> {
     let stored = vec![Client {
         class: "kitty".into(),

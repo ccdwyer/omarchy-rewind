@@ -47,6 +47,10 @@ LOG="$TMP/strace.log"
 OUT="$TMP/daemon.out"
 ERR="$TMP/daemon.err"
 set +e
+# REWIND_TEST_CAPTURE forces a deterministic synthetic capture backend and
+# treats the session as active, so an armed daemon on this headless runner
+# actually writes frames — otherwise the "no-network during capture" proof
+# could pass without any capture having happened.
 {
   echo '{"cmd":"consent","id":1,"armNow":true}'
   echo '{"cmd":"arm","id":2}'
@@ -54,7 +58,7 @@ set +e
   echo '{"cmd":"stats","id":3}'
   echo '{"cmd":"disarm","id":4}'
   echo '{"cmd":"shutdown","id":5}'
-} | strace -e trace=network -o "$LOG" -f "$BIN" daemon >"$OUT" 2>"$ERR"
+} | REWIND_TEST_CAPTURE=1 strace -e trace=network -o "$LOG" -f "$BIN" daemon >"$OUT" 2>"$ERR"
 status=$?
 set -e
 
@@ -78,6 +82,17 @@ if ! grep -q '"event":"reply"' "$OUT"; then
   cat "$OUT" "$ERR" >&2
   exit 1
 fi
+# The proof is only meaningful if a frame was actually captured and written.
+# Require either a frame-written event or a positive frame count in stats.
+frames_written=$(grep -c '"event":"frame-written"' "$OUT" 2>/dev/null || echo 0)
+frames_stat=$(grep -oE '"frames":[0-9]+' "$OUT" | grep -oE '[0-9]+' | sort -rn | head -1)
+frames_stat=${frames_stat:-0}
+if [ "$frames_written" -eq 0 ] && [ "$frames_stat" -eq 0 ]; then
+  echo "FAIL: no frame was captured during the audit; the no-network proof is vacuous" >&2
+  cat "$OUT" "$ERR" >&2
+  exit 1
+fi
+echo "captured frames: events=$frames_written stat=$frames_stat"
 
 if grep -E 'connect\(|sendto\(|recvfrom\(' "$LOG" | grep -v 'UNIX' | grep -v 'AF_UNIX' >/dev/null 2>&1; then
   echo "FAIL: unexpected network syscall"

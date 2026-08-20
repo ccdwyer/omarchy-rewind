@@ -7,6 +7,15 @@ set -eu
 PHRASE="${REWIND_PHRASE:-zebra-token-rewind-demo}"
 HASH="${REWIND_HASH:-$(git rev-parse HEAD 2>/dev/null || echo git-hash-ff00aa)}"
 
+# These values are interpolated into nested `sh -c` commands below, so restrict
+# them to a safe charset to prevent shell injection from a hostile env var.
+# Strip anything outside [A-Za-z0-9._-]; fall back to the defaults if emptied.
+sanitize() { printf '%s' "$1" | tr -cd 'A-Za-z0-9._-'; }
+PHRASE="$(sanitize "$PHRASE")"
+HASH="$(sanitize "$HASH")"
+[ -n "$PHRASE" ] || PHRASE="zebra-token-rewind-demo"
+[ -n "$HASH" ] || HASH="git-hash-ff00aa"
+
 say() { printf '%s\n' "$*"; }
 
 say "Rewind demo seed. Distinctive phrase: $PHRASE"

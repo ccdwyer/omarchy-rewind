@@ -216,6 +216,80 @@ impl Store {
         Ok(())
     }
 
+    /// Oldest-first byte-cap prune executed against an already-open
+    /// transaction, so pruning commits atomically with the insert that pushed
+    /// storage over the cap. Returns the on-disk frame/crop paths to unlink
+    /// after the transaction commits (file removal cannot be transactional).
+    /// Any SQL error propagates and rolls back the whole capture.
+    fn prune_within_tx(
+        tx: &rusqlite::Transaction<'_>,
+        cap: i64,
+    ) -> Result<Vec<(String, Option<String>)>, String> {
+        let mut unlink: Vec<(String, Option<String>)> = Vec::new();
+        if cap <= 0 {
+            return Ok(unlink);
+        }
+        loop {
+            let total: i64 = tx
+                .query_row("SELECT COALESCE(SUM(bytes),0) FROM frames", [], |r| r.get(0))
+                .map_err(|e| e.to_string())?;
+            if total <= cap {
+                break;
+            }
+            let oldest: Option<i64> = tx
+                .query_row("SELECT MIN(ts) FROM frames", [], |r| {
+                    r.get::<_, Option<i64>>(0)
+                })
+                .map_err(|e| e.to_string())?;
+            let Some(ts) = oldest else { break };
+            let next: Option<i64> = tx
+                .query_row("SELECT MIN(ts) FROM frames WHERE ts > ?1", params![ts], |r| {
+                    r.get::<_, Option<i64>>(0)
+                })
+                .map_err(|e| e.to_string())?;
+            let hi = next.map(|n| n.saturating_sub(1)).unwrap_or(i64::MAX);
+            // Collect the files in this window before deleting the rows.
+            let mut removed_here = 0usize;
+            {
+                let mut stmt = tx
+                    .prepare("SELECT path, crop_path FROM frames WHERE ts>=?1 AND ts<=?2")
+                    .map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map(params![ts, hi], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+                    })
+                    .map_err(|e| e.to_string())?;
+                for r in rows {
+                    unlink.push(r.map_err(|e| e.to_string())?);
+                    removed_here += 1;
+                }
+            }
+            for (table, has) in [
+                ("frames", true),
+                ("clips", true),
+                ("layouts", true),
+                ("events", true),
+                ("ocr_boxes", true),
+                ("ocr", false),
+                ("search_fallback", false),
+            ] {
+                let sql = format!("DELETE FROM {table} WHERE ts>=?1 AND ts<=?2");
+                let res = tx.execute(&sql, params![ts, hi]);
+                if has {
+                    res.map_err(|e| e.to_string())?;
+                } else {
+                    // ocr/search_fallback may not exist depending on FTS build.
+                    let _ = res;
+                }
+            }
+            // Guard against a pathological no-progress loop.
+            if removed_here == 0 {
+                break;
+            }
+        }
+        Ok(unlink)
+    }
+
     pub fn prune_to(&mut self, cap: i64) -> Result<i64, String> {
         if cap <= 0 {
             return Ok(0);
@@ -539,9 +613,20 @@ impl Store {
         if !still() {
             return Ok(false);
         }
+        // Enforce the byte cap oldest-first INSIDE this transaction, so a
+        // capture never reports success while storage is over the limit. A
+        // prune failure propagates and rolls back the whole insert.
+        let to_unlink = Self::prune_within_tx(&tx, byte_cap)?;
+        if !still() {
+            return Ok(false);
+        }
         tx.commit().map_err(|e| e.to_string())?;
-        if still() {
-            let _ = self.prune_to(byte_cap);
+        // Files are removed only after the DB rows are durably gone.
+        for (path, crop) in to_unlink {
+            let _ = std::fs::remove_file(self.root.join(&path));
+            if let Some(c) = crop {
+                let _ = std::fs::remove_file(self.root.join(c));
+            }
         }
         Ok(true)
     }

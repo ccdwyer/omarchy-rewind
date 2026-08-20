@@ -381,6 +381,20 @@ Item {
     send("reopen-plan", { ts: root.lastPlanTs })
   }
 
+  function requestWindowPlan(arg) {
+    // arg is JSON: { ts, target:{address,class,title} }. The helper builds the
+    // one-window plan (resolving the launch command from desktop files) and
+    // replies; the overlay shows it for confirmation before executePlan.
+    var req = root.parseJsonArg(arg, null) || {}
+    var ts = Number(req.ts) || 0
+    root.lastPlanTs = ts
+    root.planReady = false
+    root.currentPlan = {}
+    root.publish()
+    send("reopen-window", { ts: ts, target: req.target || {} })
+    return "ok"
+  }
+
   function executePlan(arg) {
     var plan = root.currentPlan || {}
     if (arg !== undefined && arg !== null && arg !== "") {
@@ -570,6 +584,7 @@ Item {
     function executePlan(arg: string): string { return root.executePlan(arg) }
     function wipe(arg: string): string { return root.wipe(arg) }
     function reopenPlan(arg: string): string { root.requestPlan(Number(arg) || 0); return "ok" }
+    function reopenWindow(arg: string): string { return root.requestWindowPlan(arg) }
     function moment(arg: string): string { root.requestMoment(Number(arg) || 0); return "ok" }
     function timeline(arg: string): string { root.refreshTimeline(); return "ok" }
     function clips(arg: string): string { root.refreshClips(); return "ok" }

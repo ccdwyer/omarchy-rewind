@@ -67,3 +67,32 @@ Conservative choices where the Omarchy / Quickshell / Hyprland API was not 100% 
 - **POSIX fallback does not record** (privacy). Query/wipe of existing data still work.
 - **image-crate WebP is compiled in** (`webp` feature). PNG is only the last fallback, at a smaller scale than the 720p WebP path.
 - **At-rest encryption** remains a documented roadmap item (tribunal applied-changes).
+
+## Round 9 (fable) fixes
+
+- **Per-window Reopen** is built entirely in the helper (`plan::build_one`,
+  reached via the `reopen-window` IPC command) from the desktop-file map plus
+  live `hyprctl clients`. Stored window rows carry no `exec`/`cmd`, so the
+  overlay never fabricates a launch command; it requests the plan async and
+  shows it for confirmation before `reopen-exec`. `Plan.oneWindowPlan` was
+  removed from `js/Plan.js`.
+- **Arm generation guard.** `ArmState` now carries a monotonic `gen` bumped
+  under the exclusive gate lock on every arm/disarm. A capture/OCR job takes a
+  ticket (the generation) at start; `write_allowed`/`still_armed` require the
+  ticket to still match, so a job begun before a disarm cannot commit after a
+  rapid disarm→re-arm. Regression: `stale_ticket_after_disarm_rearm_cannot_commit`.
+- **Atomic byte-cap.** Oldest-first pruning runs inside the capture insert
+  transaction (`prune_within_tx`); file unlinks happen only after commit. A
+  prune error rolls back the whole capture, so a capture never reports success
+  while storage is over the cap.
+- **Shell fallback consent** is now written via temp file + fsync + atomic
+  rename + parent-dir fsync (mirrors the Rust `Settings::save`); a failed save
+  rolls back the in-memory consent and reports an error rather than claiming a
+  durable write.
+- **No-network audit** runs the daemon with `REWIND_TEST_CAPTURE=1`, a
+  deterministic synthetic capture backend that also treats the session as
+  active. The audit now fails unless a `frame-written` event (or a positive
+  frame count) is observed, so the proof cannot pass without a real capture.
+  This env var is used only by tests and `scripts/network-audit.sh`.
+- Rust unit tests run in Linux CI; the JS harness skips them cleanly when
+  `cargo` is absent (the macOS authoring host).

@@ -1,7 +1,7 @@
 use crate::perms;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 
@@ -103,6 +103,13 @@ impl Settings {
         if let Err(e) = std::fs::rename(&tmp, path) {
             let _ = std::fs::remove_file(&tmp);
             return Err(e.to_string());
+        }
+        // fsync the parent directory so the rename itself is durable across a
+        // crash, not just the file contents.
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = File::open(parent) {
+                let _ = dir.sync_all();
+            }
         }
         perms::secure_file(path).map_err(|e| e.to_string())?;
         Ok(())
