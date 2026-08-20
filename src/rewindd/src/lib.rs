@@ -14,6 +14,7 @@ pub mod ipc;
 pub mod ocr;
 pub mod pause;
 pub mod perms;
+pub mod pixel;
 pub mod plan;
 pub mod query;
 pub mod store;
@@ -49,6 +50,9 @@ pub fn self_test() -> Result<(), String> {
     plan::self_test()?;
     query::self_test()?;
     encode::self_test()?;
+    if crate::pixel::startup_recording(0, true, true) {
+        return Err("startup armed without consent".into());
+    }
     let dir = tempfile_dir()?;
     let mut store = Store::open(&dir.join("rewind.db")).map_err(|e| e.to_string())?;
     store.self_test().map_err(|e| e.to_string())?;
@@ -80,7 +84,11 @@ pub fn run_daemon(data_dir: PathBuf) -> io::Result<()> {
     let paths = DataPaths::prepare(&data_dir).map_err(io::Error::other)?;
     let store = Store::open(&paths.db).map_err(io::Error::other)?;
     let settings = Settings::load(&paths.state).unwrap_or_default();
-    let armed = settings.armed && settings.consent_at > 0;
+    let armed = crate::pixel::startup_recording(
+        settings.consent_at,
+        settings.arm_on_login,
+        settings.armed,
+    );
     let shared = Arc::new(Shared {
         settings: Mutex::new(settings),
         store: Mutex::new(store),
@@ -148,7 +156,13 @@ fn handle_command(shared: &Arc<Shared>, cmd: Command) {
             apply_settings(shared, settings);
             let mut st = shared.settings.lock().unwrap();
             if st.consent_at == 0 {
-                st.consent_at = now_ms();
+                drop(st);
+                emit(&Event::error(
+                    Some(id),
+                    "consent required: arm rejected until the consent screen is recorded".into(),
+                ));
+                emit_state(shared, id);
+                return;
             }
             st.armed = true;
             let _ = st.save(&shared.paths.state);

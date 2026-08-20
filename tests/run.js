@@ -45,6 +45,7 @@ const Pause = loadEngine("Pause.js")
 const Format = loadEngine("Format.js")
 const Plan = loadEngine("Plan.js")
 const Query = loadEngine("Query.js")
+const Channel = loadEngine("Channel.js")
 
 let passed = 0
 let failed = 0
@@ -214,6 +215,46 @@ test("compat helper exists and is executable after chmod", () => {
   const r = spawnSync(p, ["self-test"], { encoding: "utf8" })
   assert.strictEqual(r.status, 0, r.stderr)
   assert.ok(String(r.stdout).indexOf("self-test ok") >= 0)
+})
+
+test("Channel.parse reads snapshot JSON", () => {
+  const u = Channel.parse('{"armed":true,"hits":[]}', {})
+  assert.strictEqual(u.armed, true)
+  assert.strictEqual(Channel.arrayOf(u.hits).length, 0)
+})
+
+test("overlay and bar widget do not call serviceFor", () => {
+  const overlay = fs.readFileSync(path.join(ROOT, "Overlay.qml"), "utf8")
+  const bar = fs.readFileSync(path.join(ROOT, "BarWidget.qml"), "utf8")
+  assert.ok(overlay.indexOf("serviceFor") < 0)
+  assert.ok(overlay.indexOf("firstPartyServiceFor") < 0)
+  assert.ok(bar.indexOf("serviceFor") < 0)
+  assert.ok(bar.indexOf("firstPartyServiceFor") < 0)
+  assert.ok(overlay.indexOf("omarchy-shell") >= 0)
+  assert.ok(bar.indexOf("omarchy-shell") >= 0)
+})
+
+test("linux helper workflow exists", () => {
+  const yml = fs.readFileSync(path.join(ROOT, ".github/workflows/linux-helper.yml"), "utf8")
+  assert.ok(yml.indexOf("ubuntu-latest") >= 0)
+  assert.ok(yml.indexOf("--features wayland") >= 0)
+  assert.ok(yml.indexOf("network-audit") >= 0)
+  assert.ok(yml.indexOf("upload-artifact") >= 0)
+})
+
+test("network-audit fails when binary is missing", () => {
+  const script = path.join(ROOT, "scripts", "network-audit.sh")
+  fs.chmodSync(script, 0o755)
+  const r = spawnSync(script, [], {
+    encoding: "utf8",
+    env: Object.assign({}, process.env, { PATH: process.env.PATH }),
+    cwd: ROOT
+  })
+  if (fs.existsSync(path.join(ROOT, "bin", "rewindd"))) {
+    return
+  }
+  assert.notStrictEqual(r.status, 0, r.stdout + r.stderr)
+  assert.ok(String(r.stderr + r.stdout).indexOf("missing") >= 0)
 })
 
 test("IpcHandler exposes JSON-arg methods", () => {

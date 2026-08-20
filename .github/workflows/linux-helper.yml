@@ -1,0 +1,60 @@
+name: linux-helper
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Wayland and audit tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libwayland-dev wayland-protocols \
+            strace file
+
+      - name: Rust tests (Wayland feature)
+        run: cargo test --manifest-path src/rewindd/Cargo.toml --features wayland
+
+      - name: JS / compat tests
+        run: node tests/run.js
+
+      - name: Build helper
+        run: ./build.sh
+
+      - name: Require Linux rewindd binary
+        run: |
+          test -x bin/rewindd
+          file bin/rewindd
+          if ! file bin/rewindd | grep -qi 'elf'; then
+            echo "FAIL: bin/rewindd is not an ELF helper" >&2
+            exit 1
+          fi
+          # POSIX fallback script is not acceptable as the CI artifact.
+          if head -1 bin/rewindd | grep -q '^#!'; then
+            echo "FAIL: bin/rewindd is a script; Wayland helper did not build" >&2
+            exit 1
+          fi
+
+      - name: ldd
+        run: ldd bin/rewindd
+
+      - name: No-network audit (strace)
+        run: ./scripts/network-audit.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rewindd-linux
+          path: |
+            bin/rewindd
+            bin/rewind

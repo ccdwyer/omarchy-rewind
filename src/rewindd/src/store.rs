@@ -181,36 +181,72 @@ impl Store {
                 )
                 .optional()
                 .map_err(|e| e.to_string())?;
-            let Some((ts, path, crop)) = row else {
+            let Some((ts, _path, _crop)) = row else {
                 break;
             };
-            self.delete_ts(ts, &path, crop.as_deref())?;
+            let next: Option<i64> = self
+                .conn
+                .query_row(
+                    "SELECT MIN(ts) FROM frames WHERE ts > ?1",
+                    params![ts],
+                    |r| r.get::<_, Option<i64>>(0),
+                )
+                .ok()
+                .flatten();
+            let hi = next.map(|n| n.saturating_sub(1)).unwrap_or(i64::MAX);
+            self.delete_range(0, hi)?;
             removed += 1;
         }
         Ok(removed)
     }
 
-    fn delete_ts(&self, ts: i64, path: &str, crop: Option<&str>) -> Result<(), String> {
-        let _ = std::fs::remove_file(self.root.join(path));
-        if let Some(c) = crop {
-            let _ = std::fs::remove_file(self.root.join(c));
-        }
-        self.conn
-            .execute("DELETE FROM frames WHERE ts=?1", params![ts])
-            .map_err(|e| e.to_string())?;
-        self.conn
-            .execute("DELETE FROM clips WHERE ts=?1", params![ts])
-            .ok();
-        self.conn
-            .execute("DELETE FROM layouts WHERE ts=?1", params![ts])
-            .ok();
-        self.conn
-            .execute("DELETE FROM ocr_boxes WHERE ts=?1", params![ts])
-            .ok();
-        let _ = self
+    fn delete_range(&mut self, lo: i64, hi: i64) -> Result<i64, String> {
+        let mut stmt = self
             .conn
-            .execute("DELETE FROM ocr WHERE ts=?1", params![ts]);
-        Ok(())
+            .prepare("SELECT ts, path, crop_path FROM frames WHERE ts>=?1 AND ts<=?2")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![lo, hi], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        let frames: Vec<_> = rows.filter_map(|r| r.ok()).collect();
+        drop(stmt);
+        let n = frames.len() as i64;
+        let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM frames WHERE ts>=?1 AND ts<=?2", params![lo, hi])
+            .map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM clips WHERE ts>=?1 AND ts<=?2", params![lo, hi])
+            .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM layouts WHERE ts>=?1 AND ts<=?2",
+            params![lo, hi],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM events WHERE ts>=?1 AND ts<=?2", params![lo, hi])
+            .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM ocr_boxes WHERE ts>=?1 AND ts<=?2",
+            params![lo, hi],
+        )
+        .map_err(|e| e.to_string())?;
+        let _ = tx.execute("DELETE FROM ocr WHERE ts>=?1 AND ts<=?2", params![lo, hi]);
+        let _ = tx.execute(
+            "DELETE FROM search_fallback WHERE ts>=?1 AND ts<=?2",
+            params![lo, hi],
+        );
+        tx.commit().map_err(|e| e.to_string())?;
+        for (_ts, path, crop) in frames {
+            let _ = std::fs::remove_file(self.root.join(&path));
+            if let Some(c) = crop {
+                let _ = std::fs::remove_file(self.root.join(c));
+            }
+        }
+        Ok(n)
     }
 
     pub fn insert_clip(&self, ts: i64, mime: &str, content: &str) -> Result<(), String> {
@@ -714,39 +750,12 @@ impl Store {
         let now = now_ms();
         let (lo, hi) = match scope {
             "all" => (0, i64::MAX),
-            "today" => {
-                let day = 86_400_000;
-                let start = now - (now % day);
-                (start, now)
-            }
+            "today" => crate::pixel::local_day_bounds(now),
             "range" => (from, if to == 0 { now } else { to }),
             other => return Err(format!("unknown wipe scope: {other}")),
         };
-        let mut stmt = self
-            .conn
-            .prepare("SELECT ts,path,crop_path FROM frames WHERE ts>=?1 AND ts<=?2")
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map(params![lo, hi], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, Option<String>>(2)?,
-                ))
-            })
-            .map_err(|e| e.to_string())?;
-        let collected: Vec<_> = rows.filter_map(|r| r.ok()).collect();
-        let n = collected.len();
-        for (ts, path, crop) in collected {
-            let _ = self.delete_ts(ts, &path, crop.as_deref());
-        }
-        if scope == "all" {
-            self.conn
-                .execute_batch("DELETE FROM clips; DELETE FROM layouts; DELETE FROM events; DELETE FROM ocr_boxes;")
-                .map_err(|e| e.to_string())?;
-            let _ = self.conn.execute_batch("DELETE FROM ocr;");
-        }
-        Ok(json!({"wiped": n, "scope": scope}))
+        let n = self.delete_range(lo, hi)?;
+        Ok(json!({"wiped": n, "scope": scope, "from": lo, "to": hi}))
     }
 
     pub fn stats(&self) -> Result<StatsSnap, String> {
@@ -763,8 +772,7 @@ impl Store {
             .query_row("SELECT COALESCE(MIN(ts),0) FROM frames", [], |r| r.get(0))
             .unwrap_or(0);
         let now = now_ms();
-        let day = 86_400_000;
-        let start = now - (now % day);
+        let start = crate::pixel::local_day_start_ms(now);
         let frames_today: i64 = self
             .conn
             .query_row(
@@ -978,6 +986,42 @@ mod tests {
                 .contains("100"),
             "path should be the nearest frame: {}",
             arr[0]["path"]
+        );
+    }
+
+    #[test]
+    fn wipe_range_deletes_clips_layouts_by_range() {
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("rewind.db")).unwrap();
+        store.insert_frame(&sample(100, 10, "a")).unwrap();
+        store.insert_clip(150, "text/plain", "secret-clip").unwrap();
+        store
+            .insert_layout(150, &[])
+            .unwrap();
+        store.wipe("range", 100, 200).unwrap();
+        let clips = store.clips(10).unwrap();
+        assert_eq!(clips["clips"].as_array().unwrap().len(), 0);
+        assert_eq!(store.stats().unwrap().frames, 0);
+    }
+
+    #[test]
+    fn prune_removes_clips_in_oldest_window() {
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("rewind.db")).unwrap();
+        for ts in [100, 200, 300, 400, 500] {
+            let f = sample(ts, 100, "t");
+            let p = dir.path().join(&f.path);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, vec![0u8; 100]).unwrap();
+            store.insert_frame(&f).unwrap();
+        }
+        store.insert_clip(150, "text/plain", "old-secret").unwrap();
+        store.prune_to(250).unwrap();
+        let clips = store.clips(10).unwrap();
+        let arr = clips["clips"].as_array().unwrap();
+        assert!(
+            arr.iter().all(|c| c["content"] != "old-secret"),
+            "{clips}"
         );
     }
 

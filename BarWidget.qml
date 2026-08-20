@@ -1,8 +1,10 @@
 import QtQuick
 import Quickshell
+import Quickshell.Io
 import qs.Ui
 import "js/Format.js" as Format
 import "js/Pause.js" as Pause
+import "js/Channel.js" as Channel
 
 BarWidget {
   id: root
@@ -16,67 +18,63 @@ BarWidget {
   property bool armOnLogin: false
 
   property bool holdFired: false
-
-  readonly property var rewindService: {
-    if (bar && bar.shell && typeof bar.shell.serviceFor === "function") {
-      var a = bar.shell.serviceFor(root.moduleName)
-      if (a)
-        return a
-    }
-    if (bar && bar.shell && typeof bar.shell.firstPartyServiceFor === "function") {
-      var b = bar.shell.firstPartyServiceFor(root.moduleName)
-      if (b)
-        return b
-    }
-    return null
-  }
-
-  readonly property bool armed: rewindService ? rewindService.armed === true : false
-  readonly property bool paused: rewindService ? rewindService.paused === true : false
-  readonly property string pauseReason: rewindService ? String(rewindService.pauseReason || "") : "disarmed"
-  readonly property int framesToday: rewindService ? Number(rewindService.framesToday || 0) : 0
-  readonly property double bytesUsed: rewindService ? Number(rewindService.bytesUsed || 0) : 0
+  property bool armed: false
+  property bool paused: false
+  property string pauseReason: "disarmed"
+  property int framesToday: 0
+  property double bytesUsed: 0
   readonly property bool opened: false
+
+  RewindAdapter { id: adapter }
 
   function open() { root.summonOverlay("{}") }
   function close() {}
   function toggle() { root.toggleArm() }
 
+  function callShell(method, arg) {
+    var cmd = ["omarchy-shell", "shell", "call", root.moduleName, method]
+    if (arg !== undefined && arg !== null && String(arg).length)
+      cmd.push(String(arg))
+    Quickshell.execDetached(cmd)
+  }
+
   function pushSettings() {
-    if (rewindService && typeof rewindService.applySettings === "function") {
-      rewindService.applySettings({
-        byteCapGb: root.byteCapGb,
-        cadenceMs: root.cadenceMs,
-        idlePauseSec: root.idlePauseSec,
-        excludeApps: root.excludeApps,
-        titlePausePatterns: root.titlePausePatterns,
-        armOnLogin: root.armOnLogin
-      })
-    }
+    root.callShell("configure", JSON.stringify({
+      byteCapGb: root.byteCapGb,
+      cadenceMs: root.cadenceMs,
+      idlePauseSec: root.idlePauseSec,
+      excludeApps: root.excludeApps,
+      titlePausePatterns: root.titlePausePatterns,
+      armOnLogin: root.armOnLogin
+    }))
   }
 
   function toggleArm() {
-    if (rewindService && typeof rewindService.toggleArm === "function") {
-      rewindService.toggleArm()
-      return
-    }
-    Quickshell.execDetached(["omarchy-shell", "shell", "call", root.moduleName, "toggleArm"])
+    root.callShell("toggleArm", "")
   }
 
   function summonOverlay(payload) {
-    if (rewindService && typeof rewindService.summonOverlay === "function") {
-      rewindService.summonOverlay(payload || "{}")
-      return
-    }
-    if (bar && bar.shell && typeof bar.shell.summon === "function") {
-      bar.shell.summon(root.moduleName, payload || "{}")
-      return
-    }
     Quickshell.execDetached(["omarchy-shell", "shell", "summon", root.moduleName, payload || "{}"])
   }
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
+
+  FileView {
+    id: uiView
+    path: adapter.dataDir() + "/ui.json"
+    watchChanges: true
+    printErrors: false
+    onLoaded: {
+      var u = Channel.parse(text(), {})
+      root.armed = u.armed === true
+      root.paused = u.paused === true
+      root.pauseReason = u.reason || (root.armed ? "" : "disarmed")
+      root.framesToday = Number(u.framesToday || 0)
+      root.bytesUsed = Number(u.bytes || 0)
+    }
+    onFileChanged: reload()
+  }
 
   WidgetButton {
     id: button
@@ -106,36 +104,21 @@ BarWidget {
       anchors.fill: parent
       acceptedButtons: Qt.LeftButton | Qt.RightButton
       hoverEnabled: true
+      pressAndHoldInterval: 450
       onPressed: function(mouse) {
-        if (mouse.button === Qt.LeftButton) {
+        if (mouse.button === Qt.LeftButton)
           root.holdFired = false
-          holdTimer.restart()
-        } else if (mouse.button === Qt.RightButton) {
+        else if (mouse.button === Qt.RightButton)
           root.summonOverlay("{}")
-        }
       }
       onReleased: function(mouse) {
-        if (mouse.button === Qt.LeftButton) {
-          holdTimer.stop()
-          if (!root.holdFired)
-            root.toggleArm()
-        }
+        if (mouse.button === Qt.LeftButton && !root.holdFired)
+          root.toggleArm()
       }
       onPressAndHold: {
         root.holdFired = true
-        holdTimer.stop()
         root.summonOverlay("{\"view\":\"clips\"}")
       }
-    }
-  }
-
-  Timer {
-    id: holdTimer
-    interval: 450
-    repeat: false
-    onTriggered: {
-      root.holdFired = true
-      root.summonOverlay("{\"view\":\"clips\"}")
     }
   }
 

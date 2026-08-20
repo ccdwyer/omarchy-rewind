@@ -20,6 +20,8 @@ Then build the helper on the machine:
 
 `build.sh` compiles `rewindd` (Rust). If `cargo` or Wayland headers are missing it installs `compat/rewindd.sh` as `bin/rewindd`. That fallback **does not record** (it cannot honor the pause matrix); it still answers query/wipe/stats against existing data and the overlay stays usable. Recording requires the Rust binary.
 
+Linux CI (`.github/workflows/linux-helper.yml`) builds the Wayland helper, runs tests, `ldd`, and `strace -e trace=network`, and uploads `rewindd-linux`. This macOS authoring host cannot produce that ELF; `scripts/network-audit.sh` exits 1 when `bin/rewindd` is missing rather than pretending the audit passed.
+
 Put the chip on the bar if `--enable` did not:
 
 ```sh

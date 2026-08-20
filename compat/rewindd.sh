@@ -322,8 +322,10 @@ now=int(sys.argv[7] or 0)
 if scope=="all":
     lo, hi = 0, 2**62
 elif scope=="today":
-    day=86400000
-    lo, hi = now - (now % day), now
+    import time
+    t=time.localtime(now/1000.0 if now>10**12 else now)
+    start=int(time.mktime((t.tm_year,t.tm_mon,t.tm_mday,0,0,0,t.tm_wday,t.tm_yday,t.tm_isdst))*1000)
+    lo, hi = start, now
 elif scope=="range":
     if hi==0: hi=now
 else:

@@ -8,6 +8,7 @@ import "js/Format.js" as Format
 import "js/Pause.js" as Pause
 import "js/Plan.js" as Plan
 import "js/Query.js" as Query
+import "js/Channel.js" as Channel
 
 Item {
   id: root
@@ -35,6 +36,17 @@ Item {
   property bool firstRun: false
   property int seenHitsRevision: -1
   property bool awaitingSearch: false
+  property int planRequestTs: 0
+  property bool planReady: false
+  property bool uiConsent: false
+  property bool uiArmed: false
+  property string uiPauseReason: "disarmed"
+  property bool uiOcr: false
+  property double uiByteCap: 2147483648
+  property var uiDaysEstimate: null
+
+  RewindAdapter { id: adapter }
+  readonly property string dataDir: adapter.dataDir()
 
   property color background: Color.menu.background
   property color foreground: Color.menu.text
@@ -51,38 +63,43 @@ Item {
   }
   readonly property int motionMs: reduceMotion ? 0 : 140
 
-  function svc() {
-    if (pluginRegistry && typeof pluginRegistry.serviceFor === "function") {
-      var a = pluginRegistry.serviceFor(root.pluginId)
-      if (a) return a
-    }
-    if (shell && typeof shell.serviceFor === "function") {
-      var b = shell.serviceFor(root.pluginId)
-      if (b) return b
-    }
-    if (shell && typeof shell.firstPartyServiceFor === "function") {
-      var c = shell.firstPartyServiceFor(root.pluginId)
-      if (c) return c
-    }
-    return null
-  }
-
   function callSvc(name, arg) {
     var payload = arg
     if (arg !== undefined && arg !== null && typeof arg === "object")
       payload = JSON.stringify(arg)
-    var s = root.svc()
-    if (s && typeof s[name] === "function") {
-      if (payload === undefined)
-        return s[name]()
-      return s[name](payload)
-    }
     var cmd = ["omarchy-shell", "shell", "call", root.pluginId, name]
     if (payload !== undefined && payload !== null && String(payload).length)
       cmd.push(String(payload))
     ipcProc.command = cmd
     ipcProc.running = true
     return "queued"
+  }
+
+  function onCallReply(text) {
+    var raw = String(text || "").trim()
+    if (raw && raw.charAt(0) === "{") {
+      try {
+        var ev = JSON.parse(raw)
+        if (ev.hits !== undefined) {
+          root.hits = ev.hits
+          root.applySearchHits()
+        }
+        if (ev.steps || ev.unrecoverable) {
+          if (!root.planRequestTs || Number(ev.ts || root.planRequestTs) === Number(root.planRequestTs)) {
+            root.plan = ev.plan || ev
+            root.planReady = true
+          }
+        }
+        if (ev.frame || ev.windows)
+          root.moment = ev.moment || ev
+      } catch (e) {}
+    }
+    uiView.reload()
+    timelineView.reload()
+    clipsView.reload()
+    momentView.reload()
+    hitsView.reload()
+    planView.reload()
   }
 
   function focusForView() {
@@ -103,22 +120,20 @@ Item {
     try {
       payload = payloadJson && String(payloadJson).length ? JSON.parse(payloadJson) : {}
     } catch (e) { payload = {} }
-    var s = root.svc()
-    root.firstRun = !(s && s.consent)
+    root.firstRun = !root.uiConsent
     if (payload.view === "consent" || root.firstRun)
       root.view = "consent"
     else if (payload.view === "clips")
       root.view = "clips"
-    if (s && typeof s.setOverlayOpen === "function")
-      s.setOverlayOpen(true)
+    root.callSvc("setOverlayOpen", "true")
+    root.callSvc("timeline", "")
+    root.callSvc("clips", "")
     root.pull()
     Qt.callLater(root.focusForView)
   }
 
   function close() {
-    var s = root.svc()
-    if (s && typeof s.setOverlayOpen === "function")
-      s.setOverlayOpen(false)
+    root.callSvc("setOverlayOpen", "false")
     root.opened = false
     root.showPlan = false
   }
@@ -131,29 +146,66 @@ Item {
   }
 
   function pull() {
-    var s = root.svc()
-    if (!s)
-      return
-    if (typeof s.refreshTimeline === "function")
-      s.refreshTimeline()
-    if (typeof s.refreshClips === "function")
-      s.refreshClips()
-    root.frames = s.timeline || []
-    root.gaps = s.gaps || []
-    root.clips = s.clips || []
-    root.hits = s.hits || []
-    root.moment = s.currentMoment || {}
-    root.plan = s.currentPlan || {}
-    if (root.awaitingSearch && s.hitsRevision !== undefined
-        && Number(s.hitsRevision) !== root.seenHitsRevision) {
-      root.seenHitsRevision = Number(s.hitsRevision)
-      root.awaitingSearch = false
-      root.applySearchHits()
-    }
+    root.applyUi(uiView.text ? uiView.text() : "")
+    root.applyTimeline(timelineView.text ? timelineView.text() : "")
+    root.applyClips(clipsView.text ? clipsView.text() : "")
+    root.applyMoment(momentView.text ? momentView.text() : "")
+    root.applyHits(hitsView.text ? hitsView.text() : "")
+    root.applyPlanFile(planView.text ? planView.text() : "")
     if (root.frames.length) {
       if (root.selectedIndex >= root.frames.length)
         root.selectedIndex = root.frames.length - 1
-      root.ensureMoment()
+    }
+  }
+
+  function applyUi(raw) {
+    var u = Channel.parse(raw, {})
+    root.uiArmed = u.armed === true
+    root.uiConsent = u.consent === true
+    root.uiPauseReason = u.reason || (root.uiArmed ? "" : "disarmed")
+    root.uiOcr = u.ocrAvailable === true
+    if (u.byteCap !== undefined)
+      root.uiByteCap = Number(u.byteCap) || root.uiByteCap
+    root.uiDaysEstimate = u.daysEstimate
+    root.firstRun = !root.uiConsent
+  }
+
+  function applyTimeline(raw) {
+    var t = Channel.parse(raw, {})
+    root.frames = Channel.arrayOf(t.frames)
+    root.gaps = Channel.arrayOf(t.gaps)
+  }
+
+  function applyClips(raw) {
+    var c = Channel.parse(raw, {})
+    root.clips = Channel.arrayOf(c.clips)
+  }
+
+  function applyMoment(raw) {
+    var m = Channel.parse(raw, {})
+    root.moment = m.moment || m
+  }
+
+  function applyHits(raw) {
+    var h = Channel.parse(raw, {})
+    var rev = h.revision !== undefined ? Number(h.revision) : -1
+    root.hits = Channel.arrayOf(h.hits)
+    if (root.awaitingSearch && rev !== root.seenHitsRevision && rev >= 0) {
+      root.seenHitsRevision = rev
+      root.awaitingSearch = false
+      root.applySearchHits()
+    }
+  }
+
+  function applyPlanFile(raw) {
+    var p = Channel.parse(raw, {})
+    if (!root.showPlan)
+      return
+    if (p.ts !== undefined && Number(p.ts) !== Number(root.planRequestTs))
+      return
+    if (p.ready === true) {
+      root.plan = p.plan || {}
+      root.planReady = true
     }
   }
 
@@ -167,9 +219,7 @@ Item {
     var f = root.currentFrame()
     if (!f)
       return
-    var s = root.svc()
-    if (s && typeof s.requestMoment === "function")
-      s.requestMoment(f.ts)
+    root.callSvc("moment", String(f.ts))
   }
 
   function stepFrame(delta) {
@@ -201,8 +251,8 @@ Item {
   }
 
   function runSearch() {
-    var s = root.svc()
-    root.seenHitsRevision = s ? Number(s.hitsRevision || 0) : root.seenHitsRevision
+    var cur = Channel.parse(hitsView.text ? hitsView.text() : "", {})
+    root.seenHitsRevision = cur.revision !== undefined ? Number(cur.revision) : -1
     root.awaitingSearch = true
     root.callSvc("query", root.searchText)
   }
@@ -224,9 +274,7 @@ Item {
     if (found >= 0)
       root.selectedIndex = found
     root.highlightBoxes = (hits[0].boxes || []).slice()
-    var s = root.svc()
-    if (s && typeof s.requestMoment === "function")
-      s.requestMoment(ts)
+    root.callSvc("moment", String(ts))
   }
 
   function copyCurrentClip() {
@@ -251,11 +299,11 @@ Item {
     var f = root.currentFrame()
     if (!f)
       return
-    var s = root.svc()
-    if (s && typeof s.requestPlan === "function")
-      s.requestPlan(f.ts)
-    root.plan = s && s.currentPlan ? s.currentPlan : root.plan
+    root.plan = {}
+    root.planReady = false
+    root.planRequestTs = Number(f.ts)
     root.showPlan = true
+    root.callSvc("reopenPlan", String(f.ts))
   }
 
   function execPlan() {
@@ -277,7 +325,63 @@ Item {
     return false
   }
 
-  Process { id: ipcProc; running: false }
+  Process {
+    id: ipcProc
+    running: false
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.onCallReply(text)
+    }
+  }
+
+  FileView {
+    id: uiView
+    path: root.dataDir + "/ui.json"
+    watchChanges: true
+    printErrors: false
+    onLoaded: root.applyUi(text())
+    onFileChanged: reload()
+  }
+  FileView {
+    id: timelineView
+    path: root.dataDir + "/timeline.json"
+    watchChanges: true
+    printErrors: false
+    onLoaded: root.applyTimeline(text())
+    onFileChanged: reload()
+  }
+  FileView {
+    id: clipsView
+    path: root.dataDir + "/clips.json"
+    watchChanges: true
+    printErrors: false
+    onLoaded: root.applyClips(text())
+    onFileChanged: reload()
+  }
+  FileView {
+    id: momentView
+    path: root.dataDir + "/moment.json"
+    watchChanges: true
+    printErrors: false
+    onLoaded: root.applyMoment(text())
+    onFileChanged: reload()
+  }
+  FileView {
+    id: hitsView
+    path: root.dataDir + "/hits.json"
+    watchChanges: true
+    printErrors: false
+    onLoaded: root.applyHits(text())
+    onFileChanged: reload()
+  }
+  FileView {
+    id: planView
+    path: root.dataDir + "/plan.json"
+    watchChanges: true
+    printErrors: false
+    onLoaded: root.applyPlanFile(text())
+    onFileChanged: reload()
+  }
 
   Timer {
     interval: root.opened ? 220 : 800
@@ -401,10 +505,9 @@ Item {
           font.family: root.fontFamily
           font.pixelSize: Style.font.body
           text: {
-            var s = root.svc()
-            var cap = s && s.byteCap ? s.byteCap : 2147483648
+            var cap = root.uiByteCap || 2147483648
             return "Measured on real UI: 25–80 KB per 720p frame. Default cap "
-                   + Format.humanBytes(cap) + " · " + Format.daysLabel(s ? s.daysEstimate : null, cap)
+                   + Format.humanBytes(cap) + " · " + Format.daysLabel(root.uiDaysEstimate, cap)
                    + ". Oldest frames go first. Search works on titles and clipboard even if tesseract is not installed."
           }
         }
@@ -521,12 +624,7 @@ Item {
           anchors.verticalCenter: parent.verticalCenter
         }
         Text {
-          text: {
-            var s = root.svc()
-            var armed = s ? s.armed : false
-            var reason = s ? s.pauseReason : "disarmed"
-            return armed ? Pause.reasonLabel(reason) : "disarmed"
-          }
+          text: root.uiArmed ? Pause.reasonLabel(root.uiPauseReason) : "disarmed"
           color: root.foreground
           opacity: 0.7
           font.family: root.fontFamily
@@ -574,7 +672,7 @@ Item {
           }
         }
         Text {
-          text: root.svc() && root.svc().ocrAvailable ? "" : "OCR off — titles & clipboard still search"
+          text: root.uiOcr ? "" : "OCR off — titles & clipboard still search"
           color: root.foreground
           opacity: 0.55
           font.family: root.fontFamily
@@ -950,7 +1048,9 @@ Item {
           Text {
             width: parent.width
             wrapMode: Text.WordWrap
-            text: (root.plan && root.plan.note) ? root.plan.note : "Review the plan. This launches missing apps and places windows. It is not session restore."
+            text: !root.planReady
+                  ? "Loading plan for this moment…"
+                  : ((root.plan && root.plan.note) ? root.plan.note : "Review the plan. This launches missing apps and places windows. It is not session restore.")
             color: root.foreground
             opacity: 0.75
             font.family: root.fontFamily
@@ -1000,9 +1100,10 @@ Item {
               width: goLbl.implicitWidth + Style.space(20)
               height: Style.space(32)
               radius: 4
+              opacity: root.planReady ? 1 : 0.38
               color: Style.selectedFillFor(root.foreground, root.accent)
-              Text { id: goLbl; anchors.centerIn: parent; text: "Confirm"; color: root.foreground; font.bold: true; font.family: root.fontFamily }
-              MouseArea { anchors.fill: parent; onClicked: root.execPlan() }
+              Text { id: goLbl; anchors.centerIn: parent; text: root.planReady ? "Confirm" : "Loading plan…"; color: root.foreground; font.bold: true; font.family: root.fontFamily }
+              MouseArea { anchors.fill: parent; enabled: root.planReady; onClicked: root.execPlan() }
             }
             Rectangle {
               width: noLbl.implicitWidth + Style.space(20)

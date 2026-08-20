@@ -5,11 +5,11 @@ Conservative choices where the Omarchy / Quickshell / Hyprland API was not 100% 
 ## Plugin host (reference wins)
 
 - **Entry points are `Item`s**, not `ShellRoot`. Overlay exposes `open(payloadJson)` / `close()` / `toggle()` for `omarchy-shell shell summon|hide|toggle`.
-- **Injected properties:** `omarchyPath`, `shell`, `manifest`, `pluginRegistry` (and `bar` on the widget). Lookups try `pluginRegistry.serviceFor` → `shell.serviceFor` → `shell.firstPartyServiceFor`, then `omarchy-shell shell call|summon`.
+- **Injected properties used:** `omarchyPath`, `shell`, `manifest`, `pluginRegistry`, `bar` (host load). **Not used:** `serviceFor` / `firstPartyServiceFor`. Overlay and bar widget talk to the service only through documented `omarchy-shell shell summon|hide|toggle|call <id> …` plus FileView snapshots the service writes under `$XDG_DATA_HOME/rewind/` (`ui.json`, `timeline.json`, `clips.json`, `moment.json`, `hits.json`, `plan.json`).
 - **`keepLoaded: true`** so the overlay’s layer-shell window survives between summons (image-picker pattern). The spec’s kinds/entryPoints are otherwise unchanged.
-- **Settings are inline on the `shell.json` entry.** Widget keys (`byteCapGb`, `cadenceMs`, `idlePauseSec`, `excludeApps`, `titlePausePatterns`, `armOnLogin`) live in `manifest.barWidget.defaults` + `schema`. The bar widget pushes them to the service; the service sends them to rewindd. There is no plugin-owned settings file for those keys.
-- **Arm/consent persistence** is runtime state, not a widget setting. rewindd writes `~/.local/share/rewind/state.json` (0600). This is capture state, not a second settings channel.
-- **IPC verbs** are `omarchy-shell shell summon|hide|toggle|call <id> ...`. `IpcHandler` on the plugin id exposes every overlay/service operation as a **one-string** method (`consentNow`, `copyClip`, `executePlan`, `wipe`, `reopenPlan`, `query`, …). Compound arguments are JSON in that single `<arg>` (Quattro’s contract). Overlay `callSvc` JSON-stringifies objects so the `shell call` fallback matches the in-process path.
+- **Settings are inline on the `shell.json` entry.** Widget keys live in `manifest.barWidget.defaults` + `schema`. The bar widget pushes them with `shell call … configure '<json>'`.
+- **Arm/consent persistence** is runtime state in `~/.local/share/rewind/state.json` (0600). Startup recording is `consentAt > 0 && armOnLogin` only; a bare persisted `armed` bit does not resume capture. `arm` is rejected until consent is recorded.
+- **IPC replies:** `IpcHandler` methods return a string (consumed via Process `StdioCollector waitForEnd`). Query/timeline/moment/plan payloads are also published to the snapshot files so the overlay never depends on discarded `execDetached` stdout.
 - **Third-party id** is `io.github.chris.rewind`. Never `omarchy.*`.
 
 ## Quickshell

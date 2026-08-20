@@ -5,7 +5,9 @@
 #![allow(dead_code)]
 
 use crate::capture::RawFrame;
+use crate::pixel::{self, ShmFormat};
 use memmap2::MmapMut;
+use wayland_client::WEnum;
 use std::fs::File;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::io::AsRawFd;
@@ -32,7 +34,7 @@ struct State {
     width: i32,
     height: i32,
     stride: i32,
-    format: u32,
+    format: wl_shm::Format,
     buffer_event: bool,
     ready: bool,
     failed: bool,
@@ -48,7 +50,7 @@ impl Default for State {
             width: 0,
             height: 0,
             stride: 0,
-            format: 0,
+            format: wl_shm::Format::Argb8888,
             buffer_event: false,
             ready: false,
             failed: false,
@@ -68,6 +70,7 @@ pub struct Session {
     buf_w: i32,
     buf_h: i32,
     buf_stride: i32,
+    buf_format: wl_shm::Format,
 }
 
 impl Session {
@@ -101,6 +104,7 @@ impl Session {
             buf_w: 0,
             buf_h: 0,
             buf_stride: 0,
+            buf_format: wl_shm::Format::Argb8888,
         })
     }
 
@@ -152,6 +156,7 @@ impl Session {
             self.state.width as u32,
             self.state.height as u32,
             self.state.stride as u32,
+            map_shm_format(self.state.format),
         )?;
         Ok(RawFrame {
             rgba,
@@ -164,10 +169,12 @@ impl Session {
         let w = self.state.width;
         let h = self.state.height;
         let stride = self.state.stride;
+        let format = self.state.format;
         if self.buffer.is_some()
             && self.buf_w == w
             && self.buf_h == h
             && self.buf_stride == stride
+            && self.buf_format == format
         {
             return Ok(());
         }
@@ -183,21 +190,14 @@ impl Session {
             .clone()
             .ok_or_else(|| "wl_shm missing".to_string())?;
         let pool = shm.create_pool(fd.as_fd(), stride * h, &qh, ());
-        let buffer = pool.create_buffer(
-            0,
-            w,
-            h,
-            stride,
-            wl_shm::Format::Argb8888,
-            &qh,
-            (),
-        );
+        let buffer = pool.create_buffer(0, w, h, stride, format, &qh, ());
         self.pool = Some(pool);
         self.buffer = Some(buffer);
         self.shm_file = Some(file);
         self.buf_w = w;
         self.buf_h = h;
         self.buf_stride = stride;
+        self.buf_format = format;
         Ok(())
     }
 }
@@ -258,28 +258,26 @@ impl FromRaw for OwnedFd {
     }
 }
 
-fn read_shm(file: &File, width: u32, height: u32, stride: u32) -> Result<Vec<u8>, String> {
-    let mmap = unsafe { MmapMut::map_mut(file) }.map_err(|e| e.to_string())?;
-    let mut rgba = vec![0u8; (width * height * 4) as usize];
-    for y in 0..height {
-        let row = (y * stride) as usize;
-        for x in 0..width {
-            let i = row + (x as usize) * 4;
-            if i + 3 >= mmap.len() {
-                continue;
-            }
-            let b = mmap[i];
-            let g = mmap[i + 1];
-            let r = mmap[i + 2];
-            let a = mmap[i + 3];
-            let o = ((y * width + x) * 4) as usize;
-            rgba[o] = r;
-            rgba[o + 1] = g;
-            rgba[o + 2] = b;
-            rgba[o + 3] = a;
+fn map_shm_format(f: wl_shm::Format) -> ShmFormat {
+    match f {
+        wl_shm::Format::Argb8888 => ShmFormat::Argb8888,
+        wl_shm::Format::Xrgb8888 => ShmFormat::Xrgb8888,
+        other => {
+            let _ = other;
+            ShmFormat::Unknown(0)
         }
     }
-    Ok(rgba)
+}
+
+fn read_shm(
+    file: &File,
+    width: u32,
+    height: u32,
+    stride: u32,
+    fmt: ShmFormat,
+) -> Result<Vec<u8>, String> {
+    let mmap = unsafe { MmapMut::map_mut(file) }.map_err(|e| e.to_string())?;
+    Ok(pixel::decode_buffer(fmt, &mmap, width, height, stride))
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for State {
@@ -372,11 +370,15 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
     ) {
         match event {
             zwlr_screencopy_frame_v1::Event::Buffer {
-                format: _,
+                format,
                 width,
                 height,
                 stride,
             } => {
+                state.format = match format {
+                    WEnum::Value(v) => v,
+                    WEnum::Unknown(_) => wl_shm::Format::Xrgb8888,
+                };
                 state.width = width as i32;
                 state.height = height as i32;
                 state.stride = stride as i32;

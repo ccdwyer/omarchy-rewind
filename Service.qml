@@ -53,6 +53,9 @@ Item {
   property int clipsRevision: 0
   property int momentRevision: 0
   property int hitsRevision: 0
+  property int lastPlanTs: 0
+  property bool planReady: false
+  property string lastQuery: ""
 
   property double byteCapGb: 2
   property int cadenceMs: 3000
@@ -122,8 +125,7 @@ Item {
       root.lastStatus = "ready"
       send("configure", root.settingsPayload())
       send("stats", {})
-      if (root.consent && root.armOnLogin && !root.armed)
-        root.arm()
+      root.publish()
       return
     }
     if (ev.event === "reply") {
@@ -207,11 +209,41 @@ Item {
     }
     if (data.steps || data.unrecoverable) {
       root.currentPlan = data
+      root.planReady = true
     }
+    root.publish()
   }
 
   function bumpStats() {
     root.statsRevision += 1
+    root.publish()
+  }
+
+  function publish() {
+    uiSnap.setText(JSON.stringify(root.statsObject()) + "\n")
+    timelineSnap.setText(JSON.stringify({
+      frames: root.timeline,
+      gaps: root.gaps,
+      revision: root.timelineRevision
+    }) + "\n")
+    clipsSnap.setText(JSON.stringify({
+      clips: root.clips,
+      revision: root.clipsRevision
+    }) + "\n")
+    momentSnap.setText(JSON.stringify({
+      moment: root.currentMoment,
+      revision: root.momentRevision
+    }) + "\n")
+    hitsSnap.setText(JSON.stringify({
+      hits: root.hits,
+      revision: root.hitsRevision,
+      query: root.lastQuery
+    }) + "\n")
+    planSnap.setText(JSON.stringify({
+      ts: root.lastPlanTs,
+      ready: root.planReady,
+      plan: root.currentPlan
+    }) + "\n")
   }
 
   function statsObject() {
@@ -317,11 +349,16 @@ Item {
   }
 
   function requestQuery(q) {
-    send("query", { q: String(q || ""), limit: 60 })
+    root.lastQuery = String(q || "")
+    send("query", { q: root.lastQuery, limit: 60 })
   }
 
   function requestPlan(ts) {
-    send("reopen-plan", { ts: Number(ts) || 0 })
+    root.lastPlanTs = Number(ts) || 0
+    root.planReady = false
+    root.currentPlan = {}
+    root.publish()
+    send("reopen-plan", { ts: root.lastPlanTs })
   }
 
   function executePlan(arg) {
@@ -470,6 +507,13 @@ Item {
     watchChanges: false
   }
 
+  FileView { id: uiSnap; path: root.dataDir + "/ui.json"; atomicWrites: true; printErrors: false }
+  FileView { id: timelineSnap; path: root.dataDir + "/timeline.json"; atomicWrites: true; printErrors: false }
+  FileView { id: clipsSnap; path: root.dataDir + "/clips.json"; atomicWrites: true; printErrors: false }
+  FileView { id: momentSnap; path: root.dataDir + "/moment.json"; atomicWrites: true; printErrors: false }
+  FileView { id: hitsSnap; path: root.dataDir + "/hits.json"; atomicWrites: true; printErrors: false }
+  FileView { id: planSnap; path: root.dataDir + "/plan.json"; atomicWrites: true; printErrors: false }
+
   Connections {
     target: Hyprland
     function onRawEvent(event) {
@@ -501,9 +545,13 @@ Item {
     function executePlan(arg: string): string { return root.executePlan(arg) }
     function wipe(arg: string): string { return root.wipe(arg) }
     function reopenPlan(arg: string): string { root.requestPlan(Number(arg) || 0); return "ok" }
+    function moment(arg: string): string { root.requestMoment(Number(arg) || 0); return "ok" }
+    function timeline(arg: string): string { root.refreshTimeline(); return "ok" }
+    function clips(arg: string): string { root.refreshClips(); return "ok" }
+    function configure(arg: string): string { return root.applySettings(root.parseJsonArg(arg, {})) }
     function setOverlayOpen(arg: string): string {
       var v = String(arg || "")
-      return root.setOverlayOpen(v === "true" || v === "1" || v === "{\"paused\":true}")
+      return root.setOverlayOpen(v === "true" || v === "1")
     }
   }
 
