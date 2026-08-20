@@ -592,12 +592,12 @@ Item {
     }
   }
 
-  FileView { id: uiSnap; path: root.publishUi ? (root.snapDir + "/ui.json") : ""; atomicWrites: true; printErrors: false }
-  FileView { id: timelineSnap; path: root.publishUi ? (root.snapDir + "/timeline.json") : ""; atomicWrites: true; printErrors: false }
-  FileView { id: clipsSnap; path: root.publishUi ? (root.snapDir + "/clips.json") : ""; atomicWrites: true; printErrors: false }
-  FileView { id: momentSnap; path: root.publishUi ? (root.snapDir + "/moment.json") : ""; atomicWrites: true; printErrors: false }
-  FileView { id: hitsSnap; path: root.publishUi ? (root.snapDir + "/hits.json") : ""; atomicWrites: true; printErrors: false }
-  FileView { id: planSnap; path: root.publishUi ? (root.snapDir + "/plan.json") : ""; atomicWrites: true; printErrors: false }
+  FileView { id: uiSnap; path: (root.publishUi && root.snapDir.length) ? (root.snapDir + "/ui.json") : ""; atomicWrites: true; printErrors: false }
+  FileView { id: timelineSnap; path: (root.publishUi && root.snapDir.length) ? (root.snapDir + "/timeline.json") : ""; atomicWrites: true; printErrors: false }
+  FileView { id: clipsSnap; path: (root.publishUi && root.snapDir.length) ? (root.snapDir + "/clips.json") : ""; atomicWrites: true; printErrors: false }
+  FileView { id: momentSnap; path: (root.publishUi && root.snapDir.length) ? (root.snapDir + "/moment.json") : ""; atomicWrites: true; printErrors: false }
+  FileView { id: hitsSnap; path: (root.publishUi && root.snapDir.length) ? (root.snapDir + "/hits.json") : ""; atomicWrites: true; printErrors: false }
+  FileView { id: planSnap; path: (root.publishUi && root.snapDir.length) ? (root.snapDir + "/plan.json") : ""; atomicWrites: true; printErrors: false }
 
   Connections {
     target: Hyprland
@@ -663,7 +663,10 @@ Item {
     // Ensure the ephemeral snapshot dir exists (tmpfs runtime dir), 0700, before
     // any FileView publishes into it.
     try {
-      Quickshell.execDetached(["mkdir", "-p", "-m", "700", root.snapDir])
+      // Only create the channel dir when it resolves to the secure per-user
+      // XDG_RUNTIME_DIR (snapDir is "" — fail closed — when that is absent).
+      if (root.snapDir && root.snapDir.length)
+        Quickshell.execDetached(["mkdir", "-p", "-m", "700", root.snapDir])
     } catch (e) {}
     root.findHelper()
   }
@@ -671,6 +674,11 @@ Item {
   Component.onDestruction: {
     root.stopping = true
     restartTimer.stop()
+    // Ask the daemon to stop in-band first (it reaps its wl-paste child group
+    // and joins workers). Then drop the process: Quickshell signals it, and the
+    // daemon's SIGTERM/SIGINT handler runs the same cooperative reap, so the
+    // clipboard watcher is never orphaned on reload/disable regardless of which
+    // path wins the race.
     root.send("shutdown", {})
     daemonProc.running = false
   }

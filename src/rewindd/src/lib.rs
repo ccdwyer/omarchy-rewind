@@ -132,8 +132,46 @@ impl Shared {
     }
     pub(crate) fn set_clip_child(&self, pid: i32) {
         self.clip_child.store(pid, Ordering::SeqCst);
+        // Mirror into the signal-visible global so a SIGTERM/SIGINT handler can
+        // reap the wl-paste process group without touching `Shared`.
+        SIG_CLIP_PID.store(pid, Ordering::SeqCst);
     }
 }
+
+/// Signal-handler-visible mirror of the persistent wl-paste clipboard child pid.
+/// A running blocking `stdin` read cannot poll a stop flag, so the termination
+/// handler kills this process group directly. Only async-signal-safe operations
+/// (atomic load, `kill`, `_exit`) run inside the handler.
+static SIG_CLIP_PID: AtomicI32 = AtomicI32::new(0);
+
+#[cfg(unix)]
+extern "C" fn on_terminate(_sig: libc::c_int) {
+    let pid = SIG_CLIP_PID.swap(0, Ordering::SeqCst);
+    if pid > 0 {
+        unsafe {
+            // Negative pid → the child's whole process group (wl-paste/sh/cat).
+            libc::kill(-pid, libc::SIGTERM);
+            libc::kill(pid, libc::SIGTERM);
+        }
+    }
+    // In-process workers are threads and die with the process. Exit now so the
+    // wl-paste watcher is never orphaned on reload/disable.
+    unsafe { libc::_exit(0) };
+}
+
+#[cfg(unix)]
+fn install_signal_handlers() {
+    // Go through a typed fn pointer before the sighandler_t (usize) cast, rather
+    // than casting the fn item directly to an integer.
+    let handler: extern "C" fn(libc::c_int) = on_terminate;
+    unsafe {
+        libc::signal(libc::SIGTERM, handler as usize as libc::sighandler_t);
+        libc::signal(libc::SIGINT, handler as usize as libc::sighandler_t);
+    }
+}
+
+#[cfg(not(unix))]
+fn install_signal_handlers() {}
 
 fn boot_shared(data_dir: &Path) -> Result<Arc<Shared>, String> {
     perms::install_umask();
@@ -179,6 +217,11 @@ fn boot_shared(data_dir: &Path) -> Result<Arc<Shared>, String> {
 }
 
 pub fn run_daemon(data_dir: PathBuf) -> io::Result<()> {
+    // Route SIGTERM/SIGINT (sent on plugin reload/disable) through a handler
+    // that terminates the wl-paste child group and exits, so the clipboard
+    // watcher is never orphaned even when we are signalled rather than sent an
+    // in-band `shutdown`.
+    install_signal_handlers();
     let shared = boot_shared(&data_dir).map_err(io::Error::other)?;
 
     emit(&Event::ready(
@@ -232,6 +275,7 @@ pub fn run_daemon(data_dir: PathBuf) -> io::Result<()> {
     // guarantees the process still exits even if a join hangs.
     shared.stopping.store(true, Ordering::SeqCst);
     let pid = shared.clip_child.swap(0, Ordering::SeqCst);
+    SIG_CLIP_PID.store(0, Ordering::SeqCst);
     if pid > 0 {
         // Negative pid kills the child's process group (wl-paste spawns sh/cat);
         // fall back to the bare pid if it was not made a group leader.
@@ -933,9 +977,13 @@ fn flush_deferred(shared: &Shared) {
             }
         }
         // (4) Reclaim any crop file left with no referencing row (e.g. a crash
-        // between an OCR commit and the crop unlink). Safe cleanup of sensitive
+        // between an OCR commit and the crop unlink) and retry deletion
+        // tombstones whose unlink previously failed. Safe cleanup of sensitive
         // surplus data in this authorized, unpaused window.
-        let _ = shared.with_store(|s| s.sweep_orphan_crops());
+        let _ = shared.with_store(|s| {
+            let _ = s.sweep_orphan_crops();
+            let _ = s.flush_unlinks();
+        });
     });
 }
 

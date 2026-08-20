@@ -89,7 +89,7 @@ Default exclusions: KeePassXC, 1Password, Bitwarden, Seahorse, polkit agents.
 
 ## Disk math (honest)
 
-Planning estimate (not measured on this host): a 720p still of text-heavy UI is **~25–80 KB/frame**, not single-digit KB. Retention is a **byte cap** (default 2 GB). Oldest frames are deleted inside the insert transaction.
+Planning estimate (not measured on this host): a 720p still of text-heavy UI is **~25–80 KB/frame**, not single-digit KB. Retention is a **byte cap** (default 2 GB) covering **all** retained observation data — frames, crops, clipboard, layouts, and the OCR/search index — not just frame bytes. When the cap is exceeded, the **oldest window across every table** (frames, clips, layouts, events, OCR) is pruned inside the same transaction, and its files are removed via durable deletion tombstones so an interrupted unlink can't leave an untracked screenshot behind.
 
 The bar and consent screen report **≈N days at your usage** once rewindd has measured this machine. Until then they show the planning band for 25–80 KB at a 10 s write average (dHash skip), not a promised calendar window.
 

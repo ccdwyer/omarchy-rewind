@@ -51,12 +51,14 @@ Item {
       if (rt && rt.length)
         return rt + "/rewind"
     } catch (e) {}
-    // No runtime dir (rare — logind always sets one): fall back to a per-user
-    // path under /tmp, NEVER the persistent data dir. The service creates it
-    // 0700 (`mkdir -m 700`). Reboot-ephemeral and outside observation storage,
-    // so a transient read snapshot can never be written into persistent data.
-    var user = Quickshell.env("USER") || "user"
-    return "/tmp/rewind-" + user
+    // No runtime dir: FAIL CLOSED. XDG_RUNTIME_DIR is a per-user 0700 tmpfs
+    // (logind always sets it), so our `rewind` subdir there cannot be
+    // pre-created or symlinked by another user. A `/tmp/rewind-$USER` fallback,
+    // by contrast, has a world-writable parent an attacker could pre-create as
+    // a symlink to siphon these sensitive snapshots — so we do NOT write the
+    // read channel anywhere insecure. Returning "" disables the snapshot
+    // channel (the overlay/bar simply show no cached data) rather than leak.
+    return ""
   }
 
   function resolveHelper(dir) {

@@ -5,7 +5,7 @@ Conservative choices where the Omarchy / Quickshell / Hyprland API was not 100% 
 ## Plugin host (reference wins)
 
 - **Entry points are `Item`s**, not `ShellRoot`. Overlay exposes `open(payloadJson)` / `close()` / `toggle()` for `omarchy-shell shell summon|hide|toggle`.
-- **Injected properties used:** `omarchyPath`, `shell`, `manifest`, `pluginRegistry`, `bar` (host load). **Not used:** `serviceFor` / `firstPartyServiceFor`. Overlay and bar widget talk to the service only through documented `omarchy-shell shell summon|hide|toggle|call <id> …`. FileView snapshots under `$XDG_DATA_HOME/rewind/` are written only while `armed && !paused`. While disarmed or paused, the bar polls `call <id> status '{}'` for live armed/paused state so it never depends on a stale `ui.json`.
+- **Injected properties used:** `omarchyPath`, `shell`, `manifest`, `pluginRegistry`, `bar` (host load). **Not used:** `serviceFor` / `firstPartyServiceFor`. Overlay and bar widget talk to the service only through documented `omarchy-shell shell summon|hide|toggle|call <id> …`. The read-response snapshot channel (`ui/timeline/clips/moment/hits/plan.json`) lives in the **ephemeral tmpfs runtime dir `$XDG_RUNTIME_DIR/rewind`** (per-user 0700), never persistent storage; if `XDG_RUNTIME_DIR` is unset the channel fails closed (empty path) rather than fall back to an insecure `/tmp` path. These are transient views of already-authorized data, so they publish whenever `consent && (armed || overlayOpen)` and the overlay reads them even while its own privacy pause is active. New observation capture remains gated on `armed && !paused`.
 - **`keepLoaded: true`** so the overlay’s layer-shell window survives between summons (image-picker pattern). The spec’s kinds/entryPoints are otherwise unchanged.
 - **Settings are inline on the `shell.json` entry.** Widget keys live in `manifest.barWidget.defaults` + `schema`. The bar widget pushes them with `shell call … configure '<json>'`.
 - **Arm/consent persistence** is runtime state in `~/.local/share/rewind/state.json` (0600). Steady-state disarmed operation writes nothing. The one exception is the explicit consent-transition write (`persist_consent`) when the user accepts the consent screen, including “Keep disarmed.” Capture/OCR/settings/snapshots still require armed. `armOnLogin` is not persisted, so the daemon boots disarmed; startup auto-arm is deferred until the shell pushes `armOnLogin` (with `consentAt > 0`) via `configure`. A bare persisted `armed` bit does not resume capture. `arm` is rejected until consent is recorded.
@@ -143,16 +143,19 @@ Conservative choices where the Omarchy / Quickshell / Hyprland API was not 100% 
   `disarm_during_capture_discards_files_and_rows` (own temp files removed
   immediately), `settings_save_deferred_while_paused`,
   `pause_transition_does_not_write_to_store`.
-- **Snapshot files are recording-only.** The QML service writes its
-  `ui/timeline/clips/moment/hits/plan.json` snapshots only while `armed && !paused`
-  (`persistUi`); a pause freezes them and `onPersistUiChanged` flushes the latest
-  in-memory state once recording resumes. The overlay does not depend on them for
-  live data (it refreshes over its own `omarchy-shell shell call` channel on
-  open), so freezing them during the overlay-open pause is safe.
-- **Bar reflects recording truthfully.** `toggleArm` runs through a process whose
-  reply (the helper's authoritative post-toggle status) is applied directly, so
-  the dot never shows "off" while recording has already started — no racing
-  status poll decides the state.
+- **Snapshot files are an ephemeral read channel, not observation storage.** The
+  service publishes `ui/timeline/clips/moment/hits/plan.json` into the tmpfs
+  runtime dir (`$XDG_RUNTIME_DIR/rewind`, 0700; fail-closed if unset) whenever
+  `consent && (armed || overlayOpen)`. The overlay and bar read from there. Because
+  these are transient renderings of already-committed authorized data — never new
+  captured content, and never persistent storage — serving them while the overlay's
+  own privacy pause is active is not an observation write. New capture stays gated
+  on `armed && !paused`.
+- **Bar reflects recording truthfully (fire-and-forget).** `toggleArm` is sent to
+  the daemon fire-and-forget; the chip renders **only** from the daemon-authoritative
+  `ui.json` snapshot plus the `status` poll. It never applies an optimistic or
+  pre-toggle reply, so the dot can't show "off" while recording is on or flip before
+  the daemon acknowledges.
 - **Screencast detection fails closed.** `parse_portal_dump` matches portal
   ScreenCast sessions and common recorders (OBS, wf-recorder, gpu-screen-recorder,
   kooha, GNOME Shell) keyed on a screencast/portal marker plus a video-stream

@@ -88,7 +88,7 @@ BarWidget {
 
   FileView {
     id: uiView
-    path: adapter.snapDir() + "/ui.json"
+    path: adapter.snapDir().length ? (adapter.snapDir() + "/ui.json") : ""
     watchChanges: true
     printErrors: false
     onLoaded: root.applyLive(text())

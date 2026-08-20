@@ -158,7 +158,18 @@ if os.path.exists(db):
     try:
         c=sqlite3.connect("file:%s?mode=ro"%db, uri=True)
         frames=c.execute("SELECT COUNT(*) FROM frames").fetchone()[0] or 0
-        used=c.execute("SELECT COALESCE(SUM(bytes),0)+COALESCE(SUM(crop_bytes),0) FROM frames").fetchone()[0] or 0
+        # Mirror the Rust managed_total: the byte budget counts ALL retained
+        # observation data, not just frame+crop bytes. Each table is summed
+        # defensively since an older/partial DB may lack some of them.
+        def _sum(sql):
+            try: return c.execute(sql).fetchone()[0] or 0
+            except Exception: return 0
+        used=(_sum("SELECT COALESCE(SUM(bytes),0)+COALESCE(SUM(crop_bytes),0) FROM frames")
+              +_sum("SELECT COALESCE(SUM(LENGTH(content)),0) FROM clips")
+              +_sum("SELECT COALESCE(SUM(LENGTH(json)),0) FROM layouts")
+              +_sum("SELECT COALESCE(SUM(LENGTH(text)),0) FROM ocr")
+              +_sum("SELECT COALESCE(SUM(LENGTH(text)+LENGTH(COALESCE(app,''))+LENGTH(COALESCE(title,''))+LENGTH(COALESCE(clip,''))),0) FROM search_fallback")
+              +_sum("SELECT COALESCE(SUM(LENGTH(word)),0) FROM ocr_boxes"))
         row=c.execute("SELECT COALESCE(MIN(ts),0),COALESCE(MAX(ts),0) FROM frames").fetchone()
         first,last=row[0] or 0,row[1] or 0
         c.close()

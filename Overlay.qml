@@ -23,6 +23,9 @@ Item {
   property string searchText: ""
   property bool searchOpen: false
   property int selectedIndex: 0
+  // When a fresh overlay open loads the timeline, jump to the newest frame
+  // (the latest moment) rather than sitting on the oldest loaded one.
+  property bool selectLatestOnLoad: false
   property var frames: []
   property var gaps: []
   property var hits: []
@@ -170,6 +173,7 @@ Item {
       payload = payloadJson && String(payloadJson).length ? JSON.parse(payloadJson) : {}
     } catch (e) { payload = {} }
     root.openView = payload.view || ""
+    root.selectLatestOnLoad = true
     root.firstRun = !root.uiConsent
     if (payload.view === "clips")
       root.view = "clips"
@@ -239,6 +243,9 @@ Item {
     if (!root.frames.length) {
       root.moment = {}
       root.highlightBoxes = []
+    } else if (root.selectLatestOnLoad) {
+      root.selectedIndex = root.frames.length - 1
+      root.selectLatestOnLoad = false
     } else if (root.selectedIndex >= root.frames.length) {
       root.selectedIndex = root.frames.length - 1
     }
@@ -480,7 +487,7 @@ Item {
 
   FileView {
     id: uiView
-    path: root.snapDir + "/ui.json"
+    path: root.snapDir.length ? (root.snapDir + "/ui.json") : ""
     watchChanges: true
     printErrors: false
     onLoaded: root.applyUi(text())
@@ -488,7 +495,7 @@ Item {
   }
   FileView {
     id: timelineView
-    path: root.snapDir + "/timeline.json"
+    path: root.snapDir.length ? (root.snapDir + "/timeline.json") : ""
     watchChanges: true
     printErrors: false
     onLoaded: root.applyTimeline(text())
@@ -496,7 +503,7 @@ Item {
   }
   FileView {
     id: clipsView
-    path: root.snapDir + "/clips.json"
+    path: root.snapDir.length ? (root.snapDir + "/clips.json") : ""
     watchChanges: true
     printErrors: false
     onLoaded: root.applyClips(text())
@@ -504,7 +511,7 @@ Item {
   }
   FileView {
     id: momentView
-    path: root.snapDir + "/moment.json"
+    path: root.snapDir.length ? (root.snapDir + "/moment.json") : ""
     watchChanges: true
     printErrors: false
     onLoaded: root.applyMoment(text())
@@ -512,7 +519,7 @@ Item {
   }
   FileView {
     id: hitsView
-    path: root.snapDir + "/hits.json"
+    path: root.snapDir.length ? (root.snapDir + "/hits.json") : ""
     watchChanges: true
     printErrors: false
     onLoaded: root.applyHits(text())
@@ -520,7 +527,7 @@ Item {
   }
   FileView {
     id: planView
-    path: root.snapDir + "/plan.json"
+    path: root.snapDir.length ? (root.snapDir + "/plan.json") : ""
     watchChanges: true
     printErrors: false
     onLoaded: root.applyPlanFile(text())

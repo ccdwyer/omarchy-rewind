@@ -108,6 +108,12 @@ impl Store {
             writable: true,
         };
         store.migrate()?;
+        // Crash recovery: retry any deletion tombstones and orphan crops left
+        // by a prior interrupted prune/wipe, so sensitive files can't survive a
+        // crash-between-row-and-file across restarts. A writable open only
+        // happens in an armed (authorized) context.
+        let _ = store.flush_unlinks();
+        let _ = store.sweep_orphan_crops();
         Ok(store)
     }
 
@@ -170,6 +176,16 @@ impl Store {
                 CREATE TABLE IF NOT EXISTS meta (
                     key TEXT PRIMARY KEY,
                     value TEXT
+                );
+                -- Durable deletion tombstones. A file path is recorded here
+                -- inside the SAME transaction that removes its row, BEFORE we
+                -- attempt to unlink it. If the process crashes or the unlink
+                -- fails, the tombstone survives so a startup/authorized sweep
+                -- can still delete the orphaned screenshot/crop. A wipe that
+                -- leaves residual tombstones reports failure rather than
+                -- claiming success.
+                CREATE TABLE IF NOT EXISTS pending_unlink (
+                    path TEXT PRIMARY KEY
                 );
                 CREATE INDEX IF NOT EXISTS idx_frames_app ON frames(app);
                 CREATE INDEX IF NOT EXISTS idx_ocr_boxes_ts ON ocr_boxes(ts);
@@ -247,7 +263,11 @@ impl Store {
             + q("SELECT COALESCE(SUM(LENGTH(content)),0) FROM clips")
             + q("SELECT COALESCE(SUM(LENGTH(json)),0) FROM layouts")
             + q("SELECT COALESCE(SUM(LENGTH(text)),0) FROM ocr")
-            + q("SELECT COALESCE(SUM(LENGTH(text)),0) FROM search_fallback")
+            // search_fallback / OCR text index: count all searchable fields, not
+            // just `text` (app, title and captured clip text are retained too).
+            + q("SELECT COALESCE(SUM(LENGTH(text)+LENGTH(COALESCE(app,''))+LENGTH(COALESCE(title,''))+LENGTH(COALESCE(clip,''))),0) FROM search_fallback")
+            // Per-word OCR bounding boxes are retained observation data too.
+            + q("SELECT COALESCE(SUM(LENGTH(word)),0) FROM ocr_boxes")
     }
 
     /// Oldest timestamp across every observation table (frames, clips, layouts,
@@ -331,7 +351,80 @@ impl Store {
                 break;
             }
         }
+        // Record a durable tombstone for every file to unlink, inside this same
+        // transaction, so the intent-to-delete survives a crash between commit
+        // and the actual unlink.
+        Self::tombstone_files(tx, &unlink)?;
         Ok(unlink)
+    }
+
+    /// Record file paths to be unlinked into `pending_unlink` within `tx`.
+    fn tombstone_files(
+        tx: &rusqlite::Transaction<'_>,
+        files: &[(String, Option<String>)],
+    ) -> Result<(), String> {
+        for (path, crop) in files {
+            tx.execute(
+                "INSERT OR IGNORE INTO pending_unlink (path) VALUES (?1)",
+                params![path],
+            )
+            .map_err(|e| e.to_string())?;
+            if let Some(c) = crop {
+                tx.execute(
+                    "INSERT OR IGNORE INTO pending_unlink (path) VALUES (?1)",
+                    params![c],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Attempt to unlink every tombstoned file; drop the tombstone only once the
+    /// file is actually gone (a NotFound is treated as gone). Returns the number
+    /// of tombstones that could NOT be cleared (residual files still on disk).
+    pub fn flush_unlinks(&self) -> Result<usize, String> {
+        let mut paths: Vec<String> = Vec::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT path FROM pending_unlink")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
+            for r in rows {
+                paths.push(r.map_err(|e| e.to_string())?);
+            }
+        }
+        let mut remaining = 0usize;
+        for p in paths {
+            let full = self.root.join(&p);
+            match std::fs::remove_file(&full) {
+                Ok(()) => {
+                    let _ = self
+                        .conn
+                        .execute("DELETE FROM pending_unlink WHERE path=?1", params![p]);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Already gone — clear the tombstone.
+                    let _ = self
+                        .conn
+                        .execute("DELETE FROM pending_unlink WHERE path=?1", params![p]);
+                }
+                Err(_) => {
+                    remaining += 1;
+                }
+            }
+        }
+        Ok(remaining)
+    }
+
+    /// Count of outstanding deletion tombstones (residual sensitive files).
+    pub fn pending_unlink_count(&self) -> i64 {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM pending_unlink", [], |r| r.get(0))
+            .unwrap_or(0)
     }
 
     pub fn prune_to(&mut self, cap: i64) -> Result<i64, String> {
@@ -394,13 +487,15 @@ impl Store {
             "DELETE FROM search_fallback WHERE ts>=?1 AND ts<=?2",
             params![lo, hi],
         );
+        // Tombstone the files inside the same transaction so an interrupted
+        // unlink cannot leave an untracked, wipe-surviving screenshot.
+        let files: Vec<(String, Option<String>)> = frames
+            .into_iter()
+            .map(|(_ts, path, crop)| (path, crop))
+            .collect();
+        Self::tombstone_files(&tx, &files)?;
         tx.commit().map_err(|e| e.to_string())?;
-        for (_ts, path, crop) in frames {
-            let _ = std::fs::remove_file(self.root.join(&path));
-            if let Some(c) = crop {
-                let _ = std::fs::remove_file(self.root.join(c));
-            }
-        }
+        let _ = self.flush_unlinks();
         Ok(n)
     }
 
@@ -647,12 +742,10 @@ impl Store {
         }
         tx.commit().map_err(|e| e.to_string())?;
         // Files are removed only after the DB rows are durably gone.
-        for (path, crop) in to_unlink {
-            let _ = std::fs::remove_file(self.root.join(&path));
-            if let Some(c) = crop {
-                let _ = std::fs::remove_file(self.root.join(c));
-            }
-        }
+        // Rows are durably gone and their files tombstoned inside the tx;
+        // unlink now, leaving any failures tombstoned for a later sweep.
+        let _ = to_unlink;
+        let _ = self.flush_unlinks();
         Ok(true)
     }
 
@@ -837,12 +930,10 @@ impl Store {
             return Ok(false);
         }
         tx.commit().map_err(|e| e.to_string())?;
-        for (path, crop) in to_unlink {
-            let _ = std::fs::remove_file(self.root.join(&path));
-            if let Some(c) = crop {
-                let _ = std::fs::remove_file(self.root.join(c));
-            }
-        }
+        // Rows are durably gone and their files tombstoned inside the tx;
+        // unlink now, leaving any failures tombstoned for a later sweep.
+        let _ = to_unlink;
+        let _ = self.flush_unlinks();
         Ok(true)
     }
 
@@ -1101,11 +1192,17 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT ts,path,app,title,workspace,bytes,encoder
-                 FROM frames
-                 WHERE (?1 = 0 OR ts >= ?1) AND (?2 = 0 OR ts <= ?2)
-                 ORDER BY ts ASC
-                 LIMIT ?3",
+                // Select the NEWEST `limit` frames in the window (DESC + LIMIT),
+                // then return them oldest-first for chronological display. Using
+                // ASC + LIMIT would drop recent captures once an archive exceeds
+                // `limit` frames, hiding the most relevant (and demo) history.
+                "SELECT ts,path,app,title,workspace,bytes,encoder FROM (
+                     SELECT ts,path,app,title,workspace,bytes,encoder
+                     FROM frames
+                     WHERE (?1 = 0 OR ts >= ?1) AND (?2 = 0 OR ts <= ?2)
+                     ORDER BY ts DESC
+                     LIMIT ?3
+                 ) ORDER BY ts ASC",
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt
@@ -1266,7 +1363,22 @@ impl Store {
             other => return Err(format!("unknown wipe scope: {other}")),
         };
         let n = self.delete_range(lo, hi)?;
-        Ok(json!({"wiped": n, "scope": scope, "from": lo, "to": hi}))
+        // Sweep any orphaned crops (files with no referencing row) and retry
+        // outstanding tombstones. A wipe that leaves residual sensitive files
+        // reports ok:false with the residual count rather than lying.
+        let _ = self.sweep_orphan_crops();
+        let residual = self.flush_unlinks().unwrap_or_else(|_| {
+            self.pending_unlink_count().max(0) as usize
+        });
+        let ok = residual == 0;
+        Ok(json!({
+            "wiped": n,
+            "scope": scope,
+            "from": lo,
+            "to": hi,
+            "ok": ok,
+            "residual": residual as i64
+        }))
     }
 
     pub fn stats(&self) -> Result<StatsSnap, String> {
@@ -1499,6 +1611,69 @@ mod tests {
             crop_path: None,
             crop_bytes: 0,
         }
+    }
+
+    #[test]
+    fn timeline_returns_newest_frames_not_oldest() {
+        // Blocker 1: once an archive exceeds the timeline limit, the strip must
+        // show the NEWEST frames (so recent/seeded demo history is visible),
+        // returned oldest-first for chronological scrubbing.
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("rewind.db")).unwrap();
+        for ts in 1..=10 {
+            store.insert_frame(&sample(ts, 10, "t")).unwrap();
+        }
+        let v = store.timeline(0, 0, 3).unwrap();
+        let frames = v["frames"].as_array().unwrap();
+        let got: Vec<i64> = frames.iter().map(|f| f["ts"].as_i64().unwrap()).collect();
+        assert_eq!(got, vec![8, 9, 10], "newest 3, ascending");
+    }
+
+    #[test]
+    fn delete_range_tombstones_then_unlinks_files() {
+        // Blocker 2: deleting rows tombstones the files inside the tx, then
+        // unlinks them; a clean run leaves no tombstone and no file.
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("rewind.db")).unwrap();
+        std::fs::create_dir_all(dir.path().join("frames")).unwrap();
+        std::fs::create_dir_all(dir.path().join("crops")).unwrap();
+        let mut f = sample(5, 10, "t");
+        f.crop_path = Some("crops/5.png".into());
+        f.crop_bytes = 3;
+        std::fs::write(dir.path().join("frames/5.png"), b"SCREEN").unwrap();
+        std::fs::write(dir.path().join("crops/5.png"), b"CROP").unwrap();
+        store.insert_frame(&f).unwrap();
+        let n = store.wipe("all", 0, 0).unwrap();
+        assert_eq!(n["wiped"].as_i64().unwrap(), 1);
+        assert_eq!(n["ok"].as_bool().unwrap(), true);
+        assert_eq!(n["residual"].as_i64().unwrap(), 0);
+        assert!(!dir.path().join("frames/5.png").exists());
+        assert!(!dir.path().join("crops/5.png").exists());
+        assert_eq!(store.pending_unlink_count(), 0);
+    }
+
+    #[test]
+    fn wipe_reports_residual_when_file_cannot_be_unlinked() {
+        // Blocker 2: a tombstone whose file cannot be removed (here it is a
+        // non-empty directory) keeps the tombstone and makes flush_unlinks
+        // report residual > 0 — a wipe must not falsely claim success while
+        // sensitive files remain.
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("rewind.db")).unwrap();
+        // A directory cannot be removed by remove_file → unlink fails, tombstone
+        // stays. Stand-in for an un-unlinkable residual file.
+        std::fs::create_dir_all(dir.path().join("stuck")).unwrap();
+        std::fs::write(dir.path().join("stuck/inner"), b"x").unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO pending_unlink (path) VALUES ('stuck')",
+                [],
+            )
+            .unwrap();
+        let remaining = store.flush_unlinks().unwrap();
+        assert_eq!(remaining, 1, "un-unlinkable file remains tombstoned");
+        assert_eq!(store.pending_unlink_count(), 1);
     }
 
     #[test]

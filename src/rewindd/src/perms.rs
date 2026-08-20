@@ -100,6 +100,82 @@ pub fn secure_file(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Validate that `path` is a real directory (not a symlink), owned by the
+/// current user, with mode exactly 0700 — without following symlinks.
+#[cfg(unix)]
+pub fn validate_private_dir(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::symlink_metadata(path)?; // lstat: does NOT follow symlinks
+    if !meta.file_type().is_dir() {
+        return Err(io::Error::other(format!(
+            "{} is not a directory (symlink/other)",
+            path.display()
+        )));
+    }
+    let uid = unsafe { libc::getuid() };
+    if meta.uid() != uid {
+        return Err(io::Error::other(format!(
+            "{} not owned by current user",
+            path.display()
+        )));
+    }
+    let mode = meta.permissions().mode() & 0o777;
+    if mode != 0o700 {
+        return Err(io::Error::other(format!(
+            "{} mode {:o} != 700",
+            path.display(),
+            mode
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn validate_private_dir(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+/// Base directory for ephemeral, sensitive runtime staging/snapshots. Prefers
+/// the systemd per-UID `XDG_RUNTIME_DIR` (a private 0700 tmpfs). If that is
+/// unavailable, a private randomized fallback under the (already 0700) data
+/// tree is used — never a predictable world-accessible `/tmp` path.
+pub fn secure_runtime_dir(sub: &str) -> io::Result<PathBuf> {
+    install_umask();
+    let base = if let Ok(x) = std::env::var("XDG_RUNTIME_DIR") {
+        if !x.is_empty() {
+            Some(PathBuf::from(x))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let root = match base {
+        Some(b) => b.join("rewind"),
+        // Fall back inside the private data tree (0700, owned) rather than /tmp.
+        None => default_data_dir().join(".rt"),
+    };
+    secure_dir(&root)?;
+    validate_private_dir(&root)?;
+    let dir = root.join(sub);
+    secure_dir(&dir)?;
+    validate_private_dir(&dir)?;
+    Ok(dir)
+}
+
+/// A hard-to-predict filename with the given extension, unique per call.
+pub fn random_name(ext: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CTR: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let c = CTR.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    format!("{pid:x}-{nanos:x}-{c:x}.{ext}")
+}
+
 pub fn assert_private_tree(root: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {

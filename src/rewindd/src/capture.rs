@@ -187,7 +187,7 @@ fn grab_grim(output: &str) -> Result<RawFrame, String> {
     if output.is_empty() {
         return Err("refusing grim capture: empty output name".into());
     }
-    let dest = tmp_path();
+    let dest = secure_stage_path()?;
     let mut cmd = Command::new("grim");
     cmd.arg("-t").arg("png");
     cmd.arg("-o").arg(output);
@@ -207,11 +207,25 @@ fn grab_grim(output: &str) -> Result<RawFrame, String> {
     Ok(frame)
 }
 
-fn tmp_path() -> PathBuf {
-    let mut p = std::env::temp_dir().join("rewind-capture");
-    let _ = std::fs::create_dir_all(&p);
-    p.push(format!("{}.png", std::process::id()));
-    p
+/// A fresh, securely-created full-resolution staging path for a grim capture.
+/// Lives in a validated private per-UID runtime dir (0700, not a symlink) with
+/// an unpredictable filename, created O_EXCL so nothing pre-existing can be
+/// followed or clobbered. grim then overwrites this exact file we own.
+fn secure_stage_path() -> Result<PathBuf, String> {
+    let dir = crate::perms::secure_runtime_dir("stage").map_err(|e| e.to_string())?;
+    for _ in 0..8 {
+        let candidate = dir.join(crate::perms::random_name("png"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true) // O_EXCL: fail if the path already exists
+            .open(&candidate)
+        {
+            Ok(_) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Err("could not create a unique secure staging file".into())
 }
 
 pub fn load_png(path: &PathBuf) -> Result<RawFrame, String> {
