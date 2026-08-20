@@ -31,6 +31,13 @@ Item {
   property var hits: []
   property var clips: []
   property var moment: ({})
+  // When a search hit is OLDER than the loaded (newest-N) timeline window, the
+  // timeline strip has no frame for it. In that case the loaded `moment` (which
+  // the helper returns for ANY ts, with an absolute path) becomes the
+  // authoritative displayed frame, so search jumps to the real matched
+  // screenshot instead of stranding on a recent one. Cleared the moment the
+  // user scrubs the strip again.
+  property bool momentAuthoritative: false
   property var plan: ({})
   property bool showPlan: false
   property bool showWipe: false
@@ -246,6 +253,7 @@ Item {
     } else if (root.selectLatestOnLoad) {
       root.selectedIndex = root.frames.length - 1
       root.selectLatestOnLoad = false
+      root.momentAuthoritative = false
     } else if (root.selectedIndex >= root.frames.length) {
       root.selectedIndex = root.frames.length - 1
     }
@@ -290,6 +298,15 @@ Item {
     return root.frames[Math.max(0, Math.min(root.selectedIndex, root.frames.length - 1))]
   }
 
+  // The frame actually shown/labeled. When a search hit lies outside the loaded
+  // timeline window, the authoritative moment's own frame is displayed so scrub
+  // jumps to the matched screenshot; otherwise the selected timeline frame.
+  function displayFrame() {
+    if (root.momentAuthoritative && root.moment && root.moment.frame && root.moment.frame.path)
+      return root.moment.frame
+    return root.currentFrame()
+  }
+
   function ensureMoment() {
     var f = root.currentFrame()
     if (!f)
@@ -300,6 +317,8 @@ Item {
   function stepFrame(delta) {
     if (!root.frames.length)
       return
+    // Scrubbing the strip returns authority to the timeline frame.
+    root.momentAuthoritative = false
     var next = root.selectedIndex + delta
     if (next < 0) next = 0
     if (next > root.frames.length - 1) next = root.frames.length - 1
@@ -308,6 +327,7 @@ Item {
   }
 
   function stepMinute(dir) {
+    root.momentAuthoritative = false
     var f = root.currentFrame()
     if (!f)
       return
@@ -346,8 +366,17 @@ Item {
         break
       }
     }
-    if (found >= 0)
+    if (found >= 0) {
+      // Hit is within the loaded timeline window: select its strip frame.
       root.selectedIndex = found
+      root.momentAuthoritative = false
+    } else {
+      // Hit is older than the newest-N window and has no strip frame. Display
+      // the loaded moment's own frame (moment() returns any ts with an absolute
+      // path) so the search jumps to the actual matched screenshot rather than
+      // stranding on a recent frame while showing old metadata/highlights.
+      root.momentAuthoritative = true
+    }
     root.highlightBoxes = (hits[0].boxes || []).slice()
     root.callSvc("moment", String(ts))
   }
@@ -450,6 +479,7 @@ Item {
     root.highlightBoxes = []
     root.hits = []
     root.moment = {}
+    root.momentAuthoritative = false
     root.plan = {}
     root.planReady = false
     root.frames = []
@@ -853,7 +883,7 @@ Item {
               asynchronous: true
               cache: true
               source: {
-                var f = root.currentFrame()
+                var f = root.displayFrame()
                 if (f && f.path)
                   return Format.fileUrl(f.path)
                 if (root.moment && root.moment.frame && root.moment.frame.path)
@@ -908,7 +938,7 @@ Item {
             anchors.margins: Style.space(12)
             spacing: Style.space(10)
             Text {
-              text: root.currentFrame() ? Format.clockLabel(root.currentFrame().ts) : ""
+              text: root.displayFrame() ? Format.clockLabel(root.displayFrame().ts) : ""
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.heading
@@ -916,7 +946,7 @@ Item {
             }
             Text {
               width: parent.width
-              text: root.currentFrame() ? ((root.currentFrame().app || "") + " — " + (root.currentFrame().title || "")) : ""
+              text: root.displayFrame() ? ((root.displayFrame().app || "") + " — " + (root.displayFrame().title || "")) : ""
               color: root.foreground
               opacity: 0.75
               wrapMode: Text.WordWrap

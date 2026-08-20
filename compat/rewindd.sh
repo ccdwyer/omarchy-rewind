@@ -358,14 +358,23 @@ elif scope=="range":
 else:
     print(json.dumps({"wiped":0,"scope":scope})); sys.exit(0)
 if not os.path.exists(db):
-    print(json.dumps({"wiped":0,"scope":scope})); sys.exit(0)
+    print(json.dumps({"wiped":0,"scope":scope,"ok":True,"residual":0})); sys.exit(0)
+def resolve(p):
+    return p if os.path.isabs(p) else os.path.join(root,p)
 try:
     c=sqlite3.connect(db); c.row_factory=sqlite3.Row
+    # Durable deletion, mirroring the Rust helper: record every file path in a
+    # pending_unlink tombstone table INSIDE the same transaction that deletes the
+    # rows, so a crash between the row delete and the file unlink cannot leave an
+    # untracked sensitive screenshot — the next run retries the tombstones.
+    c.execute("CREATE TABLE IF NOT EXISTS pending_unlink (path TEXT PRIMARY KEY)")
     c.execute("BEGIN IMMEDIATE")
     files=[]
     for r in c.execute("SELECT path,crop_path FROM frames WHERE ts>=? AND ts<=?",(lo,hi)):
         if r["path"]: files.append(r["path"])
         if r["crop_path"]: files.append(r["crop_path"])
+    for p in files:
+        c.execute("INSERT OR IGNORE INTO pending_unlink (path) VALUES (?)",(p,))
     n=c.execute("SELECT COUNT(*) FROM frames WHERE ts>=? AND ts<=?",(lo,hi)).fetchone()[0] or 0
     for tbl in ("frames","clips","layouts","events","ocr_boxes"):
         try: c.execute("DELETE FROM %s WHERE ts>=? AND ts<=?"%tbl,(lo,hi))
@@ -374,17 +383,41 @@ try:
         try: c.execute("DELETE FROM %s WHERE ts>=? AND ts<=?"%tbl,(lo,hi))
         except Exception: pass
     c.commit()
-    try: c.execute("PRAGMA wal_checkpoint(TRUNCATE)");
+    # Now unlink each tombstoned file; drop the tombstone only once the file is
+    # gone (missing == gone). A file that cannot be removed keeps its tombstone.
+    for r in list(c.execute("SELECT path FROM pending_unlink")):
+        p=r["path"]; fp=resolve(p)
+        try:
+            os.remove(fp)
+            c.execute("DELETE FROM pending_unlink WHERE path=?",(p,))
+        except FileNotFoundError:
+            c.execute("DELETE FROM pending_unlink WHERE path=?",(p,))
+        except Exception:
+            pass
+    # Sweep orphan frame/crop files with no referencing row (e.g. a screenshot
+    # from a capture that crashed before its commit) so wipe cannot leave them.
+    def refd(rel):
+        try: return (c.execute("SELECT 1 FROM frames WHERE path=? OR crop_path=? LIMIT 1",(rel,rel)).fetchone() is not None)
+        except Exception: return True
+    residual_files=0
+    for sub in ("frames","crops"):
+        base=os.path.join(root,sub)
+        for dp,_,fns in os.walk(base):
+            for fn in fns:
+                full=os.path.join(dp,fn)
+                rel=os.path.relpath(full,root)
+                if not refd(rel):
+                    try: os.remove(full)
+                    except Exception: residual_files+=1
+    c.commit()
+    try: c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     except Exception: pass
+    residual=(c.execute("SELECT COUNT(*) FROM pending_unlink").fetchone()[0] or 0)+residual_files
     c.close()
 except Exception as e:
     sys.stderr.write(str(e)); sys.exit(1)
-# Only after the DB rows are gone do we unlink the files (relative to root).
-for p in files:
-    fp=p if os.path.isabs(p) else os.path.join(root,p)
-    try: os.remove(fp)
-    except Exception: pass
-print(json.dumps({"wiped":n,"scope":scope}))
+ok=(residual==0)
+print(json.dumps({"wiped":n,"scope":scope,"ok":ok,"residual":residual}))
 ' "$DB" "$DATA" "$1" "${2:-0}" "${3:-0}" "$(now_ms)"
 }
 

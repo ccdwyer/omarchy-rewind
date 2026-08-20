@@ -114,6 +114,7 @@ impl Store {
         // happens in an armed (authorized) context.
         let _ = store.flush_unlinks();
         let _ = store.sweep_orphan_crops();
+        let _ = store.sweep_orphan_frames();
         Ok(store)
     }
 
@@ -1047,6 +1048,65 @@ impl Store {
         Ok(removed)
     }
 
+    /// Remove screenshot files under `frames/` with no referencing `frames` row
+    /// — e.g. a frame written to its final path by an interrupted capture that
+    /// crashed (power loss / SIGKILL) BEFORE its DB transaction committed. Such
+    /// a file is untracked sensitive screen content that would otherwise survive
+    /// pruning and `wipe all`. Frames live under `frames/<day>/<file>`, so we
+    /// recurse one level. Returns (removed_ok, residual) where residual counts
+    /// unreferenced files that could NOT be unlinked. Run only in an authorized,
+    /// unpaused window (startup and every authorized wipe).
+    pub fn sweep_orphan_frames(&self) -> Result<(usize, usize), String> {
+        let frames_dir = self.root.join("frames");
+        let day_dirs = match std::fs::read_dir(&frames_dir) {
+            Ok(e) => e,
+            Err(_) => return Ok((0, 0)), // no frames dir yet: nothing to sweep
+        };
+        let mut removed = 0usize;
+        let mut residual = 0usize;
+        let check = |full: &Path, removed: &mut usize, residual: &mut usize| {
+            // Relative path as stored in frames.path ("frames/<day>/<file>" in
+            // production, or "frames/<file>" in tests).
+            let rel = match full.strip_prefix(&self.root) {
+                Ok(r) => r.to_string_lossy().to_string(),
+                Err(_) => return,
+            };
+            let referenced: i64 = self
+                .conn
+                .query_row(
+                    "SELECT COUNT(1) FROM frames WHERE path=?1",
+                    params![rel],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if referenced == 0 {
+                if std::fs::remove_file(full).is_ok() {
+                    *removed += 1;
+                } else {
+                    *residual += 1;
+                }
+            }
+        };
+        for entry in day_dirs.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                // A frame stored directly under frames/ (test layout).
+                check(&path, &mut removed, &mut residual);
+            } else if path.is_dir() {
+                // A day directory: frames/<day>/<file> (production layout).
+                if let Ok(files) = std::fs::read_dir(&path) {
+                    for f in files.flatten() {
+                        let full = f.path();
+                        if full.is_file() {
+                            check(&full, &mut removed, &mut residual);
+                        }
+                    }
+                }
+            }
+        }
+        Ok((removed, residual))
+    }
+
     pub fn search(&self, q: &str, limit: usize, from: i64, to: i64) -> Result<Value, String> {
         let limit = limit.clamp(1, 200);
         let q = q.trim();
@@ -1363,13 +1423,17 @@ impl Store {
             other => return Err(format!("unknown wipe scope: {other}")),
         };
         let n = self.delete_range(lo, hi)?;
-        // Sweep any orphaned crops (files with no referencing row) and retry
-        // outstanding tombstones. A wipe that leaves residual sensitive files
-        // reports ok:false with the residual count rather than lying.
+        // Sweep any orphaned crops AND frames (files with no referencing row —
+        // e.g. a screenshot written by a capture that crashed before its DB
+        // commit) and retry outstanding tombstones. A wipe that leaves residual
+        // sensitive files reports ok:false with the residual count rather than
+        // lying that everything is gone.
         let _ = self.sweep_orphan_crops();
-        let residual = self.flush_unlinks().unwrap_or_else(|_| {
-            self.pending_unlink_count().max(0) as usize
-        });
+        let frame_residual = self.sweep_orphan_frames().map(|(_, r)| r).unwrap_or(0);
+        let residual = self
+            .flush_unlinks()
+            .unwrap_or_else(|_| self.pending_unlink_count().max(0) as usize)
+            + frame_residual;
         let ok = residual == 0;
         Ok(json!({
             "wiped": n,
@@ -1630,6 +1694,41 @@ mod tests {
     }
 
     #[test]
+    fn search_hit_outside_timeline_window_still_resolves_a_frame() {
+        // Blocker 2 (r18) — backend guarantee behind the overlay fix: a search
+        // hit can be OLDER than the newest-N timeline window, so the strip has
+        // no frame for it. moment(ts) must still return that exact frame (with
+        // an absolute path) so the overlay can display the matched screenshot.
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("rewind.db")).unwrap();
+        // An early frame + an early clip with a unique token, then many newer
+        // frames that push the early one out of a small timeline window.
+        store.insert_frame(&sample(1, 10, "t")).unwrap();
+        store.insert_clip(1, "text/plain", "zzUNIQUEmarkerzz").unwrap();
+        store.record_clip_search(1, "zzUNIQUEmarkerzz").unwrap();
+        for ts in 2..=50 {
+            store.insert_frame(&sample(ts, 10, "t")).unwrap();
+        }
+        // Small window: the early frame (ts=1) is NOT in the newest-5 strip.
+        let tl = store.timeline(0, 0, 5).unwrap();
+        let in_window: Vec<i64> = tl["frames"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["ts"].as_i64().unwrap())
+            .collect();
+        assert!(!in_window.contains(&1), "early frame is out of the window");
+        // Search finds the early hit...
+        let hits = store.search("zzUNIQUEmarkerzz", 10, 0, 0).unwrap();
+        let ts0 = hits["hits"][0]["ts"].as_i64().unwrap();
+        assert_eq!(ts0, 1);
+        // ...and moment(ts) resolves that exact out-of-window frame with a path.
+        let m = store.moment(ts0).unwrap();
+        assert_eq!(m["frame"]["ts"].as_i64().unwrap(), 1);
+        assert!(m["frame"]["path"].as_str().unwrap().contains("frames/"));
+    }
+
+    #[test]
     fn delete_range_tombstones_then_unlinks_files() {
         // Blocker 2: deleting rows tombstones the files inside the tx, then
         // unlinks them; a clean run leaves no tombstone and no file.
@@ -1650,6 +1749,39 @@ mod tests {
         assert!(!dir.path().join("frames/5.png").exists());
         assert!(!dir.path().join("crops/5.png").exists());
         assert_eq!(store.pending_unlink_count(), 0);
+    }
+
+    #[test]
+    fn orphan_frame_from_crash_before_commit_is_swept() {
+        // Blocker 3 (r18): a capture that wrote its screenshot to frames/ but
+        // crashed BEFORE the DB commit leaves an untracked file with no row.
+        // The sweep (run at startup and every authorized wipe) must remove it so
+        // it cannot survive `wipe all` or evade the byte cap.
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("rewind.db")).unwrap();
+        std::fs::create_dir_all(dir.path().join("frames/20260820")).unwrap();
+        // One committed frame (referenced) + one orphan (no row), both layouts.
+        let mut f = sample(100, 10, "kept");
+        f.path = "frames/20260820/100.webp".into();
+        std::fs::write(dir.path().join("frames/20260820/100.webp"), b"KEPT").unwrap();
+        store.insert_frame(&f).unwrap();
+        std::fs::write(dir.path().join("frames/20260820/999.webp"), b"ORPHAN").unwrap();
+        // Also a flat-layout orphan to cover the test/legacy path.
+        std::fs::write(dir.path().join("frames/flat-orphan.webp"), b"ORPHAN2").unwrap();
+
+        let (removed, residual) = store.sweep_orphan_frames().unwrap();
+        assert_eq!(removed, 2, "both orphan frame files removed");
+        assert_eq!(residual, 0);
+        assert!(dir.path().join("frames/20260820/100.webp").exists(), "referenced frame kept");
+        assert!(!dir.path().join("frames/20260820/999.webp").exists());
+        assert!(!dir.path().join("frames/flat-orphan.webp").exists());
+
+        // And `wipe all` reports ok:true with zero residual (no orphan survives).
+        std::fs::write(dir.path().join("frames/20260820/888.webp"), b"LATE-ORPHAN").unwrap();
+        let w = store.wipe("all", 0, 0).unwrap();
+        assert_eq!(w["ok"].as_bool().unwrap(), true);
+        assert_eq!(w["residual"].as_i64().unwrap(), 0);
+        assert!(!dir.path().join("frames/20260820/888.webp").exists());
     }
 
     #[test]

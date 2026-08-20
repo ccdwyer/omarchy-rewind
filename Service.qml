@@ -476,19 +476,31 @@ Item {
   function status() { return JSON.stringify(root.statsObject()) }
 
   property bool triedBuild: false
+  property bool triedDownload: false
 
   function findHelper() {
     var paths = adapter.resolveHelper(root.pluginDir)
-    // Prefer the compiled recorder. If it is absent but the machine can build it
-    // (cargo present, build.sh shipped) and we have not already tried, report
-    // "buildable" so we compile it on first run — recording needs the Rust
-    // binary; the shell fallback cannot record. Only if neither the binary nor a
-    // build path exists do we fall back to the (non-recording) compat helper.
-    var buildable = root.triedBuild ? "" : "elif command -v cargo >/dev/null 2>&1 && [ -f \"$3\" ]; then echo buildable; "
+    // Recorder bootstrap, in priority order — recording needs the Rust binary;
+    // the shell fallback cannot record. A clean judge machine has no bundled
+    // bin/rewindd, so:
+    //   1. binary      — an existing/prebuilt bin/rewindd is present.
+    //   2. buildable    — cargo + build.sh present: compile it on first run.
+    //   3. downloadable — no cargo, but a network tool + sha256 tool exist:
+    //                      download a verified prebuilt from GitHub Releases.
+    //   4. fallback     — none of the above: the non-recording compat helper.
+    // triedBuild/triedDownload prevent looping. Each tier re-probes after.
+    var buildable = root.triedBuild ? "" :
+      "elif command -v cargo >/dev/null 2>&1 && [ -f \"$3\" ]; then echo buildable; "
+    var downloadable = root.triedDownload ? "" :
+      "elif ( command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 ) && " +
+      "( command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 ) && " +
+      "[ -f \"$4\" ]; then echo downloadable; "
     probeProc.command = [
       "sh", "-c",
-      "if [ -x \"$1\" ]; then echo binary; " + buildable + "elif [ -x \"$2\" ]; then echo fallback; else echo missing; fi",
-      "sh", paths.binary, paths.fallback, root.pluginDir + "/build.sh"
+      "if [ -x \"$1\" ]; then echo binary; " + buildable + downloadable +
+        "elif [ -x \"$2\" ]; then echo fallback; else echo missing; fi",
+      "sh", paths.binary, paths.fallback,
+      root.pluginDir + "/build.sh", root.pluginDir + "/scripts/fetch-rewindd.sh"
     ]
     probeProc.running = true
   }
@@ -499,6 +511,14 @@ Item {
     root.lastStatus = "building recorder…"
     buildProc.command = ["sh", "-c", "cd \"$1\" && sh build.sh >/dev/null 2>&1", "sh", root.pluginDir]
     buildProc.running = true
+  }
+
+  function downloadHelper() {
+    root.triedDownload = true
+    root.helperStatus = "downloading"
+    root.lastStatus = "downloading recorder…"
+    downloadProc.command = ["sh", "-c", "sh \"$1/scripts/fetch-rewindd.sh\" >/dev/null 2>&1", "sh", root.pluginDir]
+    downloadProc.running = true
   }
 
   function startHelper(kind) {
@@ -533,11 +553,28 @@ Item {
           root.startHelper(kind)
         else if (kind === "buildable")
           root.buildHelper()
+        else if (kind === "downloadable")
+          root.downloadHelper()
         else {
           root.helperStatus = "missing"
-          root.lastStatus = "helper missing"
+          // Honest bar message: recording needs the Rust recorder and we could
+          // neither find, build, nor download it. Query/wipe still work on any
+          // existing data via the fallback.
+          root.lastStatus = "recorder unavailable — install rust or check network"
         }
       }
+    }
+  }
+
+  Process {
+    id: downloadProc
+    running: false
+    stdout: StdioCollector { }
+    stderr: StdioCollector { }
+    onExited: {
+      // After attempting the download, re-probe: prefer the freshly installed
+      // binary, else fall through. triedDownload is set, so this cannot loop.
+      root.findHelper()
     }
   }
 

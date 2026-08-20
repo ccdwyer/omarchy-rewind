@@ -44,7 +44,8 @@ Item {
   // transient query responses derived from already-authorized data, never stored
   // observation. Serving them works while a privacy pause (e.g. the overlay's own
   // pause) is active, because reading already-recorded data is not a write of new
-  // content. Falls back to the data dir only if no runtime dir exists.
+  // content. If no runtime dir exists it FAILS CLOSED (returns "" — no channel),
+  // never falling back to a world-accessible /tmp or the persistent data dir.
   function snapDir() {
     try {
       var rt = Quickshell.env("XDG_RUNTIME_DIR")

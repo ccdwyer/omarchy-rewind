@@ -203,10 +203,20 @@ Conservative choices where the Omarchy / Quickshell / Hyprland API was not 100% 
   `armed`/`paused`; the chip changes only when the helper's authoritative `state`
   event arrives. So the dot never shows "disarmed" while recording is still on,
   and never after a failed disarm write (`send` failure leaves armed=true).
-- **Fresh-install recorder.** On first run, if `bin/rewindd` is absent but
-  `cargo` is present, the service builds it via `build.sh` (bar shows
-  "building recorder…") and starts the compiled binary; `triedBuild` prevents a
-  build loop. Recording works from a clean `omarchy plugin add … --enable`.
+- **Fresh-install recorder (3 tiers).** On first run the service provisions the
+  recorder without a required toolchain: (1) an existing executable `bin/rewindd`
+  is used as-is; (2) else if `cargo` is present it builds via `build.sh` (bar
+  shows "building recorder…"); (3) else if `curl`/`wget` + a sha256 tool are
+  present, `scripts/fetch-rewindd.sh` downloads the prebuilt `rewindd-<arch>`
+  from the plugin's GitHub Releases and **verifies its SHA-256** (against a
+  committed `checksums/rewindd-<arch>.sha256` when present, else the checksum
+  published in the same release) before installing — never an unverified binary.
+  `triedBuild`/`triedDownload` prevent loops; each tier re-probes. If all fail,
+  the bar says "recorder unavailable — install rust or check network" and
+  query/wipe still work. So recording works from a clean `omarchy plugin add …
+  --enable` on a machine with cargo *or* just network + curl. The release
+  binaries are built by `.github/workflows/release.yml` (x86_64/aarch64 musl +
+  sha256); this macOS authoring host does not produce or commit them.
 - **Fallback operates on the real SQLite store.** `compat/rewindd.sh`
   query/timeline/moment/clips/stats/copy-clip/wipe use python3's `sqlite3` module
   against `rewind.db` (never a legacy JSONL index). A wipe deletes the real

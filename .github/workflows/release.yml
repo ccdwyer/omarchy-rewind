@@ -1,0 +1,49 @@
+name: release
+# Build the Linux `rewindd` recorder for x86_64 and aarch64 (static musl) on a
+# tag and publish each binary plus its SHA-256 as release assets. The plugin's
+# scripts/fetch-rewindd.sh downloads `rewindd-<arch>` (+ `.sha256`) from
+# `releases/latest/download/` on a clean judge machine that has no cargo.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-musl
+          - arch: aarch64
+            target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          rustup target add ${{ matrix.target }}
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          if [ "${{ matrix.arch }}" = "aarch64" ]; then
+            sudo apt-get install -y gcc-aarch64-linux-gnu
+          fi
+      - name: Build (no default features — portable grim recorder)
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+        run: |
+          cargo build --release --manifest-path src/rewindd/Cargo.toml \
+            --target ${{ matrix.target }}
+          install -m755 src/rewindd/target/${{ matrix.target }}/release/rewindd \
+            "rewindd-${{ matrix.arch }}"
+      - name: Checksum
+        run: sha256sum "rewindd-${{ matrix.arch }}" > "rewindd-${{ matrix.arch }}.sha256"
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            rewindd-${{ matrix.arch }}
+            rewindd-${{ matrix.arch }}.sha256

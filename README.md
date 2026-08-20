@@ -12,7 +12,13 @@ Recording starts **disarmed**. The bar chip is the truth: if it says disarmed, r
 omarchy plugin add <git-url> --enable
 ```
 
-That is all for a normal Omarchy (Arch) machine: **on first run the service builds the recorder itself.** If `bin/rewindd` is absent and `cargo` is present (Arch ships Rust), the service runs `build.sh` in the background — the bar shows *"building recorder…"* — and starts the compiled `rewindd` when it finishes. So `omarchy plugin add … --enable`, then arm from the consent screen, and recording works.
+That is all: **the service provisions the recorder itself on first run**, in three tiers, so recording works on a clean machine with or without a Rust toolchain:
+
+1. **Bundled binary** — if `bin/rewindd` is already present and executable, it is used as-is.
+2. **Build** — else if `cargo` is present, the service runs `build.sh` in the background (the bar shows *"building recorder…"*) and starts the compiled `rewindd`.
+3. **Download** — else if a network tool (`curl`/`wget`) and a SHA-256 tool are present, `scripts/fetch-rewindd.sh` downloads the prebuilt `rewindd-<arch>` for this machine from the plugin's GitHub Releases and **verifies its SHA-256** before installing (against `checksums/rewindd-<arch>.sha256` committed in this clone when present, else the checksum published alongside the binary in the same release). It never installs an unverified binary.
+
+If all three fail, the bar says *"recorder unavailable — install rust or check network"* and the plugin still answers query/wipe/stats against your existing data via the non-recording fallback. So on a normal machine: `omarchy plugin add … --enable`, arm from the consent screen, and recording works — no toolchain required.
 
 You can also build it ahead of time:
 
@@ -20,7 +26,7 @@ You can also build it ahead of time:
 ~/.config/omarchy/plugins/io.github.chris.rewind/build.sh
 ```
 
-`build.sh` compiles `rewindd` (Rust). Missing Wayland headers usually still produce a **grim-only Rust helper**. The POSIX `compat/rewindd.sh` fallback is used only when `cargo` is unavailable or the build fails. That fallback **does not record** (it cannot honor the pause matrix), but it does answer query/wipe/stats **against the real SQLite store** (`rewind.db`) — so a wipe there actually deletes your data, it never reports a false success. Recording itself requires the Rust binary.
+`build.sh` compiles `rewindd` (Rust) — tier 2 above. Missing Wayland headers usually still produce a **grim-only Rust helper**. Tier 3 (`scripts/fetch-rewindd.sh`) downloads a verified prebuilt when there is no toolchain. The POSIX `compat/rewindd.sh` fallback is used only when the binary is absent and neither build nor download succeeds. That fallback **does not record** (it cannot honor the pause matrix), but it does answer query/wipe/stats **against the real SQLite store** (`rewind.db`) — so a wipe there actually deletes your data, it never reports a false success. Recording itself requires the Rust binary.
 
 Linux CI (`.github/workflows/linux-helper.yml`) builds the Wayland helper, runs tests, `ldd`, and `strace -e trace=network`, and uploads `rewindd-linux`. This macOS authoring host cannot produce that ELF; `scripts/network-audit.sh` exits 1 when `bin/rewindd` is missing rather than pretending the audit passed.
 
@@ -91,7 +97,7 @@ Default exclusions: KeePassXC, 1Password, Bitwarden, Seahorse, polkit agents.
 
 Planning estimate (not measured on this host): a 720p still of text-heavy UI is **~25–80 KB/frame**, not single-digit KB. Retention is a **byte cap** (default 2 GB) covering **all** retained observation data — frames, crops, clipboard, layouts, and the OCR/search index — not just frame bytes. When the cap is exceeded, the **oldest window across every table** (frames, clips, layouts, events, OCR) is pruned inside the same transaction, and its files are removed via durable deletion tombstones so an interrupted unlink can't leave an untracked screenshot behind.
 
-The bar and consent screen report **≈N days at your usage** once rewindd has measured this machine. Until then they show the planning band for 25–80 KB at a 10 s write average (dHash skip), not a promised calendar window.
+The bar and consent screen report **≈N days at your usage** once rewindd has measured this machine. Until then they show the planning band for 25–80 KB at a 10 s write average (dHash skip), not a promised calendar window. The real per-frame size and an 8 h CPU / GB-per-day soak are **not measured on this macOS authoring host** — they are produced on-device once you arm it (`rewindd stats`) and by the Linux CI soak; the numbers above are a planning estimate, never a measured claim.
 
 This plugin was authored on macOS without Hyprland or Quickshell. Hyprland/Quickshell runtime, a fresh-VM install, soak, and QML validation are **runtime-unverified on this host**. After you arm it, `rewindd stats` prints frames, bytes, and the encoder actually used. `scripts/network-audit.sh` prints `ldd` and, on Linux, runs `strace -e trace=network` through a capture cycle.
 

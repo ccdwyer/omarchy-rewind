@@ -205,6 +205,25 @@ test("plan: no client-side one-window fabrication (helper builds the command)", 
   assert.ok(planSrc.indexOf("win.exec || win.cmd") < 0)
 })
 
+test("compat: fallback wipe is durable (tombstones + residual, no false success)", () => {
+  // Blocker 4 (r18): the shell fallback wipe must record pending_unlink
+  // tombstones inside the delete transaction, sweep orphan frame/crop files,
+  // and report ok:false + residual when files remain — never a false "wiped".
+  const sh = fs.readFileSync(path.join(__dirname, "..", "compat", "rewindd.sh"), "utf8")
+  assert.ok(sh.indexOf("pending_unlink") >= 0, "records deletion tombstones")
+  assert.ok(sh.indexOf("residual") >= 0, "reports residual count")
+  assert.ok(/"ok"\s*:\s*ok|\\"ok\\"|json.dumps\(\{"wiped":n,"scope":scope,"ok":ok/.test(sh), "reports ok flag")
+})
+
+test("recorder: fetch-rewindd verifies sha256 before install and never installs unverified", () => {
+  // Blocker 1 (r18) tier 3: the download path must verify a checksum and refuse
+  // on mismatch/absence rather than install an unverified binary.
+  const fetch = fs.readFileSync(path.join(__dirname, "..", "scripts", "fetch-rewindd.sh"), "utf8")
+  assert.ok(fetch.indexOf("checksum mismatch") >= 0)
+  assert.ok(fetch.indexOf("refusing") >= 0 || fetch.indexOf("no expected checksum") >= 0)
+  assert.ok(/mv -f "\$BINTMP" "\$OUT\/rewindd"/.test(fetch), "installs only after verification")
+})
+
 test("query: gapReason maps lock vs gap spans", () => {
   const gaps = [{ from: 100, to: 200, reason: "lock" }, { from: 300, to: 400, reason: "gap" }]
   assert.strictEqual(Query.gapReason(150, gaps), "lock")

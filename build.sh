@@ -1,6 +1,9 @@
 #!/bin/sh
-# Build rewindd. The plugin QML degrades to compat/rewindd.sh when
-# bin/rewindd is missing, so a failed build is not fatal at runtime.
+# Build rewindd (tier 2 of the recorder bootstrap). If cargo is absent, the
+# service instead runs scripts/fetch-rewindd.sh (tier 3) to download a verified
+# prebuilt from GitHub Releases. The plugin QML degrades to compat/rewindd.sh
+# (non-recording) only when the binary is absent and neither build nor download
+# succeeds, so a failed build is not fatal at runtime.
 
 set -eu
 
