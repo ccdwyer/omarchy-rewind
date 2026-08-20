@@ -332,7 +332,7 @@ Item {
     return false
   }
 
-  function arm() {
+  function arm(arg) {
     if (!root.consent) {
       root.openConsent()
       return "consent"
@@ -348,7 +348,7 @@ Item {
     return "ok"
   }
 
-  function disarm() {
+  function disarm(arg) {
     // Do NOT optimistically flip armed/paused here, and do NOT return a status:
     // recording is still on until the helper acknowledges the disarm with its
     // authoritative `state` event (which sets armed=false and republishes
@@ -504,8 +504,8 @@ Item {
     return root.summonOverlay("{}")
   }
 
-  function ping() { return "ok" }
-  function status() { return JSON.stringify(root.statsObject()) }
+  function ping(arg) { return "ok" }
+  function status(arg) { return JSON.stringify(root.statsObject()) }
 
   function enqueueBindWork(command, done) {
     if (!command)

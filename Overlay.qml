@@ -821,7 +821,9 @@ Item {
         }
         Text {
           text: root.uiArmed
-                ? Pause.reasonLabel(root.uiPauseReason)
+                ? ((root.uiPauseReason && root.uiPauseReason !== "disarmed")
+                    ? Pause.reasonLabel(root.uiPauseReason)
+                    : "recording")
                 : (root.uiStatus && root.uiStatus.length ? root.uiStatus : "disarmed")
           color: root.foreground
           opacity: 0.7
