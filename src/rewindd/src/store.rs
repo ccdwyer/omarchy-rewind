@@ -115,6 +115,11 @@ impl Store {
         let _ = store.flush_unlinks();
         let _ = store.sweep_orphan_crops();
         let _ = store.sweep_orphan_frames();
+        // Checkpoint so the schema (especially `clips`) lives in the main
+        // file, not only WAL. Read-only opens use immutable=1 and cannot see
+        // WAL; without this, a helper restart while disarmed queries a main
+        // file that still lacks tables and surfaces `no such table: clips`.
+        let _ = store.checkpoint();
         Ok(store)
     }
 
@@ -127,10 +132,18 @@ impl Store {
             .map_err(|e| e.to_string())
     }
 
+    fn missing_table(err: &str) -> bool {
+        err.to_ascii_lowercase().contains("no such table")
+    }
+
     fn migrate(&self) -> Result<(), String> {
-        self.conn
-            .execute_batch(
-                r#"
+        // One transaction so a crash cannot leave `frames` without `clips`.
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        tx.execute_batch(
+            r#"
                 CREATE TABLE IF NOT EXISTS frames (
                     ts INTEGER PRIMARY KEY,
                     path TEXT NOT NULL,
@@ -191,8 +204,9 @@ impl Store {
                 CREATE INDEX IF NOT EXISTS idx_frames_app ON frames(app);
                 CREATE INDEX IF NOT EXISTS idx_ocr_boxes_ts ON ocr_boxes(ts);
                 "#,
-            )
-            .map_err(|e| e.to_string())?;
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
         // Account full-resolution OCR crops in the managed byte budget. The crop
         // is a separate on-disk file (crop_path) whose size is NOT the frame
         // thumbnail's `bytes`; without this, crops could grow unbounded while
@@ -340,11 +354,14 @@ impl Store {
             ] {
                 let sql = format!("DELETE FROM {table} WHERE ts>=?1 AND ts<=?2");
                 let res = tx.execute(&sql, params![ts, hi]);
-                if required {
-                    removed_here += res.map_err(|e| e.to_string())?;
-                } else {
-                    // ocr/search_fallback may not exist depending on FTS build.
-                    removed_here += res.unwrap_or(0);
+                match res {
+                    Ok(n) => removed_here += n,
+                    Err(e) if Self::missing_table(&e.to_string()) => {
+                        // Partial/legacy schema: skip this table rather than
+                        // aborting the capture that just created a frame.
+                    }
+                    Err(e) if required => return Err(e.to_string()),
+                    Err(_) => {}
                 }
             }
             // Guard against a pathological no-progress loop.
@@ -469,20 +486,18 @@ impl Store {
         let tx = self.conn.transaction().map_err(|e| e.to_string())?;
         tx.execute("DELETE FROM frames WHERE ts>=?1 AND ts<=?2", params![lo, hi])
             .map_err(|e| e.to_string())?;
-        tx.execute("DELETE FROM clips WHERE ts>=?1 AND ts<=?2", params![lo, hi])
-            .map_err(|e| e.to_string())?;
-        tx.execute(
+        for sql in [
+            "DELETE FROM clips WHERE ts>=?1 AND ts<=?2",
             "DELETE FROM layouts WHERE ts>=?1 AND ts<=?2",
-            params![lo, hi],
-        )
-        .map_err(|e| e.to_string())?;
-        tx.execute("DELETE FROM events WHERE ts>=?1 AND ts<=?2", params![lo, hi])
-            .map_err(|e| e.to_string())?;
-        tx.execute(
+            "DELETE FROM events WHERE ts>=?1 AND ts<=?2",
             "DELETE FROM ocr_boxes WHERE ts>=?1 AND ts<=?2",
-            params![lo, hi],
-        )
-        .map_err(|e| e.to_string())?;
+        ] {
+            if let Err(e) = tx.execute(sql, params![lo, hi]) {
+                if !Self::missing_table(&e.to_string()) {
+                    return Err(e.to_string());
+                }
+            }
+        }
         let _ = tx.execute("DELETE FROM ocr WHERE ts>=?1 AND ts<=?2", params![lo, hi]);
         let _ = tx.execute(
             "DELETE FROM search_fallback WHERE ts>=?1 AND ts<=?2",
@@ -1179,7 +1194,7 @@ impl Store {
     fn search_like(&self, q: &str, limit: usize, from: i64, to: i64) -> Result<Vec<Hit>, String> {
         let like = format!("%{}%", q.to_ascii_lowercase());
         let root = self.root.clone();
-        let sql = "SELECT f.ts, f.path, f.app, f.title,
+        let sql_with_clips = "SELECT f.ts, f.path, f.app, f.title,
                           COALESCE((
                               SELECT c.content FROM clips c
                               WHERE c.ts <= f.ts
@@ -1195,7 +1210,20 @@ impl Store {
                               ORDER BY c.ts DESC LIMIT 1
                           ), '')) LIKE ?1)
                    ORDER BY f.ts DESC LIMIT ?4";
-        let mut stmt = self.conn.prepare(sql).map_err(|e| e.to_string())?;
+        let sql_frames = "SELECT f.ts, f.path, f.app, f.title, ''
+                   FROM frames f
+                   WHERE (?2 = 0 OR f.ts >= ?2)
+                     AND (?3 = 0 OR f.ts <= ?3)
+                     AND (lower(f.title) LIKE ?1 OR lower(f.app) LIKE ?1)
+                   ORDER BY f.ts DESC LIMIT ?4";
+        let mut stmt = match self.conn.prepare(sql_with_clips) {
+            Ok(s) => s,
+            Err(e) if Self::missing_table(&e.to_string()) => self
+                .conn
+                .prepare(sql_frames)
+                .map_err(|e| e.to_string())?,
+            Err(e) => return Err(e.to_string()),
+        };
         let rows = stmt
             .query_map(params![like, from, to, limit as i64], |r| {
                 let title: String = r.get(3)?;
@@ -1219,10 +1247,14 @@ impl Store {
 
     fn boxes_for(&self, ts: i64, q: &str) -> Result<Vec<WordBox>, String> {
         let needle = q.to_ascii_lowercase();
-        let mut stmt = self
+        let mut stmt = match self
             .conn
             .prepare("SELECT word,x,y,w,h FROM ocr_boxes WHERE ts=?1")
-            .map_err(|e| e.to_string())?;
+        {
+            Ok(s) => s,
+            Err(e) if Self::missing_table(&e.to_string()) => return Ok(Vec::new()),
+            Err(e) => return Err(e.to_string()),
+        };
         let rows = stmt
             .query_map(params![ts], |r| {
                 Ok(WordBox {
@@ -1324,22 +1356,24 @@ impl Store {
             .unwrap_or_default();
         let layout = self.layout_at(ts).unwrap_or_default();
         let boxes: Vec<WordBox> = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT word,x,y,w,h FROM ocr_boxes WHERE ts=?1")
-                .map_err(|e| e.to_string())?;
-            let rows = stmt
-                .query_map(params![ts], |r| {
-                    Ok(WordBox {
-                        word: r.get(0)?,
-                        x: r.get(1)?,
-                        y: r.get(2)?,
-                        w: r.get(3)?,
-                        h: r.get(4)?,
-                    })
-                })
-                .map_err(|e| e.to_string())?;
-            rows.filter_map(|r| r.ok()).collect()
+            match self.conn.prepare("SELECT word,x,y,w,h FROM ocr_boxes WHERE ts=?1") {
+                Ok(mut stmt) => {
+                    let rows = stmt
+                        .query_map(params![ts], |r| {
+                            Ok(WordBox {
+                                word: r.get(0)?,
+                                x: r.get(1)?,
+                                y: r.get(2)?,
+                                w: r.get(3)?,
+                                h: r.get(4)?,
+                            })
+                        })
+                        .map_err(|e| e.to_string())?;
+                    rows.filter_map(|r| r.ok()).collect()
+                }
+                Err(e) if Self::missing_table(&e.to_string()) => Vec::new(),
+                Err(e) => return Err(e.to_string()),
+            }
         };
         Ok(json!({
             "frame": frame,
@@ -1350,6 +1384,21 @@ impl Store {
     }
 
     pub fn clips(&self, limit: usize) -> Result<Value, String> {
+        match self.clips_inner(limit) {
+            Ok(v) => Ok(v),
+            Err(e) if Self::missing_table(&e) => {
+                if self.writable {
+                    self.migrate()?;
+                    self.clips_inner(limit)
+                } else {
+                    Ok(json!({"clips": []}))
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn clips_inner(&self, limit: usize) -> Result<Value, String> {
         let limit = limit.clamp(1, 500);
         let mut stmt = self
             .conn
@@ -1375,6 +1424,21 @@ impl Store {
     }
 
     pub fn clip_at(&self, ts: i64) -> Result<String, String> {
+        match self.clip_at_inner(ts) {
+            Ok(s) => Ok(s),
+            Err(e) if Self::missing_table(&e) => {
+                if self.writable {
+                    self.migrate()?;
+                    self.clip_at_inner(ts)
+                } else {
+                    Ok(String::new())
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn clip_at_inner(&self, ts: i64) -> Result<String, String> {
         let exact: Option<String> = self
             .conn
             .query_row(
@@ -1399,7 +1463,7 @@ impl Store {
     }
 
     pub fn layout_at(&self, ts: i64) -> Result<Vec<Client>, String> {
-        let raw: Option<String> = self
+        let raw: Option<String> = match self
             .conn
             .query_row(
                 "SELECT json FROM layouts WHERE ts<=?1 ORDER BY ts DESC LIMIT 1",
@@ -1407,7 +1471,11 @@ impl Store {
                 |r| r.get(0),
             )
             .optional()
-            .map_err(|e| e.to_string())?;
+        {
+            Ok(v) => v,
+            Err(e) if Self::missing_table(&e.to_string()) => return Ok(Vec::new()),
+            Err(e) => return Err(e.to_string()),
+        };
         match raw {
             Some(s) => serde_json::from_str(&s).map_err(|e| e.to_string()),
             None => Ok(Vec::new()),
@@ -1498,7 +1566,7 @@ impl Store {
         let clips: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM clips", [], |r| r.get(0))
-            .map_err(|e| e.to_string())?;
+            .unwrap_or(0);
         Ok((frames, events, boxes, clips))
     }
 
@@ -2124,5 +2192,68 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM clips", [], |r| r.get(0))
             .unwrap();
         assert!(n > 0 && n < 50, "oldest clips pruned, newest kept (n={n})");
+    }
+
+    #[test]
+    fn frames_only_db_clips_query_is_empty_not_error() {
+        // A main file that has frames but not clips (WAL not checkpointed,
+        // crash mid-migrate, or a legacy db) must not fail the overlay's
+        // clips/moment refresh with `no such table: clips`.
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("rewind.db");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE frames (
+                    ts INTEGER PRIMARY KEY, path TEXT NOT NULL, app TEXT, title TEXT,
+                    workspace TEXT, output TEXT, width INTEGER, height INTEGER,
+                    out_w INTEGER, out_h INTEGER, crop_x INTEGER, crop_y INTEGER,
+                    crop_w INTEGER, crop_h INTEGER, bytes INTEGER, dhash INTEGER,
+                    encoder TEXT, crop_path TEXT
+                );
+                INSERT INTO frames (ts, path, app, title, workspace, output,
+                    width, height, out_w, out_h, crop_x, crop_y, crop_w, crop_h,
+                    bytes, dhash, encoder)
+                VALUES (1, 'frames/1.webp', 'kitty', 't', '1', 'eDP-1',
+                    100, 80, 100, 80, 0, 0, 100, 80, 10, 1, 'png');",
+            )
+            .unwrap();
+        }
+        let ro = Store::open_read_only(&db).unwrap();
+        let v = ro.clips(10).unwrap();
+        assert_eq!(v["clips"].as_array().unwrap().len(), 0);
+        assert_eq!(ro.clip_at(1).unwrap(), "");
+        let m = ro.moment(1).unwrap();
+        assert_eq!(m["clip"].as_str().unwrap(), "");
+    }
+
+    #[test]
+    fn writable_open_migrates_missing_clips_table() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("rewind.db");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE frames (
+                    ts INTEGER PRIMARY KEY, path TEXT NOT NULL, app TEXT, title TEXT,
+                    workspace TEXT, output TEXT, width INTEGER, height INTEGER,
+                    out_w INTEGER, out_h INTEGER, crop_x INTEGER, crop_y INTEGER,
+                    crop_w INTEGER, crop_h INTEGER, bytes INTEGER, dhash INTEGER,
+                    encoder TEXT, crop_path TEXT
+                );",
+            )
+            .unwrap();
+        }
+        let store = Store::open(&db).unwrap();
+        store.insert_clip(42, "text/plain", "hello").unwrap();
+        let v = store.clips(10).unwrap();
+        assert_eq!(v["clips"].as_array().unwrap().len(), 1);
+        assert_eq!(v["clips"][0]["content"], "hello");
+        drop(store);
+        // Schema must be in the main file, not only WAL, so a later
+        // immutable read-only open still sees clips.
+        let ro = Store::open_read_only(&db).unwrap();
+        let v = ro.clips(10).unwrap();
+        assert_eq!(v["clips"].as_array().unwrap().len(), 1);
     }
 }

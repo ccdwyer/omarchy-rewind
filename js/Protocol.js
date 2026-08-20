@@ -53,8 +53,21 @@ function mergeStats(target, ev) {
                 "consent", "version", "firstTs", "lastTs", "status", "fallback", "helper"]
     for (var i = 0; i < keys.length; i++) {
         var k = keys[i]
-        if (src[k] !== undefined)
+        if (src[k] === undefined)
+            continue
+        // QML Items throw on unknown property assign (`bytes` is `bytesUsed`
+        // on the service). Only write keys the target already has.
+        var known = false
+        try {
+            known = Object.prototype.hasOwnProperty.call(target, k) || (k in target)
+        } catch (e1) {
+            known = false
+        }
+        if (!known)
+            continue
+        try {
             target[k] = src[k]
+        } catch (e2) {}
     }
     return target
 }

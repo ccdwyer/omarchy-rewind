@@ -149,6 +149,15 @@ test("protocol: parses frame-written and replies", () => {
   assert.strictEqual(stats.armed, true)
 })
 
+test("protocol: mergeStats does not assign unknown keys like bytes onto a partial target", () => {
+  const target = { armed: false, frames: 0 }
+  Protocol.mergeStats(target, { bytes: 99, armed: true, frames: 3, reason: "overlay" })
+  assert.strictEqual(target.armed, true)
+  assert.strictEqual(target.frames, 3)
+  assert.strictEqual(target.bytes, undefined)
+  assert.strictEqual(target.reason, undefined)
+})
+
 test("protocol: command assigns ids", () => {
   const a = JSON.parse(Protocol.command("arm", { byteCapGb: 2 }))
   const b = JSON.parse(Protocol.command("query", { q: "hello" }))
@@ -509,6 +518,16 @@ test("compat configure with existing consent is memory-only", () => {
   assert.deepStrictEqual(fs.readdirSync(tmp).sort(), before)
 })
 
+test("service ignores missing-clips errors and maps stats bytes onto bytesUsed", () => {
+  const src = fs.readFileSync(path.join(ROOT, "Service.qml"), "utf8")
+  assert.ok(src.indexOf("no such table") >= 0)
+  assert.ok(src.indexOf("function recoverStatus()") >= 0)
+  assert.ok(src.indexOf("root.bytesUsed = Number(data.bytes)") >= 0)
+  assert.ok(/publish\(\)\s*\{\s*\n\s*if \(!root\.publishUi \|\| !root\.snapDir/.test(src))
+  const proto = fs.readFileSync(path.join(ROOT, "js", "Protocol.js"), "utf8")
+  assert.ok(proto.indexOf("hasOwnProperty") >= 0)
+})
+
 test("service gates snapshots on consent and serves the overlay while open", () => {
   const src = fs.readFileSync(path.join(ROOT, "Service.qml"), "utf8")
   // Publishing the UI read-response channel requires consent (a fresh,
@@ -516,7 +535,7 @@ test("service gates snapshots on consent and serves the overlay while open", () 
   // while the overlay is open — so the overlay is functional even though opening
   // it pauses capture (blocker r15/1).
   assert.ok(/publishUi:\s*root\.consent\s*&&\s*\(root\.armed\s*\|\|\s*root\.overlayOpen\)/.test(src))
-  assert.ok(/publish\(\)\s*\{\s*\n\s*if \(!root\.publishUi\)/.test(src))
+  assert.ok(/publish\(\)\s*\{\s*\n\s*if \(!root\.publishUi/.test(src))
   // The read-response channel lives in the ephemeral tmpfs snapDir, not the
   // persistent data dir.
   assert.ok(/snapDir\s*\+\s*"\/timeline\.json"/.test(src))

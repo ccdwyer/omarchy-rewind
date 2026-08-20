@@ -155,11 +155,14 @@ Item {
     if (ev.event === "reply") {
       Protocol.mergeStats(root, ev.data || {})
       root.ingestReply(ev)
+      root.recoverStatus()
       root.bumpStats()
       return
     }
     if (ev.event === "stats" || ev.event === "state") {
       Protocol.mergeStats(root, ev)
+      var payload = ev.data && typeof ev.data === "object" ? ev.data : ev
+      root.ingestReply({ data: payload })
       root.paused = ev.paused === true || (ev.reason && ev.reason !== "" && ev.reason !== "disarmed" && !ev.armed)
       if (ev.reason !== undefined)
         root.pauseReason = ev.reason || (root.armed ? "" : "disarmed")
@@ -167,6 +170,7 @@ Item {
         root.armed = ev.armed === true
       if (ev.consent !== undefined)
         root.consent = ev.consent === true
+      root.recoverStatus()
       root.bumpStats()
       return
     }
@@ -184,8 +188,21 @@ Item {
       root.lastStatus = "ocr " + (ev.done || 0) + "/" + (ev.queued || 0)
       return
     }
-    if (ev.event === "error")
-      root.lastStatus = ev.error || "error"
+    if (ev.event === "error") {
+      var err = String(ev.error || "error")
+      // A partial schema (WAL not yet in the main file, or a frames-only
+      // legacy db) must not hijack the overlay header. The helper now
+      // treats a missing `clips` table as empty; ignore a leftover error.
+      if (err.indexOf("no such table") >= 0)
+        return
+      root.lastStatus = err
+    }
+  }
+
+  function recoverStatus() {
+    var s = String(root.lastStatus || "")
+    if (s.indexOf("no such table") >= 0 || s === "starting" || s === "daemon" || s === "fallback" || s === "stdin-failed")
+      root.lastStatus = "ready"
   }
 
   function ingestReply(ev) {
@@ -266,7 +283,7 @@ Item {
   }
 
   function publish() {
-    if (!root.publishUi)
+    if (!root.publishUi || !root.snapDir || !root.snapDir.length)
       return
     uiSnap.setText(JSON.stringify(root.statsObject()) + "\n")
     timelineSnap.setText(JSON.stringify({
