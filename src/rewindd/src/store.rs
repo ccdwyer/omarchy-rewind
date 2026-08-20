@@ -224,6 +224,83 @@ impl Store {
         Ok(())
     }
 
+    pub fn nearest_frame_ts(&self, ts: i64) -> Option<i64> {
+        let before: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT ts FROM frames WHERE ts <= ?1 ORDER BY ts DESC LIMIT 1",
+                params![ts],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        if before.is_some() {
+            return before;
+        }
+        self.conn
+            .query_row(
+                "SELECT ts FROM frames WHERE ts >= ?1 ORDER BY ts ASC LIMIT 1",
+                params![ts],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    fn frame_meta(&self, ts: i64) -> Option<(String, String, String)> {
+        self.conn
+            .query_row(
+                "SELECT path, app, title FROM frames WHERE ts=?1",
+                params![ts],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    fn read_search_row(&self, ts: i64) -> (String, String, String) {
+        let from_fts: Option<(String, String, String)> = self
+            .conn
+            .query_row(
+                "SELECT text, app, title FROM ocr WHERE ts=?1",
+                params![ts],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        if let Some(row) = from_fts {
+            return row;
+        }
+        let from_fb: Option<(String, String, String)> = self
+            .conn
+            .query_row(
+                "SELECT text, app, title FROM search_fallback WHERE ts=?1",
+                params![ts],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        if let Some(row) = from_fb {
+            return row;
+        }
+        if let Some((_, app, title)) = self.frame_meta(ts) {
+            return (String::new(), app, title);
+        }
+        (String::new(), String::new(), String::new())
+    }
+
+    /// Index clipboard text onto the nearest frame so OCR-free search hits a screenshot.
+    pub fn record_clip_search(&self, clip_ts: i64, content: &str) -> Result<(), String> {
+        let frame_ts = self.nearest_frame_ts(clip_ts).unwrap_or(clip_ts);
+        let (text, app, title) = self.read_search_row(frame_ts);
+        self.index_search_row(frame_ts, &text, &app, &title, content)
+    }
+
     pub fn insert_layout(&self, ts: i64, clients: &[Client]) -> Result<(), String> {
         let body = serde_json::to_string(clients).map_err(|e| e.to_string())?;
         self.conn
@@ -349,6 +426,8 @@ impl Store {
             Ok(h) => h,
             Err(_) => self.search_like(q, limit, from, to)?,
         };
+        let clip_hits = self.search_clips(q, limit, from, to).unwrap_or_default();
+        merge_hits(&mut hits, clip_hits, limit);
         for hit in &mut hits {
             hit.boxes = self.boxes_for(hit.ts, q)?;
         }
@@ -365,21 +444,33 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT o.ts, f.path, f.app, f.title, snippet(ocr, 1, '[', ']', '…', 12)
+                "SELECT COALESCE(f.ts, nf.ts, o.ts),
+                        COALESCE(f.path, nf.path, ''),
+                        COALESCE(f.app, nf.app, o.app),
+                        COALESCE(f.title, nf.title, o.title),
+                        snippet(ocr, 1, '[', ']', '…', 12)
                  FROM ocr o
-                 JOIN frames f ON f.ts = o.ts
+                 LEFT JOIN frames f ON f.ts = o.ts
+                 LEFT JOIN frames nf ON nf.ts = (
+                     SELECT ts FROM frames WHERE ts <= o.ts ORDER BY ts DESC LIMIT 1
+                 )
                  WHERE ocr MATCH ?1
-                   AND (?2 = 0 OR o.ts >= ?2)
-                   AND (?3 = 0 OR o.ts <= ?3)
-                 ORDER BY o.ts DESC
+                   AND (?2 = 0 OR COALESCE(f.ts, nf.ts, o.ts) >= ?2)
+                   AND (?3 = 0 OR COALESCE(f.ts, nf.ts, o.ts) <= ?3)
+                 ORDER BY COALESCE(f.ts, nf.ts, o.ts) DESC
                  LIMIT ?4",
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map(params![fts, from, to, limit as i64], |r| {
+                let rel: String = r.get(1)?;
                 Ok(Hit {
                     ts: r.get(0)?,
-                    path: root.join(r.get::<_, String>(1)?).display().to_string(),
+                    path: if rel.is_empty() {
+                        String::new()
+                    } else {
+                        root.join(rel).display().to_string()
+                    },
                     app: r.get(2)?,
                     title: r.get(3)?,
                     snippet: r.get(4)?,
@@ -398,13 +489,20 @@ impl Store {
         let like = format!("%{}%", q.to_ascii_lowercase());
         let root = self.root.clone();
         let sql = "SELECT f.ts, f.path, f.app, f.title,
-                          COALESCE(c.content,'')
+                          COALESCE((
+                              SELECT c.content FROM clips c
+                              WHERE c.ts <= f.ts
+                              ORDER BY c.ts DESC LIMIT 1
+                          ), '')
                    FROM frames f
-                   LEFT JOIN clips c ON c.ts = f.ts
                    WHERE (?2 = 0 OR f.ts >= ?2)
                      AND (?3 = 0 OR f.ts <= ?3)
                      AND (lower(f.title) LIKE ?1 OR lower(f.app) LIKE ?1
-                          OR lower(COALESCE(c.content,'')) LIKE ?1)
+                          OR lower(COALESCE((
+                              SELECT c.content FROM clips c
+                              WHERE c.ts <= f.ts
+                              ORDER BY c.ts DESC LIMIT 1
+                          ), '')) LIKE ?1)
                    ORDER BY f.ts DESC LIMIT ?4";
         let mut stmt = self.conn.prepare(sql).map_err(|e| e.to_string())?;
         let rows = stmt
@@ -723,6 +821,63 @@ impl Store {
         }
         Ok(())
     }
+
+    fn search_clips(
+        &self,
+        q: &str,
+        limit: usize,
+        from: i64,
+        to: i64,
+    ) -> Result<Vec<Hit>, String> {
+        let like = format!("%{}%", q.to_ascii_lowercase());
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT ts, content FROM clips
+                 WHERE lower(content) LIKE ?1
+                   AND (?2 = 0 OR ts >= ?2)
+                   AND (?3 = 0 OR ts <= ?3)
+                 ORDER BY ts DESC LIMIT ?4",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![like, from, to, limit as i64], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut hits = Vec::new();
+        for row in rows {
+            let (clip_ts, content) = row.map_err(|e| e.to_string())?;
+            let frame_ts = self.nearest_frame_ts(clip_ts).unwrap_or(clip_ts);
+            let (path, app, title) = match self.frame_meta(frame_ts) {
+                Some((p, a, t)) => (self.root.join(p).display().to_string(), a, t),
+                None => (String::new(), String::new(), String::new()),
+            };
+            hits.push(Hit {
+                ts: frame_ts,
+                path,
+                app,
+                title,
+                snippet: query::snippet_around(&content, q),
+                boxes: vec![],
+            });
+        }
+        Ok(hits)
+    }
+}
+
+fn merge_hits(into: &mut Vec<Hit>, extra: Vec<Hit>, limit: usize) {
+    for hit in extra {
+        if into.iter().any(|h| h.ts == hit.ts && h.snippet == hit.snippet) {
+            continue;
+        }
+        if into.iter().any(|h| h.ts == hit.ts) {
+            continue;
+        }
+        into.push(hit);
+    }
+    into.sort_by(|a, b| b.ts.cmp(&a.ts));
+    into.truncate(limit);
 }
 
 fn infer_gaps(frames: &[Value]) -> Vec<Value> {
@@ -796,6 +951,34 @@ mod tests {
         assert_eq!(a["hits"].as_array().unwrap().len(), 1);
         let b = store.search("git-hash-ff00aa", 10, 0, 0).unwrap();
         assert_eq!(b["hits"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn clipboard_event_search_joins_nearest_frame_without_ocr() {
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("rewind.db")).unwrap();
+        store.insert_frame(&sample(100, 10, "editor")).unwrap();
+        store
+            .index_search_row(100, "", "kitty", "editor", "")
+            .unwrap();
+        store
+            .insert_clip(150, "text/plain", "orphan-clip-token-zz")
+            .unwrap();
+        store
+            .record_clip_search(150, "orphan-clip-token-zz")
+            .unwrap();
+        let hits = store.search("orphan-clip-token-zz", 10, 0, 0).unwrap();
+        let arr = hits["hits"].as_array().expect("hits array");
+        assert_eq!(arr.len(), 1, "{hits}");
+        assert_eq!(arr[0]["ts"], 100);
+        assert!(
+            arr[0]["path"]
+                .as_str()
+                .unwrap_or("")
+                .contains("100"),
+            "path should be the nearest frame: {}",
+            arr[0]["path"]
+        );
     }
 
     #[test]

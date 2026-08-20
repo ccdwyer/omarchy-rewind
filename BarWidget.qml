@@ -142,6 +142,8 @@ BarWidget {
   Component.onCompleted: root.pushSettings()
   onByteCapGbChanged: root.pushSettings()
   onCadenceMsChanged: root.pushSettings()
+  onIdlePauseSecChanged: root.pushSettings()
   onExcludeAppsChanged: root.pushSettings()
+  onTitlePausePatternsChanged: root.pushSettings()
   onArmOnLoginChanged: root.pushSettings()
 }

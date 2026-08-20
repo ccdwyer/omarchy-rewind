@@ -1,5 +1,6 @@
 //! Persistent wlr-screencopy session. Compiled only with `--features wayland`.
-//! Isolated so a protocol mismatch cannot take down the grim fallback.
+//! The Wayland connection, registry, manager, outputs, event queue, and
+//! reusable shm pool/buffer stay alive across capture ticks.
 
 #![allow(dead_code)]
 
@@ -32,6 +33,7 @@ struct State {
     height: i32,
     stride: i32,
     format: u32,
+    buffer_event: bool,
     ready: bool,
     failed: bool,
 }
@@ -47,72 +49,157 @@ impl Default for State {
             height: 0,
             stride: 0,
             format: 0,
+            buffer_event: false,
             ready: false,
             failed: false,
         }
     }
 }
 
-pub fn grab(output: &str) -> Result<RawFrame, String> {
-    let conn = Connection::connect_to_env().map_err(|e| e.to_string())?;
-    let display = conn.display();
-    let mut event_queue: EventQueue<State> = conn.new_event_queue();
-    let qh = event_queue.handle();
-    let _registry = display.get_registry(&qh, ());
-    let mut state = State {
-        want_output: output.to_string(),
-        ..State::default()
-    };
-    event_queue
-        .roundtrip(&mut state)
-        .map_err(|e| e.to_string())?;
-    let manager = state
-        .manager
-        .clone()
-        .ok_or_else(|| "zwlr_screencopy_manager_v1 missing".to_string())?;
-    let shm = state
-        .shm
-        .clone()
-        .ok_or_else(|| "wl_shm missing".to_string())?;
-    let output_obj = pick_output(&state).ok_or_else(|| "no matching wl_output".to_string())?;
-    let frame = manager.capture_output(0, &output_obj, &qh, ());
-    while !state.ready && !state.failed && state.width == 0 {
+/// Long-lived screencopy session. Construct once; call [`Session::grab`] each tick.
+pub struct Session {
+    _conn: Connection,
+    event_queue: EventQueue<State>,
+    state: State,
+    _registry: wl_registry::WlRegistry,
+    shm_file: Option<File>,
+    pool: Option<WlShmPool>,
+    buffer: Option<WlBuffer>,
+    buf_w: i32,
+    buf_h: i32,
+    buf_stride: i32,
+}
+
+impl Session {
+    pub fn connect() -> Result<Self, String> {
+        let conn = Connection::connect_to_env().map_err(|e| e.to_string())?;
+        let display = conn.display();
+        let mut event_queue: EventQueue<State> = conn.new_event_queue();
+        let qh = event_queue.handle();
+        let registry = display.get_registry(&qh, ());
+        let mut state = State::default();
         event_queue
-            .blocking_dispatch(&mut state)
+            .roundtrip(&mut state)
             .map_err(|e| e.to_string())?;
-    }
-    if state.failed || state.width <= 0 {
-        return Err("screencopy frame failed".into());
-    }
-    let (fd, _file) = shm_file((state.stride * state.height) as i64)?;
-    let pool = shm.create_pool(fd.as_fd(), state.stride * state.height, &qh, ());
-    let buffer = pool.create_buffer(
-        0,
-        state.width,
-        state.height,
-        state.stride,
-        wl_shm::Format::Argb8888,
-        &qh,
-        (),
-    );
-    frame.copy(&buffer);
-    while !state.ready && !state.failed {
         event_queue
-            .blocking_dispatch(&mut state)
+            .roundtrip(&mut state)
             .map_err(|e| e.to_string())?;
+        if state.manager.is_none() {
+            return Err("zwlr_screencopy_manager_v1 missing".into());
+        }
+        if state.shm.is_none() {
+            return Err("wl_shm missing".into());
+        }
+        Ok(Self {
+            _conn: conn,
+            event_queue,
+            state,
+            _registry: registry,
+            shm_file: None,
+            pool: None,
+            buffer: None,
+            buf_w: 0,
+            buf_h: 0,
+            buf_stride: 0,
+        })
     }
-    if state.failed {
-        return Err("screencopy copy failed".into());
+
+    pub fn grab(&mut self, output: &str) -> Result<RawFrame, String> {
+        self.state.want_output = output.to_string();
+        self.state.buffer_event = false;
+        self.state.ready = false;
+        self.state.failed = false;
+
+        let manager = self
+            .state
+            .manager
+            .clone()
+            .ok_or_else(|| "zwlr_screencopy_manager_v1 missing".to_string())?;
+        let output_obj =
+            pick_output(&self.state).ok_or_else(|| "no matching wl_output".to_string())?;
+        let qh = self.event_queue.handle();
+        let frame = manager.capture_output(0, &output_obj, &qh, ());
+
+        while !self.state.buffer_event && !self.state.failed {
+            self.event_queue
+                .blocking_dispatch(&mut self.state)
+                .map_err(|e| e.to_string())?;
+        }
+        if self.state.failed || self.state.width <= 0 {
+            return Err("screencopy frame failed".into());
+        }
+
+        self.ensure_buffer()?;
+        let buffer = self
+            .buffer
+            .as_ref()
+            .ok_or_else(|| "shm buffer missing".to_string())?;
+        frame.copy(buffer);
+        while !self.state.ready && !self.state.failed {
+            self.event_queue
+                .blocking_dispatch(&mut self.state)
+                .map_err(|e| e.to_string())?;
+        }
+        if self.state.failed {
+            return Err("screencopy copy failed".into());
+        }
+        let file = self
+            .shm_file
+            .as_ref()
+            .ok_or_else(|| "shm file missing".to_string())?;
+        let rgba = read_shm(
+            file,
+            self.state.width as u32,
+            self.state.height as u32,
+            self.state.stride as u32,
+        )?;
+        Ok(RawFrame {
+            rgba,
+            width: self.state.width as u32,
+            height: self.state.height as u32,
+        })
     }
-    let rgba = read_shm(&_file, state.width as u32, state.height as u32, state.stride as u32)?;
-    drop(buffer);
-    drop(pool);
-    drop(frame);
-    Ok(RawFrame {
-        rgba,
-        width: state.width as u32,
-        height: state.height as u32,
-    })
+
+    fn ensure_buffer(&mut self) -> Result<(), String> {
+        let w = self.state.width;
+        let h = self.state.height;
+        let stride = self.state.stride;
+        if self.buffer.is_some()
+            && self.buf_w == w
+            && self.buf_h == h
+            && self.buf_stride == stride
+        {
+            return Ok(());
+        }
+        self.buffer = None;
+        self.pool = None;
+        self.shm_file = None;
+
+        let (fd, file) = shm_file((stride * h) as i64)?;
+        let qh = self.event_queue.handle();
+        let shm = self
+            .state
+            .shm
+            .clone()
+            .ok_or_else(|| "wl_shm missing".to_string())?;
+        let pool = shm.create_pool(fd.as_fd(), stride * h, &qh, ());
+        let buffer = pool.create_buffer(
+            0,
+            w,
+            h,
+            stride,
+            wl_shm::Format::Argb8888,
+            &qh,
+            (),
+        );
+        self.pool = Some(pool);
+        self.buffer = Some(buffer);
+        self.shm_file = Some(file);
+        self.buf_w = w;
+        self.buf_h = h;
+        self.buf_stride = stride;
+        Ok(())
+    }
 }
 
 fn pick_output(state: &State) -> Option<WlOutput> {
@@ -181,7 +268,6 @@ fn read_shm(file: &File, width: u32, height: u32, stride: u32) -> Result<Vec<u8>
             if i + 3 >= mmap.len() {
                 continue;
             }
-            // wl_shm Argb8888 is actually x8r8g8b8 in little endian: B,G,R,A
             let b = mmap[i];
             let g = mmap[i + 1];
             let r = mmap[i + 2];
@@ -216,8 +302,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                     state.shm = Some(registry.bind::<WlShm, _, _>(name, version.min(1), qh, ()));
                 }
                 "wl_output" => {
-                    let output =
-                        registry.bind::<WlOutput, _, _>(name, version.min(4), qh, name);
+                    let output = registry.bind::<WlOutput, _, _>(name, version.min(4), qh, name);
                     state.outputs.push((name, output, String::new()));
                 }
                 "zwlr_screencopy_manager_v1" => {
@@ -295,6 +380,7 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
                 state.width = width as i32;
                 state.height = height as i32;
                 state.stride = stride as i32;
+                state.buffer_event = true;
             }
             zwlr_screencopy_frame_v1::Event::Ready { .. } => state.ready = true,
             zwlr_screencopy_frame_v1::Event::Failed => state.failed = true,
@@ -327,7 +413,6 @@ impl Dispatch<WlBuffer, ()> for State {
     }
 }
 
-// Silence unused import on some sctk versions.
 #[allow(dead_code)]
 fn _raw_fd(file: &File) -> i32 {
     file.as_raw_fd()

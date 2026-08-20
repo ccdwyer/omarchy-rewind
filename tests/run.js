@@ -158,6 +158,22 @@ test("query: snippet around needle", () => {
   assert.ok(s.indexOf("abcdef123") >= 0)
 })
 
+test("query: fittedRect letterboxes PreserveAspectFit", () => {
+  const r = Query.fittedRect(200, 100, 100, 100)
+  assert.strictEqual(r.w, 100)
+  assert.strictEqual(r.h, 100)
+  assert.strictEqual(r.x, 50)
+  assert.strictEqual(r.y, 0)
+})
+
+test("protocol: consent payload is one JSON object", () => {
+  const line = Protocol.command("consent", { armNow: true, armOnLogin: false })
+  const body = JSON.parse(line)
+  assert.strictEqual(body.cmd, "consent")
+  assert.strictEqual(body.armNow, true)
+  assert.strictEqual(body.armOnLogin, false)
+})
+
 test("plan: browsers are unrecoverable tabs", () => {
   assert.strictEqual(Plan.isBrowser("firefox"), true)
   assert.strictEqual(Plan.isBrowser("kitty"), false)
@@ -200,6 +216,14 @@ test("compat helper exists and is executable after chmod", () => {
   assert.ok(String(r.stdout).indexOf("self-test ok") >= 0)
 })
 
+test("IpcHandler exposes JSON-arg methods", () => {
+  const src = fs.readFileSync(path.join(ROOT, "Service.qml"), "utf8")
+  for (const name of ["consentNow", "copyClip", "executePlan", "wipe", "reopenPlan", "query"]) {
+    assert.ok(src.indexOf("function " + name + "(arg: string)") >= 0
+      || src.indexOf("function " + name + "(q: string)") >= 0, name)
+  }
+})
+
 test("compat query over index jsonl", () => {
   const tmp = fs.mkdtempSync(path.join(require("os").tmpdir(), "rewind-"))
   process.env.REWIND_DATA_DIR = tmp
@@ -215,6 +239,49 @@ test("compat query over index jsonl", () => {
   assert.strictEqual(r.status, 0, r.stderr + r.stdout)
   const body = JSON.parse(r.stdout)
   assert.ok(body.hits && body.hits.length >= 1)
+})
+
+test("compat does not record on arm", () => {
+  const os = require("os")
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "rewind-norecord-"))
+  const env = Object.assign({}, process.env, { REWIND_DATA_DIR: tmp })
+  const p = path.join(ROOT, "compat", "rewindd.sh")
+  fs.chmodSync(p, 0o755)
+  const r = spawnSync(p, ["daemon"], {
+    encoding: "utf8",
+    env,
+    input: '{"cmd":"arm","id":1}\n{"cmd":"shutdown","id":2}\n'
+  })
+  assert.strictEqual(r.status, 0, r.stderr + r.stdout)
+  const framesDir = path.join(tmp, "frames")
+  const files = fs.existsSync(framesDir) ? fs.readdirSync(framesDir) : []
+  assert.strictEqual(files.length, 0)
+  assert.ok(r.stdout.indexOf("does not record") >= 0 || r.stdout.indexOf("compat-norecord") >= 0)
+})
+
+test("compat wipe rewrites index instead of leaving stale rows", () => {
+  const os = require("os")
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "rewind-wipe-"))
+  fs.mkdirSync(path.join(tmp, "frames"), { recursive: true })
+  const gone = path.join(tmp, "frames", "1.png")
+  const stay = path.join(tmp, "frames", "2.png")
+  fs.writeFileSync(gone, "a")
+  fs.writeFileSync(stay, "b")
+  fs.writeFileSync(
+    path.join(tmp, "index.jsonl"),
+    JSON.stringify({ ts: 1, path: gone }) + "\n" + JSON.stringify({ ts: 2, path: stay }) + "\n"
+  )
+  fs.writeFileSync(path.join(tmp, "clips.jsonl"), JSON.stringify({ ts: 1, content: "old" }) + "\n")
+  const env = Object.assign({}, process.env, { REWIND_DATA_DIR: tmp })
+  const p = path.join(ROOT, "compat", "rewindd.sh")
+  const r = spawnSync(p, ["wipe", "all"], { encoding: "utf8", env })
+  assert.strictEqual(r.status, 0, r.stderr + r.stdout)
+  const idx = fs.readFileSync(path.join(tmp, "index.jsonl"), "utf8").trim()
+  assert.strictEqual(idx, "")
+  const clips = fs.readFileSync(path.join(tmp, "clips.jsonl"), "utf8").trim()
+  assert.strictEqual(clips, "")
+  assert.ok(!fs.existsSync(gone))
+  assert.ok(!fs.existsSync(stay))
 })
 
 const rust = spawnSync("cargo", ["test", "--manifest-path", path.join(ROOT, "src/rewindd/Cargo.toml"), "--offline"], {

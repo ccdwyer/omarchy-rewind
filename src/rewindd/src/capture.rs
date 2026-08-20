@@ -24,17 +24,85 @@ pub fn backend_name() -> &'static str {
     }
 }
 
-pub fn grab_focused(output: &str) -> Result<RawFrame, String> {
+/// Cadence for the next tick. Unchanged dHash backs off to 10s as specified.
+pub fn next_cadence_ms(base_ms: u64, last_unchanged: bool) -> u64 {
+    if last_unchanged {
+        10_000
+    } else {
+        base_ms.clamp(250, 60_000)
+    }
+}
+
+/// Persistent capture source. Holds the wlr-screencopy session across ticks.
+pub struct CaptureSession {
     #[cfg(feature = "wayland")]
-    {
-        match capture_wlr::grab(output) {
-            Ok(frame) => return Ok(frame),
-            Err(err) => {
-                eprintln!("rewindd: wlr-screencopy failed ({err}); falling back to grim");
-            }
+    wlr: Option<capture_wlr::Session>,
+    grim_only: bool,
+}
+
+impl Default for CaptureSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CaptureSession {
+    pub fn new() -> Self {
+        Self {
+            #[cfg(feature = "wayland")]
+            wlr: None,
+            grim_only: false,
         }
     }
-    grab_grim(output)
+
+    pub fn using_grim(&self) -> bool {
+        if self.grim_only {
+            return true;
+        }
+        #[cfg(feature = "wayland")]
+        {
+            return self.wlr.is_none();
+        }
+        #[cfg(not(feature = "wayland"))]
+        {
+            true
+        }
+    }
+
+    pub fn grab(&mut self, output: &str) -> Result<RawFrame, String> {
+        #[cfg(feature = "wayland")]
+        {
+            if !self.grim_only {
+                if self.wlr.is_none() {
+                    match capture_wlr::Session::connect() {
+                        Ok(sess) => self.wlr = Some(sess),
+                        Err(err) => {
+                            eprintln!(
+                                "rewindd: wlr-screencopy connect failed ({err}); grim fallback"
+                            );
+                            self.grim_only = true;
+                        }
+                    }
+                }
+                if let Some(sess) = self.wlr.as_mut() {
+                    match sess.grab(output) {
+                        Ok(frame) => return Ok(frame),
+                        Err(err) => {
+                            eprintln!(
+                                "rewindd: wlr-screencopy grab failed ({err}); grim this tick"
+                            );
+                            self.wlr = None;
+                        }
+                    }
+                }
+            }
+        }
+        grab_grim(output)
+    }
+}
+
+pub fn grab_focused(output: &str) -> Result<RawFrame, String> {
+    CaptureSession::new().grab(output)
 }
 
 fn grab_grim(output: &str) -> Result<RawFrame, String> {
@@ -97,5 +165,12 @@ mod tests {
     fn backend_is_named() {
         let name = backend_name();
         assert!(name == "grim" || name == "missing" || name == "wlr-screencopy");
+    }
+
+    #[test]
+    fn unchanged_cadence_backs_off_to_10s() {
+        assert_eq!(next_cadence_ms(3000, true), 10_000);
+        assert_eq!(next_cadence_ms(3000, false), 3000);
+        assert_eq!(next_cadence_ms(5000, false), 5000);
     }
 }

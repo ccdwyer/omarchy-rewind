@@ -6,3 +6,8 @@
 .DS_Store
 .grok_impl.log
 .impl_prompt.md
+.fix_prompt*
+.gpt_review*
+.review*
+.round*
+.serena/

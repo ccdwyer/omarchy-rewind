@@ -52,6 +52,7 @@ Item {
   property int timelineRevision: 0
   property int clipsRevision: 0
   property int momentRevision: 0
+  property int hitsRevision: 0
 
   property double byteCapGb: 2
   property int cadenceMs: 3000
@@ -185,8 +186,9 @@ Item {
       root.paused = data.paused === true
     if (data.reason !== undefined)
       root.pauseReason = data.reason || ""
-    if (data.hits) {
+    if (data.hits !== undefined) {
       root.hits = data.hits
+      root.hitsRevision += 1
     }
     if (data.frames && data.frames.length !== undefined && typeof data.frames !== "number" && data.frames[0] !== undefined && data.frames[0].ts !== undefined) {
       root.timeline = data.frames
@@ -258,10 +260,36 @@ Item {
     return root.arm()
   }
 
-  function consentNow(armNow, onLogin) {
-    send("consent", { armNow: !!armNow, armOnLogin: !!onLogin })
+  function parseJsonArg(arg, fallback) {
+    if (arg === undefined || arg === null || arg === "")
+      return fallback
+    if (typeof arg === "object")
+      return arg
+    var s = String(arg)
+    try {
+      return JSON.parse(s)
+    } catch (e) {
+      return s
+    }
+  }
+
+  function consentNow(arg) {
+    var armNow = false
+    var onLogin = false
+    var parsed = root.parseJsonArg(arg, {})
+    if (typeof parsed === "boolean")
+      armNow = parsed
+    else if (typeof parsed === "number")
+      armNow = parsed !== 0
+    else if (typeof parsed === "string")
+      armNow = parsed === "true" || parsed === "1"
+    else if (parsed && typeof parsed === "object") {
+      armNow = !!(parsed.armNow || parsed.arm_now)
+      onLogin = !!(parsed.armOnLogin || parsed.arm_on_login)
+    }
+    send("consent", { armNow: armNow, armOnLogin: onLogin })
     root.consent = true
-    root.armOnLogin = !!onLogin
+    root.armOnLogin = onLogin
     if (armNow) {
       root.armed = true
       root.pauseReason = ""
@@ -296,18 +324,43 @@ Item {
     send("reopen-plan", { ts: Number(ts) || 0 })
   }
 
-  function executePlan(plan) {
-    send("reopen-exec", { plan: plan || root.currentPlan || {} })
+  function executePlan(arg) {
+    var plan = root.currentPlan || {}
+    if (arg !== undefined && arg !== null && arg !== "") {
+      var parsed = root.parseJsonArg(arg, null)
+      if (parsed && typeof parsed === "object")
+        plan = parsed.plan || parsed
+    }
+    send("reopen-exec", { plan: plan })
     return "ok"
   }
 
-  function copyClip(ts) {
-    send("copy-clip", { ts: Number(ts) || 0 })
+  function copyClip(arg) {
+    var ts = 0
+    var parsed = root.parseJsonArg(arg, arg)
+    if (typeof parsed === "number")
+      ts = parsed
+    else if (typeof parsed === "string")
+      ts = Number(parsed) || 0
+    else if (parsed && typeof parsed === "object" && parsed.ts !== undefined)
+      ts = Number(parsed.ts) || 0
+    send("copy-clip", { ts: ts })
     return "ok"
   }
 
-  function wipe(scope, from, to) {
-    send("wipe", { scope: scope || "today", from: Number(from) || 0, to: Number(to) || 0 })
+  function wipe(arg, from, to) {
+    var scope = "today"
+    var lo = Number(from) || 0
+    var hi = Number(to) || 0
+    var parsed = root.parseJsonArg(arg, arg)
+    if (parsed && typeof parsed === "object" && from === undefined) {
+      scope = parsed.scope || "today"
+      lo = Number(parsed.from) || 0
+      hi = Number(parsed.to) || 0
+    } else if (typeof parsed === "string" || typeof arg === "string") {
+      scope = String(parsed || arg || "today")
+    }
+    send("wipe", { scope: scope, from: lo, to: hi })
     return "ok"
   }
 
@@ -441,9 +494,17 @@ Item {
     function summon(): string { return root.openTimeline() }
     function openTimeline(): string { return root.openTimeline() }
     function openClips(): string { return root.openClips() }
-    function wipe(scope: string): string { return root.wipe(scope, 0, 0) }
-    function query(q: string): string { root.requestQuery(q); return "ok" }
     function openConsent(): string { return root.openConsent() }
+    function query(q: string): string { root.requestQuery(q); return "ok" }
+    function consentNow(arg: string): string { return root.consentNow(arg) }
+    function copyClip(arg: string): string { return root.copyClip(arg) }
+    function executePlan(arg: string): string { return root.executePlan(arg) }
+    function wipe(arg: string): string { return root.wipe(arg) }
+    function reopenPlan(arg: string): string { root.requestPlan(Number(arg) || 0); return "ok" }
+    function setOverlayOpen(arg: string): string {
+      var v = String(arg || "")
+      return root.setOverlayOpen(v === "true" || v === "1" || v === "{\"paused\":true}")
+    }
   }
 
   Component.onCompleted: {

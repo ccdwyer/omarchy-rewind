@@ -2,8 +2,8 @@ use crate::encode::which;
 use crate::{now_ms, DaemonState, CLIP_CAP};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, OnceLock};
 use std::sync::Arc;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -19,6 +19,12 @@ pub fn latest_cached() -> Option<String> {
         None
     } else {
         Some(g.clone())
+    }
+}
+
+fn clear_cached() {
+    if let Ok(mut g) = cache().lock() {
+        g.clear();
     }
 }
 
@@ -60,8 +66,10 @@ pub(crate) fn watch(shared: Arc<DaemonState>) {
         return;
     }
     loop {
+        // Each clipboard change is written in full, then a NUL, so multiline
+        // text is one event instead of one ingest per line.
         let child = Command::new("wl-paste")
-            .args(["-w", "-t", "text", "cat"])
+            .args(["-w", "-t", "text", "sh", "-c", "cat; printf '\\0'"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -71,10 +79,23 @@ pub(crate) fn watch(shared: Arc<DaemonState>) {
             continue;
         };
         if let Some(stdout) = child.stdout.take() {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines() {
-                let Ok(line) = line else { break };
-                ingest(&shared, &line);
+            let mut reader = BufReader::new(stdout);
+            loop {
+                let mut buf = Vec::new();
+                match reader.read_until(0, &mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if buf.last() == Some(&0) {
+                            buf.pop();
+                        }
+                        if buf.is_empty() {
+                            continue;
+                        }
+                        let text = String::from_utf8_lossy(&buf);
+                        ingest(&shared, &text);
+                    }
+                    Err(_) => break,
+                }
             }
         }
         let _ = child.wait();
@@ -87,6 +108,12 @@ fn ingest(shared: &DaemonState, raw: &str) {
         return;
     }
     let text = cap_text(raw);
+    if !shared.is_recording() {
+        // Drop secrets copied while paused (lock, overlay, excluded app, …)
+        // so the next frame cannot attach them.
+        clear_cached();
+        return;
+    }
     {
         let mut g = cache().lock().unwrap();
         if *g == text {
@@ -94,13 +121,10 @@ fn ingest(shared: &DaemonState, raw: &str) {
         }
         *g = text.clone();
     }
-    if !shared.is_armed() {
-        return;
-    }
     let ts = now_ms();
     let store = shared.store();
     let _ = store.insert_clip(ts, "text/plain", &text);
-    let _ = store.index_search_row(ts, "", "", "", &text);
+    let _ = store.record_clip_search(ts, &text);
 }
 
 #[cfg(test)]
@@ -112,5 +136,11 @@ mod tests {
         let s = "a".repeat(CLIP_CAP + 50);
         let out = cap_text(&s);
         assert_eq!(out.len(), CLIP_CAP);
+    }
+
+    #[test]
+    fn cap_keeps_multiline() {
+        let s = "line1\nline2\nline3";
+        assert_eq!(cap_text(s), s);
     }
 }

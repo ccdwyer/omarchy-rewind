@@ -33,6 +33,8 @@ Item {
   property string wipeScope: "today"
   property var highlightBoxes: []
   property bool firstRun: false
+  property int seenHitsRevision: -1
+  property bool awaitingSearch: false
 
   property color background: Color.menu.background
   property color foreground: Color.menu.text
@@ -66,18 +68,28 @@ Item {
   }
 
   function callSvc(name, arg) {
+    var payload = arg
+    if (arg !== undefined && arg !== null && typeof arg === "object")
+      payload = JSON.stringify(arg)
     var s = root.svc()
     if (s && typeof s[name] === "function") {
-      if (arg === undefined)
+      if (payload === undefined)
         return s[name]()
-      return s[name](arg)
+      return s[name](payload)
     }
     var cmd = ["omarchy-shell", "shell", "call", root.pluginId, name]
-    if (arg !== undefined && arg !== null && String(arg).length)
-      cmd.push(String(arg))
+    if (payload !== undefined && payload !== null && String(payload).length)
+      cmd.push(String(payload))
     ipcProc.command = cmd
     ipcProc.running = true
     return "queued"
+  }
+
+  function focusForView() {
+    if (root.view === "clips")
+      clipList.forceActiveFocus()
+    else
+      keyCatcher.forceActiveFocus()
   }
 
   function open(payloadJson) {
@@ -100,7 +112,7 @@ Item {
     if (s && typeof s.setOverlayOpen === "function")
       s.setOverlayOpen(true)
     root.pull()
-    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+    Qt.callLater(root.focusForView)
   }
 
   function close() {
@@ -132,6 +144,12 @@ Item {
     root.hits = s.hits || []
     root.moment = s.currentMoment || {}
     root.plan = s.currentPlan || {}
+    if (root.awaitingSearch && s.hitsRevision !== undefined
+        && Number(s.hitsRevision) !== root.seenHitsRevision) {
+      root.seenHitsRevision = Number(s.hitsRevision)
+      root.awaitingSearch = false
+      root.applySearchHits()
+    }
     if (root.frames.length) {
       if (root.selectedIndex >= root.frames.length)
         root.selectedIndex = root.frames.length - 1
@@ -184,23 +202,31 @@ Item {
 
   function runSearch() {
     var s = root.svc()
-    if (s && typeof s.requestQuery === "function")
-      s.requestQuery(root.searchText)
-    if (s)
-      root.hits = s.hits || []
-    if (root.hits.length) {
-      var ts = Number(root.hits[0].ts)
-      for (var i = 0; i < root.frames.length; i++) {
-        if (Number(root.frames[i].ts) === ts) {
-          root.selectedIndex = i
-          break
-        }
-      }
-      root.highlightBoxes = (root.hits[0].boxes || []).slice()
-      root.ensureMoment()
-    } else {
+    root.seenHitsRevision = s ? Number(s.hitsRevision || 0) : root.seenHitsRevision
+    root.awaitingSearch = true
+    root.callSvc("query", root.searchText)
+  }
+
+  function applySearchHits() {
+    var hits = root.hits || []
+    if (!hits.length) {
       root.highlightBoxes = []
+      return
     }
+    var ts = Number(hits[0].ts)
+    var found = -1
+    for (var i = 0; i < root.frames.length; i++) {
+      if (Number(root.frames[i].ts) === ts) {
+        found = i
+        break
+      }
+    }
+    if (found >= 0)
+      root.selectedIndex = found
+    root.highlightBoxes = (hits[0].boxes || []).slice()
+    var s = root.svc()
+    if (s && typeof s.requestMoment === "function")
+      s.requestMoment(ts)
   }
 
   function copyCurrentClip() {
@@ -209,7 +235,16 @@ Item {
     var clip = root.moment && root.moment.clip
     if (!ts && root.clips.length)
       ts = root.clips[0].ts
-    root.callSvc("copyClip", ts)
+    root.callSvc("copyClip", String(ts))
+  }
+
+  function copySelectedClip() {
+    if (!root.clips.length)
+      return
+    var idx = clipList.currentIndex
+    if (idx < 0 || idx >= root.clips.length)
+      idx = 0
+    root.callSvc("copyClip", String(root.clips[idx].ts))
   }
 
   function askPlan() {
@@ -224,9 +259,7 @@ Item {
   }
 
   function execPlan() {
-    var s = root.svc()
-    if (s && typeof s.executePlan === "function")
-      s.executePlan(root.plan)
+    root.callSvc("executePlan", root.plan || {})
     root.showPlan = false
   }
 
@@ -309,8 +342,18 @@ Item {
         } else if (event.key === Qt.Key_Y) {
           root.copyCurrentClip()
           event.accepted = true
+        } else if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter) && root.view === "clips") {
+          root.copySelectedClip()
+          event.accepted = true
+        } else if (event.key === Qt.Key_Down && root.view === "clips") {
+          clipList.currentIndex = Math.min(clipList.count - 1, clipList.currentIndex + 1)
+          event.accepted = true
+        } else if (event.key === Qt.Key_Up && root.view === "clips") {
+          clipList.currentIndex = Math.max(0, clipList.currentIndex - 1)
+          event.accepted = true
         } else if (event.key === Qt.Key_C && (event.modifiers & Qt.ControlModifier) === 0 && root.view === "scrub") {
           root.view = "clips"
+          Qt.callLater(root.focusForView)
           event.accepted = true
         }
       }
@@ -424,10 +467,7 @@ Item {
             MouseArea {
               anchors.fill: parent
               onClicked: {
-                root.callSvc("consentNow", false)
-                var s = root.svc()
-                if (s && typeof s.consentNow === "function")
-                  s.consentNow(false, loginCheck.checked)
+                root.callSvc("consentNow", { armNow: false, armOnLogin: loginCheck.checked })
                 root.view = "scrub"
                 root.firstRun = false
               }
@@ -452,9 +492,7 @@ Item {
             MouseArea {
               anchors.fill: parent
               onClicked: {
-                var s = root.svc()
-                if (s && typeof s.consentNow === "function")
-                  s.consentNow(true, loginCheck.checked)
+                root.callSvc("consentNow", { armNow: true, armOnLogin: loginCheck.checked })
                 root.view = "scrub"
                 root.firstRun = false
               }
@@ -586,10 +624,13 @@ Item {
                 color: Qt.rgba(0.2, 0.7, 1, 0.28)
                 border.color: root.accent
                 border.width: 1
-                x: frameImage.x + (modelData.x || 0) * frameImage.width
-                y: frameImage.y + (modelData.y || 0) * frameImage.height
-                width: Math.max(4, (modelData.w || 0) * frameImage.width)
-                height: Math.max(4, (modelData.h || 0) * frameImage.height)
+                property var fit: Query.fittedRect(
+                  frameImage.width, frameImage.height,
+                  frameImage.sourceSize.width, frameImage.sourceSize.height)
+                x: frameImage.x + fit.x + (modelData.x || 0) * fit.w
+                y: frameImage.y + fit.y + (modelData.y || 0) * fit.h
+                width: Math.max(4, (modelData.w || 0) * fit.w)
+                height: Math.max(4, (modelData.h || 0) * fit.h)
               }
             }
             Text {
@@ -842,10 +883,8 @@ Item {
           clip: true
           model: root.clips
           focus: root.view === "clips"
-          Keys.onReturnPressed: {
-            if (root.clips.length)
-              root.callSvc("copyClip", root.clips[clipList.currentIndex].ts)
-          }
+          Keys.onReturnPressed: root.copySelectedClip()
+          Keys.onEnterPressed: root.copySelectedClip()
           delegate: Rectangle {
             required property int index
             required property var modelData
@@ -876,7 +915,7 @@ Item {
             MouseArea {
               anchors.fill: parent
               onClicked: clipList.currentIndex = index
-              onDoubleClicked: root.callSvc("copyClip", modelData.ts)
+              onDoubleClicked: root.callSvc("copyClip", String(modelData.ts))
             }
           }
         }

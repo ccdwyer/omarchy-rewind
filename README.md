@@ -18,7 +18,7 @@ Then build the helper on the machine:
 ~/.config/omarchy/plugins/io.github.chris.rewind/build.sh
 ```
 
-`build.sh` compiles `rewindd` (Rust). If `cargo` or Wayland headers are missing it installs `compat/rewindd.sh` as `bin/rewindd` and the QML keeps working.
+`build.sh` compiles `rewindd` (Rust). If `cargo` or Wayland headers are missing it installs `compat/rewindd.sh` as `bin/rewindd`. That fallback **does not record** (it cannot honor the pause matrix); it still answers query/wipe/stats against existing data and the overlay stays usable. Recording requires the Rust binary.
 
 Put the chip on the bar if `--enable` did not:
 
@@ -134,7 +134,7 @@ Data lives at `$XDG_DATA_HOME/rewind` (default `~/.local/share/rewind`), created
 - **Private-window pause is heuristic** on documented Firefox / Chrome / Brave title markers.
 - **Lock/idle** prefer the compositor + `pidof hyprlock` + `loginctl`. The grim fallback cannot open a wlr-screencopy session.
 - **No at-rest encryption.** Roadmap, not v1. Wipe anytime.
-- **No second Quickshell process.** Helper is a rust/posix binary talking NDJSON on stdio.
+- **No second Quickshell process.** Helper is a rust binary talking NDJSON on stdio. The POSIX `compat/rewindd.sh` is a non-recording protocol stub, not a second capture path.
 - **Keybinds are yours.**
 - **CPU% / GB/day** are not fictionalized. Measure on device; the daemon records per-frame bytes.
 

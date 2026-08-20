@@ -59,6 +59,24 @@ function hitMarkers(hits) {
     return out
 }
 
+function fittedRect(containerW, containerH, sourceW, sourceH) {
+    containerW = Number(containerW) || 0
+    containerH = Number(containerH) || 0
+    sourceW = Number(sourceW) || 0
+    sourceH = Number(sourceH) || 0
+    if (!sourceW || !sourceH || !containerW || !containerH)
+        return { x: 0, y: 0, w: containerW, h: containerH }
+    var scale = Math.min(containerW / sourceW, containerH / sourceH)
+    var w = sourceW * scale
+    var h = sourceH * scale
+    return {
+        x: (containerW - w) / 2,
+        y: (containerH - h) / 2,
+        w: w,
+        h: h
+    }
+}
+
 function boxesForQuery(boxes, needle) {
     var n = String(needle || "").toLowerCase()
     var out = []

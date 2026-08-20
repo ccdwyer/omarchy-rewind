@@ -9,7 +9,7 @@ Conservative choices where the Omarchy / Quickshell / Hyprland API was not 100% 
 - **`keepLoaded: true`** so the overlay’s layer-shell window survives between summons (image-picker pattern). The spec’s kinds/entryPoints are otherwise unchanged.
 - **Settings are inline on the `shell.json` entry.** Widget keys (`byteCapGb`, `cadenceMs`, `idlePauseSec`, `excludeApps`, `titlePausePatterns`, `armOnLogin`) live in `manifest.barWidget.defaults` + `schema`. The bar widget pushes them to the service; the service sends them to rewindd. There is no plugin-owned settings file for those keys.
 - **Arm/consent persistence** is runtime state, not a widget setting. rewindd writes `~/.local/share/rewind/state.json` (0600). This is capture state, not a second settings channel.
-- **IPC verbs** are `omarchy-shell shell summon|hide|toggle|call <id> ...`. An extra `IpcHandler` target of the plugin id is registered; `shell call` is the documented path.
+- **IPC verbs** are `omarchy-shell shell summon|hide|toggle|call <id> ...`. `IpcHandler` on the plugin id exposes every overlay/service operation as a **one-string** method (`consentNow`, `copyClip`, `executePlan`, `wipe`, `reopenPlan`, `query`, …). Compound arguments are JSON in that single `<arg>` (Quattro’s contract). Overlay `callSvc` JSON-stringifies objects so the `shell call` fallback matches the in-process path.
 - **Third-party id** is `io.github.chris.rewind`. Never `omarchy.*`.
 
 ## Quickshell
@@ -24,10 +24,11 @@ Conservative choices where the Omarchy / Quickshell / Hyprland API was not 100% 
 
 ## Capture
 
-- Spec wants a **persistent wlr-screencopy session** via smithay-client-toolkit. That path is compiled only with `--features wayland` (wayland-client + wayland-protocols-wlr). `build.sh` tries it, then a grim-only binary, then the POSIX script.
-- The Wayland module opens a connection per grab, not a long-lived event loop across ticks. Isolated in `capture_wlr.rs`. If the protocol bind is wrong on a given compositor, grim runs. Cadence floor becomes 5 s as specified for the fallback.
+- Spec wants a **persistent wlr-screencopy session**. `CaptureSession` in `capture.rs` owns a long-lived `capture_wlr::Session`: Wayland `Connection`, registry, `zwlr_screencopy_manager_v1`, outputs, event queue, and a reusable wl_shm pool/buffer. Each tick only creates a new `zwlr_screencopy_frame_v1` and `copy`s into the existing buffer (recreated only if size/stride change). Compiled with `--features wayland`. `build.sh` tries that, then a grim-only binary, then the POSIX script.
+- Grim remains **fallback only** (connect failure, grab failure, or no wayland feature). Grim cadence floor is 5 s.
+- Unchanged dHash backs the next tick off to 10 s (`capture::next_cadence_ms`).
 - Focused output comes from `hyprctl -j monitors` (`focused: true`).
-- This authoring machine is macOS: wayland crates are not default features so `cargo test` stays portable.
+- This authoring machine is macOS: wayland crates are not default features so `cargo test` stays portable. No Linux prebuilts are claimed.
 
 ## Encoder
 
@@ -42,8 +43,10 @@ Conservative choices where the Omarchy / Quickshell / Hyprland API was not 100% 
 
 ## Search / OCR
 
-- FTS5 over app + title + clipboard is written on every frame even when OCR text is empty. If the bundled SQLite build rejects FTS5, rewindd falls back to LIKE on a regular table.
-- Tesseract is optional, `nice -n 19`, TSV parse, crops deleted after. Word boxes are stored as fractions of the stored frame.
+- FTS5 over app + title + clipboard is written on every frame (including the current clipboard text). Independent clipboard events (their own timestamps) are attached to the **nearest frame** via `record_clip_search` and a LEFT JOIN / clip-table merge so OCR-free clipboard search hits a screenshot, not an orphan ts. LIKE fallback uses the same nearest-clip-before-frame rule.
+- Clipboard ingest is gated by the **full pause matrix** (not merely `armed`). While paused the in-memory clip cache is cleared so a later frame cannot attach a secret copied in KeePass etc.
+- Tesseract is optional, `nice -n 19`, TSV parse, crops deleted after. Word boxes are stored as fractions of the stored frame; QML maps them through `Query.fittedRect` onto the PreserveAspectFit painted area.
+- `wl-paste -w` payloads are NUL-delimited so multiline clipboard text is one event (64 KB cap).
 
 ## Reopen & arrange
 
@@ -51,7 +54,7 @@ Conservative choices where the Omarchy / Quickshell / Hyprland API was not 100% 
 
 ## Helper fallback
 
-- The competition brief asked for a missing-binary degrade path. `compat/rewindd.sh` speaks the same NDJSON subset, grim-only, python3 for JSON, no OCR, reopen-plan returns an honest empty plan.
+- The competition brief asked for a missing-binary degrade path. `compat/rewindd.sh` speaks the same NDJSON protocol for query/wipe/stats/clips/timeline/moment/consent/configure, but **does not record**. A shell grim loop cannot honor the pause matrix or a persistent screencopy session; an unsafe partial recorder was rejected in review. Arm replies with `compat-norecord` and an error telling the user to run `build.sh`. Wipe rewrites `index.jsonl` / `clips.jsonl` atomically and drops missing files.
 
 ## Deviations from the spec (reference or honesty)
 
@@ -59,6 +62,7 @@ Conservative choices where the Omarchy / Quickshell / Hyprland API was not 100% 
 - **`barWidget` metadata block** added (reference requires it when `kinds` includes `bar-widget`).
 - **Widget settings in shell.json**, not a Rewind config file (reference).
 - **No committed 8-hour CPU% / GB/day.** Authoring host has no Hyprland. Planning numbers are the spec’s 25–80 KB/frame; live UI uses measured bytes.
-- **wlr-screencopy is feature-gated**, grim is the always-on path.
+- **wlr-screencopy is feature-gated** (macOS cannot compile wayland). On Linux with the feature, the session is persistent; grim is fallback only.
+- **POSIX fallback does not record** (privacy). Query/wipe of existing data still work.
 - **image-crate WebP skipped** (native libwebp). PNG is the compiled fallback after `cwebp`.
 - **At-rest encryption** remains a documented roadmap item (tribunal applied-changes).

@@ -1,6 +1,11 @@
 #!/bin/sh
-# POSIX fallback for rewindd. Same NDJSON verbs, grim-only capture at ≥5s.
-# Used when bin/rewindd is missing. Search is titles+clipboard only.
+# POSIX fallback for rewindd — protocol-compatible, non-recording.
+#
+# It never captures frames or clipboard. That is intentional: the shell
+# fallback cannot enforce the pause matrix (lock/idle/exclusion/portal/
+# private-window) or a persistent screencopy session, so recording here
+# would be an unsafe partial recorder. Query/wipe/stats still operate on
+# data previously written by the Rust binary.
 
 set -eu
 
@@ -23,43 +28,99 @@ LAYOUTS="$DATA/layouts"
 
 mkdir -p "$FRAMES" "$LAYOUTS"
 chmod 700 "$DATA" "$FRAMES" "$LAYOUTS" 2>/dev/null || true
-: >>"$CLIPS"
-: >>"$INDEX"
+[ -f "$CLIPS" ] || : >"$CLIPS"
+[ -f "$INDEX" ] || : >"$INDEX"
 chmod 600 "$CLIPS" "$INDEX" 2>/dev/null || true
 
-ARMED=0
 CONSENT=0
-OVERLAY=0
-CADENCE=5
+ARMONLOGIN=0
 BYTECAP=2147483648
-PASTE_PID=""
+CADENCE=3000
+IDLEPAUSE=120
+EXCLUDES="keepassxc,1Password,1password,Bitwarden,bitwarden,seahorse"
+TITLEPAUSE=""
 
-json_escape() {
-  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g'
-}
-
-emit() {
-  printf '%s\n' "$1"
-}
+emit() { printf '%s\n' "$1"; }
 
 now_ms() {
   python3 -c 'import time; print(int(time.time()*1000))' 2>/dev/null || date +%s000
 }
 
 load_state() {
-  if [ -f "$STATE" ]; then
-    ARMED=$(sed -n 's/.*"armed"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p' "$STATE" | head -1)
-    CONSENT=$(sed -n 's/.*"consentAt"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$STATE" | head -1)
-    [ "$ARMED" = "true" ] && ARMED=1 || ARMED=0
-    [ -n "$CONSENT" ] && [ "$CONSENT" != "0" ] && CONSENT=1 || CONSENT=0
+  if [ ! -f "$STATE" ]; then
+    return 0
   fi
+  eval "$(python3 -c '
+import json,sys
+try:
+    s=json.load(open(sys.argv[1]))
+except Exception:
+    s={}
+def i(k,d=0):
+    print("%s=%s"%(k,int(s.get(k) or d)))
+print("CONSENT=%d"%(1 if s.get("consentAt") else 0))
+print("ARMONLOGIN=%d"%(1 if s.get("armOnLogin") else 0))
+print("BYTECAP=%d"%int(s.get("byteCap") or 2147483648))
+print("CADENCE=%d"%int(s.get("cadenceMs") or 3000))
+print("IDLEPAUSE=%d"%int(s.get("idlePauseSec") or 120))
+ex=s.get("excludeApps") or ""
+if isinstance(ex,list):
+    ex=",".join(ex)
+print("EXCLUDES=%r"%ex)
+tp=s.get("titlePausePatterns") or ""
+if isinstance(tp,list):
+    tp=",".join(tp)
+print("TITLEPAUSE=%r"%tp)
+' "$STATE" 2>/dev/null || true)"
 }
 
 save_state() {
-  cat >"$STATE" <<EOF
-{"armed":$([ "$ARMED" -eq 1 ] && echo true || echo false),"consentAt":$([ "$CONSENT" -eq 1 ] && now_ms || echo 0)}
-EOF
+  python3 -c '
+import json,sys
+path=sys.argv[1]
+body={
+  "armed": False,
+  "consentAt": int(sys.argv[2]),
+  "armOnLogin": sys.argv[3]=="1",
+  "byteCap": int(sys.argv[4]),
+  "cadenceMs": int(sys.argv[5]),
+  "idlePauseSec": int(sys.argv[6]),
+  "excludeApps": sys.argv[7],
+  "titlePausePatterns": sys.argv[8],
+  "record": False,
+  "reason": "compat-norecord",
+}
+json.dump(body, open(path,"w"))
+' "$STATE" "$([ "$CONSENT" -eq 1 ] && now_ms || echo 0)" "$ARMONLOGIN" "$BYTECAP" "$CADENCE" "$IDLEPAUSE" "$EXCLUDES" "$TITLEPAUSE" 2>/dev/null || true
   chmod 600 "$STATE" 2>/dev/null || true
+}
+
+merge_configure() {
+  line="$1"
+  eval "$(python3 -c '
+import json,sys
+v=json.loads(sys.argv[1])
+def n(*keys):
+    for k in keys:
+        if k in v and v[k] not in (None,""):
+            print(k, v[k]); return
+n("byteCapGb","byteCap")
+n("cadenceMs")
+n("idlePauseSec")
+n("excludeApps","exclude")
+n("titlePausePatterns","titlePause")
+n("armOnLogin")
+' "$line" 2>/dev/null | while IFS= read -r k rest; do
+    case "$k" in
+      byteCapGb) echo "BYTECAP=$(python3 -c "print(int(float(\"$rest\")*1024*1024*1024))" 2>/dev/null || echo $BYTECAP)" ;;
+      byteCap) echo "BYTECAP=$rest" ;;
+      cadenceMs) echo "CADENCE=$rest" ;;
+      idlePauseSec) echo "IDLEPAUSE=$rest" ;;
+      excludeApps|exclude) echo "EXCLUDES=$rest" ;;
+      titlePausePatterns|titlePause) echo "TITLEPAUSE=$rest" ;;
+      armOnLogin) echo "ARMONLOGIN=$([ "$rest" = "True" ] || [ "$rest" = "true" ] && echo 1 || echo 0)" ;;
+    esac
+  done)"
 }
 
 bytes_used() {
@@ -70,109 +131,24 @@ frame_count() {
   find "$FRAMES" -type f 2>/dev/null | wc -l | tr -d ' '
 }
 
-focused_output() {
-  hyprctl -j monitors 2>/dev/null | python3 -c '
-import json,sys
-try:
-    m=json.load(sys.stdin)
-    for x in m:
-        if x.get("focused"):
-            print(x.get("name",""))
-            break
-except Exception:
-    pass
-' 2>/dev/null || true
-}
-
-locked_now() {
-  if pidof hyprlock >/dev/null 2>&1; then
-    return 0
-  fi
-  return 1
-}
-
-excluded_visible() {
-  hyprctl -j clients 2>/dev/null | python3 -c '
-import json,sys
-ex={"keepassxc","1password","bitwarden","seahorse","polkit"}
-try:
-    cs=json.load(sys.stdin)
-except Exception:
-    raise SystemExit(1)
-for c in cs:
-    cls=str(c.get("class","")).lower()
-    if not c.get("mapped", True) or c.get("hidden"):
-        continue
-    for e in ex:
-        if e in cls:
-            raise SystemExit(0)
-raise SystemExit(1)
-' 2>/dev/null
-}
-
-capture_once() {
-  if [ "$ARMED" -ne 1 ] || [ "$OVERLAY" -eq 1 ]; then
-    return 0
-  fi
-  if locked_now; then
-    return 0
-  fi
-  if excluded_visible; then
-    return 0
-  fi
-  if ! command -v grim >/dev/null 2>&1; then
-    emit '{"event":"error","error":"grim missing"}'
-    return 0
-  fi
-  out=$(focused_output)
-  ts=$(now_ms)
-  dest="$FRAMES/${ts}.png"
-  if [ -n "$out" ]; then
-    grim -t png -o "$out" "$dest" 2>/dev/null || return 0
-  else
-    grim -t png "$dest" 2>/dev/null || return 0
-  fi
-  chmod 600 "$dest" 2>/dev/null || true
-  app=""
-  title=""
-  ws="1"
-  if command -v hyprctl >/dev/null 2>&1; then
-    eval "$(hyprctl -j activewindow 2>/dev/null | python3 -c '
-import json,sys
-try:
-    w=json.load(sys.stdin)
-    def esc(s):
-        return str(s).replace("\\","\\\\").replace("\"","\\\"")
-    print("app=\"%s\"" % esc(w.get("class","")))
-    print("title=\"%s\"" % esc(w.get("title","")))
-    ws=w.get("workspace") or {}
-    print("ws=\"%s\"" % esc(ws.get("id",1)))
-except Exception:
-    print("app=\"\"\ntitle=\"\"\nws=\"1\"")
-' 2>/dev/null || true)"
-    hyprctl -j clients >"$LAYOUTS/${ts}.json" 2>/dev/null || true
-    chmod 600 "$LAYOUTS/${ts}.json" 2>/dev/null || true
-  fi
-  bytes=$(wc -c <"$dest" | tr -d ' ')
-  printf '%s\n' "{\"ts\":$ts,\"path\":\"$dest\",\"app\":\"$(json_escape "$app")\",\"title\":\"$(json_escape "$title")\",\"workspace\":\"$ws\",\"bytes\":$bytes,\"encoder\":\"png\"}" >>"$INDEX"
-  emit "{\"event\":\"frame-written\",\"ts\":$ts,\"path\":\"$dest\",\"app\":\"$(json_escape "$app")\",\"title\":\"$(json_escape "$title")\",\"workspace\":\"$ws\",\"bytes\":$bytes,\"encoder\":\"png\"}"
-  prune
-}
-
-prune() {
-  used=$(bytes_used)
-  while [ "$used" -gt "$BYTECAP" ]; do
-    oldest=$(find "$FRAMES" -type f | sort | head -1)
-    [ -z "$oldest" ] && break
-    rm -f "$oldest"
-    used=$(bytes_used)
-  done
-}
-
-emit_stats() {
+stats_json() {
   used=$(bytes_used)
   n=$(frame_count)
-  emit "{\"event\":\"stats\",\"armed\":$([ "$ARMED" -eq 1 ] && echo true || echo false),\"consent\":$([ "$CONSENT" -eq 1 ] && echo true || echo false),\"paused\":$([ "$ARMED" -eq 1 ] && echo false || echo true),\"reason\":\"$([ "$ARMED" -eq 1 ] && echo "" || echo disarmed)\",\"frames\":$n,\"framesToday\":$n,\"bytes\":$used,\"byteCap\":$BYTECAP,\"encoder\":\"png\",\"ocrAvailable\":false,\"capture\":\"grim\",\"version\":\"$VERSION\"}"
+  python3 -c 'import json,sys
+print(json.dumps({
+  "armed": False,
+  "consent": sys.argv[1]=="1",
+  "paused": True,
+  "reason": "compat-norecord",
+  "frames": int(sys.argv[2]),
+  "framesToday": int(sys.argv[2]),
+  "bytes": int(sys.argv[3]),
+  "byteCap": int(sys.argv[4]),
+  "encoder": "none",
+  "ocrAvailable": False,
+  "capture": "none",
+  "version": sys.argv[5],
+}))' "$CONSENT" "$n" "$used" "$BYTECAP" "$VERSION"
 }
 
 reply() {
@@ -181,33 +157,86 @@ reply() {
   emit "{\"event\":\"reply\",\"id\":$id,\"ok\":true,\"data\":$data}"
 }
 
+cmd_of() {
+  printf '%s' "$1" | python3 -c 'import json,sys
+v=json.loads(sys.stdin.read() or "{}")
+print(v.get("cmd") or v.get("type") or "")' 2>/dev/null || echo ""
+}
+
+id_of() {
+  printf '%s' "$1" | python3 -c 'import json,sys
+v=json.loads(sys.stdin.read() or "{}")
+print(int(v.get("id") or 0))' 2>/dev/null || echo 0
+}
+
+field() {
+  printf '%s' "$1" | python3 -c 'import json,sys
+v=json.loads(sys.stdin.read() or "{}")
+x=v.get(sys.argv[1],"")
+if isinstance(x,bool):
+    print("true" if x else "false")
+elif x is None:
+    print("")
+else:
+    print(x)' "$2" 2>/dev/null || true
+}
+
 query_index() {
-  q=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  q="$1"
   python3 -c '
-import json,sys
-q=sys.argv[1]
+import json,sys,os
+q=sys.argv[1].lower()
+idx=sys.argv[2]
+clips=sys.argv[3]
+frames=[]
+try:
+    for line in open(idx, encoding="utf-8"):
+        line=line.strip()
+        if not line: continue
+        try: frames.append(json.loads(line))
+        except Exception: pass
+except FileNotFoundError:
+    pass
+clip_rows=[]
+try:
+    for line in open(clips, encoding="utf-8"):
+        line=line.strip()
+        if not line: continue
+        try: clip_rows.append(json.loads(line))
+        except Exception: pass
+except FileNotFoundError:
+    pass
+
+def nearest(ts):
+    before=[f for f in frames if int(f.get("ts") or 0)<=ts]
+    if before:
+        return max(before, key=lambda f: int(f.get("ts") or 0))
+    after=[f for f in frames if int(f.get("ts") or 0)>=ts]
+    if after:
+        return min(after, key=lambda f: int(f.get("ts") or 0))
+    return None
+
 hits=[]
-try:
-    for line in open(sys.argv[2], encoding="utf-8"):
-        line=line.strip()
-        if not line: continue
-        try: row=json.loads(line)
-        except Exception: continue
-        blob=" ".join([str(row.get("title","")), str(row.get("app","")), str(row.get("path",""))]).lower()
-        if q and q in blob:
-            hits.append(row)
-except FileNotFoundError:
-    pass
-try:
-    for line in open(sys.argv[3], encoding="utf-8"):
-        line=line.strip()
-        if not line: continue
-        try: row=json.loads(line)
-        except Exception: continue
-        if q and q in str(row.get("content","")).lower():
-            hits.append({"ts":row.get("ts"),"path":"","app":"clipboard","title":row.get("content","")[:80],"snippet":row.get("content","")[:80],"boxes":[]})
-except FileNotFoundError:
-    pass
+seen=set()
+for f in frames:
+    blob=" ".join([str(f.get("title","")), str(f.get("app","")), str(f.get("path",""))]).lower()
+    if q and q in blob:
+        ts=int(f.get("ts") or 0)
+        if ts in seen: continue
+        seen.add(ts)
+        hits.append(f)
+for c in clip_rows:
+    content=str(c.get("content",""))
+    if q and q in content.lower():
+        f=nearest(int(c.get("ts") or 0))
+        row=dict(f) if f else {"ts": c.get("ts"), "path":"", "app":"clipboard", "title":""}
+        ts=int(row.get("ts") or 0)
+        if ts in seen: continue
+        seen.add(ts)
+        row=dict(row)
+        row["snippet"]=content[:80]
+        row["boxes"]=[]
+        hits.append(row)
 print(json.dumps({"hits":hits[-50:],"ocrAvailable":False,"query":q}))
 ' "$q" "$INDEX" "$CLIPS" 2>/dev/null || echo '{"hits":[],"ocrAvailable":false}'
 }
@@ -248,127 +277,113 @@ moment_json() {
   ts="$1"
   python3 -c '
 import json,sys,os
-ts=int(sys.argv[1])
-idx=sys.argv[2]
-root=sys.argv[3]
-frame=None
+ts=int(sys.argv[1] or 0)
+idx, clips_path, root = sys.argv[2], sys.argv[3], sys.argv[4]
+frames=[]
 try:
     for line in open(idx, encoding="utf-8"):
-        try: row=json.loads(line)
-        except Exception: continue
-        if int(row.get("ts",0))==ts:
-            frame=row
+        try: frames.append(json.loads(line))
+        except Exception: pass
 except FileNotFoundError:
     pass
+frame=None
+for f in frames:
+    if int(f.get("ts") or 0)==ts:
+        frame=f
+if frame is None:
+    before=[f for f in frames if int(f.get("ts") or 0)<=ts]
+    frame=max(before, key=lambda f: int(f.get("ts") or 0)) if before else None
 clip=""
 try:
-    for line in open(os.path.join(os.path.dirname(idx),"clips.jsonl"), encoding="utf-8"):
+    for line in open(clips_path, encoding="utf-8"):
         try: row=json.loads(line)
         except Exception: continue
-        if int(row.get("ts",0))<=ts:
+        if int(row.get("ts") or 0)<=ts:
             clip=row.get("content","")
 except FileNotFoundError:
     pass
 windows=[]
-lp=os.path.join(root,"layouts","%s.json"%ts)
-if os.path.exists(lp):
-    try: windows=json.load(open(lp))
-    except Exception: windows=[]
+if frame:
+    lp=os.path.join(root,"layouts","%s.json"%frame.get("ts"))
+    if os.path.exists(lp):
+        try: windows=json.load(open(lp))
+        except Exception: windows=[]
 print(json.dumps({"frame":frame,"clip":clip,"windows":windows,"boxes":[]}))
-' "$ts" "$INDEX" "$DATA" 2>/dev/null || echo '{"frame":null,"clip":"","windows":[],"boxes":[]}'
+' "$ts" "$INDEX" "$CLIPS" "$DATA" 2>/dev/null || echo '{"frame":null,"clip":"","windows":[],"boxes":[]}'
 }
 
-wipe_scope() {
-  scope="$1"
-  case "$scope" in
-    all)
-      rm -rf "$FRAMES" "$LAYOUTS"
-      mkdir -p "$FRAMES" "$LAYOUTS"
-      : >"$INDEX"
-      : >"$CLIPS"
-      ;;
-    today|range)
-      # Fallback treats today as all-of-session files newer than midnight if python can compute it.
-      python3 -c '
-import os,time,sys
-root=sys.argv[1]
-cut=int(time.time()*1000) - (int(time.time()) % 86400)*1000
-for dirn in ("frames","layouts"):
-    p=os.path.join(root,dirn)
-    if not os.path.isdir(p):
+# Atomically drop missing files from the index and remove matching clip/layout rows.
+rewrite_index() {
+  python3 -c '
+import json,os,sys,tempfile
+root, idx_path, clips_path = sys.argv[1], sys.argv[2], sys.argv[3]
+scope, lo, hi = sys.argv[4], int(sys.argv[5] or 0), int(sys.argv[6] or 0)
+now=int(sys.argv[7] or 0)
+if scope=="all":
+    lo, hi = 0, 2**62
+elif scope=="today":
+    day=86400000
+    lo, hi = now - (now % day), now
+elif scope=="range":
+    if hi==0: hi=now
+else:
+    lo, hi = 0, -1  # keep all; just drop missing files
+
+def load(path):
+    rows=[]
+    try:
+        for line in open(path, encoding="utf-8"):
+            line=line.strip()
+            if not line: continue
+            try: rows.append(json.loads(line))
+            except Exception: pass
+    except FileNotFoundError:
+        pass
+    return rows
+
+def atomic_write(path, rows):
+    d=os.path.dirname(path) or "."
+    fd, tmp=tempfile.mkstemp(dir=d, prefix=".idx-")
+    os.close(fd)
+    with open(tmp,"w",encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False)+"\n")
+    os.replace(tmp, path)
+    os.chmod(path, 0o600)
+
+frames=load(idx_path)
+keep=[]
+for f in frames:
+    ts=int(f.get("ts") or 0)
+    path=f.get("path") or ""
+    gone = (lo<=ts<=hi) if hi>=lo else False
+    if gone:
+        if path and os.path.exists(path):
+            try: os.remove(path)
+            except Exception: pass
+        lp=os.path.join(root,"layouts","%s.json"%ts)
+        if os.path.exists(lp):
+            try: os.remove(lp)
+            except Exception: pass
         continue
-    for name in os.listdir(p):
-        stem=os.path.splitext(name)[0]
-        try: ts=int(stem)
-        except Exception: continue
-        if ts>=cut:
-            os.remove(os.path.join(p,name))
-' "$DATA" 2>/dev/null || true
-      ;;
-  esac
+    if path and not os.path.exists(path) and not os.path.exists(os.path.join(root, path)):
+        continue
+    keep.append(f)
+atomic_write(idx_path, keep)
+clips=load(clips_path)
+ck=[]
+for c in clips:
+    ts=int(c.get("ts") or 0)
+    if hi>=lo and lo<=ts<=hi:
+        continue
+    ck.append(c)
+atomic_write(clips_path, ck)
+print(json.dumps({"wiped": len(frames)-len(keep), "scope": scope}))
+' "$DATA" "$INDEX" "$CLIPS" "$1" "${2:-0}" "${3:-0}" "$(now_ms)"
 }
-
-watch_clipboard() {
-  if ! command -v wl-paste >/dev/null 2>&1; then
-    return 0
-  fi
-  wl-paste -w -t text cat 2>/dev/null | while IFS= read -r line; do
-    [ -z "$line" ] && continue
-    ts=$(now_ms)
-    # 64KB cap
-    trimmed=$(printf '%s' "$line" | dd bs=65536 count=1 2>/dev/null || printf '%s' "$line")
-    printf '%s\n' "{\"ts\":$ts,\"mime\":\"text/plain\",\"content\":\"$(json_escape "$trimmed")\",\"bytes\":${#trimmed}}" >>"$CLIPS"
-  done &
-  PASTE_PID=$!
-}
-
-handle() {
-  line="$1"
-  cmd=$(printf '%s' "$line" | python3 -c 'import json,sys
-try:
-    v=json.load(sys.stdin)
-    print(v.get("cmd") or v.get("type") or "")
-    print(int(v.get("id") or 0))
-    print(json.dumps(v))
-except Exception:
-    print("\n0\n{}")
-' 2>/dev/null)
-  set -- $cmd
-  # The above collapses JSON. Use python for the real dispatch.
-  python3 - "$line" <<'PY' || true
-import json,sys,os
-raw=sys.argv[1]
-try:
-    v=json.loads(raw)
-except Exception:
-    print('{"event":"error","error":"bad-json"}')
-    sys.exit(0)
-print(json.dumps({"_dispatch": True, "cmd": v.get("cmd") or v.get("type") or "", "id": v.get("id") or 0, "body": v}))
-PY
-}
-
-cmd_of() {
-  printf '%s' "$1" | python3 -c 'import json,sys
-v=json.loads(sys.stdin.read() or "{}")
-print(v.get("cmd") or v.get("type") or "")' 2>/dev/null || echo ""
-}
-
-id_of() {
-  printf '%s' "$1" | python3 -c 'import json,sys
-v=json.loads(sys.stdin.read() or "{}")
-print(int(v.get("id") or 0))' 2>/dev/null || echo 0
-}
-
-field() {
-  printf '%s' "$1" | python3 -c 'import json,sys
-v=json.loads(sys.stdin.read() or "{}")
-print(v.get(sys.argv[1],""))' "$2" 2>/dev/null || true
-}
-
-trap 'if [ -n "$PASTE_PID" ]; then kill "$PASTE_PID" 2>/dev/null || true; fi' EXIT INT TERM
 
 usage() {
-  echo "rewindd $VERSION (POSIX fallback)
+  echo "rewindd $VERSION (POSIX fallback — does not record)
 daemon | wipe today|all|range | query TEXT | stats | self-test" >&2
 }
 
@@ -381,16 +396,13 @@ cli() {
     ""|daemon) return 1 ;;
     self-test) self_test; exit 0 ;;
     wipe)
-      wipe_scope "${2:-today}"
-      echo "{\"wiped\":true,\"scope\":\"${2:-today}\"}"
+      rewrite_index "${2:-today}" 0 0
       exit 0
       ;;
     query) shift; query_index "$*"; exit 0 ;;
     stats|status)
       load_state
-      n=$(frame_count)
-      used=$(bytes_used)
-      echo "{\"frames\":$n,\"bytes\":$used,\"encoder\":\"png\",\"ocrAvailable\":false,\"capture\":\"grim\",\"version\":\"$VERSION\"}"
+      stats_json
       exit 0
       ;;
     ldd-report) echo "posix fallback; no ldd"; exit 0 ;;
@@ -400,62 +412,43 @@ cli() {
   return 1
 }
 
-if ! cli "$@"; then
-  :
-else
+if cli "$@"; then
   exit 0
 fi
 
 load_state
-watch_clipboard
-emit "{\"event\":\"ready\",\"armed\":$([ "$ARMED" -eq 1 ] && echo true || echo false),\"consentShown\":$([ "$CONSENT" -eq 1 ] && echo true || echo false),\"helper\":\"rewindd.sh\",\"encoder\":\"png\"}"
-
-# Capture loop in background
-(
-  while :; do
-    sleep "$CADENCE"
-    capture_once
-  done
-) &
-CAP_PID=$!
-trap 'kill $CAP_PID $PASTE_PID 2>/dev/null || true' EXIT INT TERM
+emit "{\"event\":\"ready\",\"armed\":false,\"consentShown\":$([ "$CONSENT" -eq 1 ] && echo true || echo false),\"helper\":\"rewindd.sh\",\"encoder\":\"none\",\"capture\":\"none\"}"
 
 while IFS= read -r line; do
   [ -z "$line" ] && continue
   cmd=$(cmd_of "$line")
   id=$(id_of "$line")
   case "$cmd" in
-    hello) reply "$id" "{\"version\":\"$VERSION\"}" ;;
+    hello) reply "$id" "{\"version\":\"$VERSION\",\"record\":false}" ;;
     arm)
-      ARMED=1
       CONSENT=1
       save_state
-      reply "$id" "{\"armed\":true}"
-      emit_stats
+      emit "{\"event\":\"error\",\"id\":$id,\"ok\":false,\"error\":\"compat helper does not record; run build.sh for rewindd\"}"
+      reply "$id" "$(stats_json)"
+      emit "{\"event\":\"stats\",$(stats_json | sed 's/^{//;s/}$//')}"
       ;;
     disarm)
-      ARMED=0
       save_state
-      reply "$id" "{\"armed\":false}"
-      emit_stats
+      reply "$id" "$(stats_json)"
       ;;
     consent)
       CONSENT=1
       armnow=$(field "$line" armNow)
-      [ "$armnow" = "True" ] || [ "$armnow" = "true" ] && ARMED=1
+      [ "$armnow" = "true" ] && emit "{\"event\":\"error\",\"id\":$id,\"error\":\"compat helper does not record; run build.sh for rewindd\"}"
       save_state
-      reply "$id" "{\"consent\":true,\"armed\":$([ "$ARMED" -eq 1 ] && echo true || echo false)}"
-      emit_stats
+      reply "$id" "$(stats_json)"
       ;;
-    set-pause|setPause)
-      paused=$(field "$line" paused)
-      reason=$(field "$line" reason)
-      if [ "$reason" = "overlay" ]; then
-        [ "$paused" = "true" ] && OVERLAY=1 || OVERLAY=0
-      fi
+    set-pause|setPause) reply "$id" "{\"ok\":true}" ;;
+    configure)
+      merge_configure "$line"
+      save_state
       reply "$id" "{\"ok\":true}"
       ;;
-    configure) reply "$id" "{\"ok\":true}" ;;
     query)
       q=$(field "$line" q)
       [ -z "$q" ] && q=$(field "$line" query)
@@ -465,12 +458,15 @@ while IFS= read -r line; do
     moment) reply "$id" "$(moment_json "$(field "$line" ts)")" ;;
     clips) reply "$id" "$(clips_json)" ;;
     reopen-plan|reopenPlan)
-      reply "$id" '{"title":"Reopen & arrange","honest":true,"steps":[],"unrecoverable":[{"reason":"fallback helper cannot map desktop files"}],"note":"Build bin/rewindd for reopen plans."}'
+      reply "$id" '{"title":"Reopen & arrange","honest":true,"steps":[],"unrecoverable":[{"reason":"compat helper does not record or plan"}],"note":"Build bin/rewindd for reopen plans."}'
       ;;
     reopen-exec|reopenExec) reply "$id" '{"ran":0}' ;;
     wipe)
-      wipe_scope "$(field "$line" scope)"
-      reply "$id" '{"wiped":true}'
+      scope=$(field "$line" scope)
+      [ -z "$scope" ] && scope=today
+      from=$(field "$line" from)
+      to=$(field "$line" to)
+      reply "$id" "$(rewrite_index "$scope" "${from:-0}" "${to:-0}")"
       ;;
     copy-clip|copyClip)
       if command -v wl-copy >/dev/null 2>&1; then
@@ -486,14 +482,14 @@ try:
             hit=row.get("content","")
 except FileNotFoundError:
     pass
-print(hit)
+sys.stdout.write(hit)
 ' "$(field "$line" ts)" "$CLIPS" 2>/dev/null | wl-copy -t text/plain || true
       fi
       reply "$id" '{"ok":true}'
       ;;
     stats|status)
-      emit_stats
-      reply "$id" "{\"armed\":$([ "$ARMED" -eq 1 ] && echo true || echo false)}"
+      reply "$id" "$(stats_json)"
+      emit "{\"event\":\"stats\",$(stats_json | sed 's/^{//;s/}$//')}"
       ;;
     shutdown)
       reply "$id" '{"bye":true}'

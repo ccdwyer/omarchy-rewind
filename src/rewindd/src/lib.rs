@@ -30,7 +30,7 @@ use std::process::{Command as Proc, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const CLIP_CAP: usize = 64 * 1024;
@@ -396,25 +396,18 @@ fn evaluate_pause(shared: &Shared) -> Option<PauseReason> {
 }
 
 fn capture_loop(shared: Arc<Shared>) {
-    let mut last_tick = Instant::now();
+    let mut session = capture::CaptureSession::new();
+    let mut last_unchanged = false;
     loop {
         let settings = shared.settings.lock().unwrap().clone();
-        let grim = capture::backend_name() == "grim";
+        let grim = session.using_grim();
         let base_ms = if grim {
             settings.cadence_ms.max(5000)
         } else {
             settings.cadence_ms.max(1000)
         };
-        let unchanged = shared.last_dhash.load(Ordering::SeqCst) != 0
-            && shared.last_write_ms.load(Ordering::SeqCst) > 0
-            && last_tick.elapsed() < Duration::from_millis(10_000);
-        let wait = if unchanged && last_tick.elapsed() < Duration::from_millis(base_ms) {
-            base_ms
-        } else {
-            base_ms
-        };
-        thread::sleep(Duration::from_millis(wait.min(10_000).max(250)));
-        last_tick = Instant::now();
+        let wait = capture::next_cadence_ms(base_ms, last_unchanged);
+        thread::sleep(Duration::from_millis(wait));
 
         let reason = evaluate_pause(&shared);
         {
@@ -435,24 +428,35 @@ fn capture_loop(shared: Arc<Shared>) {
             }
         }
         if reason.is_some() {
+            last_unchanged = false;
             continue;
         }
 
-        if let Err(err) = capture_once(&shared, &settings) {
-            emit(&Event::error(None, err));
+        match capture_once(&shared, &settings, &mut session) {
+            Ok(true) => last_unchanged = true,
+            Ok(false) => last_unchanged = false,
+            Err(err) => {
+                last_unchanged = false;
+                emit(&Event::error(None, err));
+            }
         }
     }
 }
 
-fn capture_once(shared: &Shared, settings: &Settings) -> Result<(), String> {
+fn capture_once(
+    shared: &Shared,
+    settings: &Settings,
+    session: &mut capture::CaptureSession,
+) -> Result<bool, String> {
     let monitor = hypr::focused_monitor().unwrap_or_default();
     let active = hypr::active_window().unwrap_or_default();
     let clients = hypr::clients().unwrap_or_default();
-    let raw = capture::grab_focused(&monitor.name)?;
+    let raw = session.grab(&monitor.name)?;
     let hash = dhash::compute(&raw.rgba, raw.width, raw.height);
     let last = shared.last_dhash.load(Ordering::SeqCst);
     if last != 0 && last == hash && settings.skip_unchanged {
-        return Ok(());
+        shared.last_dhash.store(hash, Ordering::SeqCst);
+        return Ok(true);
     }
 
     let scaled = encode::downscale_720p(&raw.rgba, raw.width, raw.height);
@@ -519,11 +523,9 @@ fn capture_once(shared: &Shared, settings: &Settings) -> Result<(), String> {
         store
             .insert_layout(ts, &clients)
             .map_err(|e| e.to_string())?;
-        if let Some(clip) = clipboard::latest_cached() {
-            let _ = store.insert_clip(ts, "text/plain", &clip);
-        }
+        let clip = clipboard::latest_cached().unwrap_or_default();
         store
-            .index_search_row(ts, "", &insert.app, &insert.title, "")
+            .index_search_row(ts, "", &insert.app, &insert.title, &clip)
             .map_err(|e| e.to_string())?;
         store
             .prune_to(settings.byte_cap)
@@ -533,7 +535,7 @@ fn capture_once(shared: &Shared, settings: &Settings) -> Result<(), String> {
     shared.last_dhash.store(hash, Ordering::SeqCst);
     shared.last_write_ms.store(ts as u64, Ordering::SeqCst);
     emit(&Event::frame_written(&insert));
-    Ok(())
+    Ok(false)
 }
 
 fn day_stamp(ts: i64) -> String {
@@ -707,8 +709,13 @@ impl Shared {
         &self.paths
     }
 
+    #[allow(dead_code)]
     pub fn is_armed(&self) -> bool {
         self.armed.load(Ordering::SeqCst)
+    }
+
+    pub fn is_recording(&self) -> bool {
+        evaluate_pause(self).is_none()
     }
 
     pub fn is_idle(&self) -> bool {
