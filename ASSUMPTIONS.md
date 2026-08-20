@@ -22,7 +22,7 @@ Conservative choices where the Omarchy / Quickshell / Hyprland API was not 100% 
 - **`Hyprland.rawEvent`** is used only as a lock/unlock hint. Pause truth for lock/idle/exclusion/portal lives in rewindd (`pidof hyprlock`, `loginctl`, `hyprctl -j clients`, `pw-dump`).
 - **`Hyprland.dispatch` / `hyprctl dispatch`** take a Lua dispatcher as a single argument (`hl.dsp.exec_cmd(...)`, `hl.dsp.window.move({...})`). Classic `exec` / `movetoworkspacesilent` / `movewindowpixel` names become `hl.dispatch(<classic>)` and are a Lua syntax error on Hyprland 0.55+. If QML `dispatch` throws, `hyprctl dispatch <lua-expr>` is spawned.
 - **No invented Quickshell APIs.** Capture, encode, OCR, SQLite, and clipboard watching are all in rewindd.
-- **Opt-in keybinds.** Super+R (overlay summon) and Super+Shift+R (toggleArm) are not written until the user clicks **Add keybindings**. That appends a marked `o.bind` block to `~/.config/hypr/bindings.lua` after `hyprctl -j binds`. Occupied combos fall back to Super+Alt variants. Super+Ctrl+R is never used. Never `hl.unbind` of someone else's shortcut.
+- **Keybinds auto-assign on first load.** Super+R (overlay summon) and Super+Shift+R (toggleArm) are written to `~/.config/hypr/bindings.lua` if they are free. If any of this plugin's binds is already live, skip (no notify spam). Occupied combos fall back to Super+Alt variants. Super+Ctrl+R is Omarchy “Set reminder” and is never used. Never `hl.unbind` of someone else's shortcut. Notify with `omarchy notification send` only after a successful write.
 
 ## Capture
 

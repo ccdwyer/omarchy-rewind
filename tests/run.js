@@ -116,6 +116,29 @@ test("binds: skip when preferred and alternate are taken", () => {
   assert.ok(p.note.indexOf("skipped SUPER + R") >= 0)
 })
 
+test("binds: notify body lists assigned keys", () => {
+  const body = Binds.notifyBody([{ chosen: "SUPER + R", desc: "Rewind overlay" }], [])
+  assert.ok(body.indexOf("SUPER + R — Rewind overlay") === 0)
+  const argv = Binds.notifyArgv("Rewind", "Rewind keybindings", body)
+  assert.strictEqual(argv[0], "omarchy")
+  assert.strictEqual(argv[1], "notification")
+  assert.strictEqual(argv[2], "send")
+  assert.ok(Binds.claimAuto())
+  assert.strictEqual(Binds.claimAuto(), false)
+})
+
+test("binds: service auto-assigns on first scan, overlay has no Add keybindings", () => {
+  const src = fs.readFileSync(path.join(ROOT, "Service.qml"), "utf8")
+  assert.ok(src.indexOf("Binds.claimAuto()") >= 0)
+  assert.ok(src.indexOf("notifyNewBinds") >= 0)
+  assert.ok(src.indexOf("compat/install-binds.py") >= 0)
+  const overlay = fs.readFileSync(path.join(ROOT, "Overlay.qml"), "utf8")
+  assert.ok(overlay.indexOf("Add keybindings") < 0)
+  const bar = fs.readFileSync(path.join(ROOT, "BarWidget.qml"), "utf8")
+  assert.ok(bar.indexOf("Add keybindings") < 0)
+  assert.ok(bar.indexOf("text: \"keys\"") < 0)
+})
+
 test("protocol: parses frame-written and replies", () => {
   const ev = Protocol.parseLine('{"event":"frame-written","ts":1,"path":"/x.png","bytes":40}')
   assert.strictEqual(Protocol.isFrame(ev), true)

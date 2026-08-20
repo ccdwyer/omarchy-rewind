@@ -61,7 +61,7 @@ Optional garnish, never required:
 | Clipboard history | **Long-press** the chip, then Enter to re-copy |
 | Wipe | Overlay “wipe today”, or `./scripts/rewind wipe today\|all\|range` |
 
-If Super+R / Super+Shift+R are free, the overlay first-run card, the empty timeline card, and a **keys** chip on the bar offer **Add keybindings**. That writes `o.bind` lines to `~/.config/hypr/bindings.lua` (Hyprland reloads on save). Combos you already use are skipped; Super+R falls back to Super+Alt+R, Super+Shift+R to Super+Alt+Shift+R. Super+Ctrl+R is Omarchy “Set reminder” and is never used. The plugin never unbinds someone else's shortcut.
+On first load the plugin writes Super+R / Super+Shift+R to `~/.config/hypr/bindings.lua` if the combos are free, then pops an Omarchy notification with the keys it assigned. Occupied shortcuts (including stock Omarchy hotkeys) are skipped or replaced with Super+Alt variants. Super+Ctrl+R is Omarchy “Set reminder” and is never used. It never unbinds someone else's key, and it will not notify again once its binds are already live.
 
 ```
 omarchy-shell shell summon io.github.chris.rewind '{}'
@@ -149,7 +149,7 @@ Data lives at `$XDG_DATA_HOME/rewind` (default `~/.local/share/rewind`), created
 - **Lock/idle** prefer the compositor + `pidof hyprlock` + `loginctl`. The grim fallback cannot open a wlr-screencopy session.
 - **No at-rest encryption.** Roadmap, not v1. Wipe anytime.
 - **No second Quickshell process.** Helper is a rust binary talking NDJSON on stdio. The POSIX `compat/rewindd.sh` is a non-recording protocol stub, not a second capture path.
-- **Keybinds are yours.**
+- **Keybinds auto-assign on first load.** Super+R / Super+Shift+R are written if free; occupied combos (including stock Omarchy hotkeys) are skipped or replaced with Super+Alt variants. Super+Ctrl+R is never used. Never `hl.unbind`. Notify only after a successful write.
 - **CPU% / GB/day** are not fictionalized. Measure on device; the daemon records per-frame bytes.
 
 ## Privacy proofs
