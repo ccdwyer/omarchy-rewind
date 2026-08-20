@@ -235,6 +235,45 @@ impl Store {
     /// storage over the cap. Returns the on-disk frame/crop paths to unlink
     /// after the transaction commits (file removal cannot be transactional).
     /// Any SQL error propagates and rolls back the whole capture.
+    /// Total bytes of ALL retained observation data counted against the cap:
+    /// frame thumbnails + full-res OCR crops + clipboard content + window
+    /// layouts + OCR/search text. Each sub-total is tolerant of a missing table
+    /// (unwrap_or(0)) so it works before optional tables/FTS exist. Clipboard-,
+    /// layout- and OCR-only growth are therefore bounded, not just frames.
+    /// (WAL/page overhead is bounded separately by the truncating checkpoint.)
+    fn managed_total(conn: &rusqlite::Connection) -> i64 {
+        let q = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap_or(0) };
+        q("SELECT COALESCE(SUM(bytes),0)+COALESCE(SUM(crop_bytes),0) FROM frames")
+            + q("SELECT COALESCE(SUM(LENGTH(content)),0) FROM clips")
+            + q("SELECT COALESCE(SUM(LENGTH(json)),0) FROM layouts")
+            + q("SELECT COALESCE(SUM(LENGTH(text)),0) FROM ocr")
+            + q("SELECT COALESCE(SUM(LENGTH(text)),0) FROM search_fallback")
+    }
+
+    /// Oldest timestamp across every observation table (frames, clips, layouts,
+    /// events), so pruning advances through clipboard-/layout-only periods that
+    /// carry no frame — not just frame windows.
+    fn oldest_ts(conn: &rusqlite::Connection, after: Option<i64>) -> Option<i64> {
+        let union = "SELECT ts FROM frames{w}
+             UNION ALL SELECT ts FROM clips{w}
+             UNION ALL SELECT ts FROM layouts{w}
+             UNION ALL SELECT ts FROM events{w}";
+        match after {
+            Some(a) => {
+                let sql = format!("SELECT MIN(ts) FROM ({})", union.replace("{w}", " WHERE ts>?1"));
+                conn.query_row(&sql, params![a], |r| r.get::<_, Option<i64>>(0))
+                    .ok()
+                    .flatten()
+            }
+            None => {
+                let sql = format!("SELECT MIN(ts) FROM ({})", union.replace("{w}", ""));
+                conn.query_row(&sql, [], |r| r.get::<_, Option<i64>>(0))
+                    .ok()
+                    .flatten()
+            }
+        }
+    }
+
     fn prune_within_tx(
         tx: &rusqlite::Transaction<'_>,
         cap: i64,
@@ -244,26 +283,14 @@ impl Store {
             return Ok(unlink);
         }
         loop {
-            let total: i64 = tx
-                .query_row("SELECT COALESCE(SUM(bytes),0)+COALESCE(SUM(crop_bytes),0) FROM frames", [], |r| r.get(0))
-                .map_err(|e| e.to_string())?;
+            let total = Self::managed_total(tx);
             if total <= cap {
                 break;
             }
-            let oldest: Option<i64> = tx
-                .query_row("SELECT MIN(ts) FROM frames", [], |r| {
-                    r.get::<_, Option<i64>>(0)
-                })
-                .map_err(|e| e.to_string())?;
-            let Some(ts) = oldest else { break };
-            let next: Option<i64> = tx
-                .query_row("SELECT MIN(ts) FROM frames WHERE ts > ?1", params![ts], |r| {
-                    r.get::<_, Option<i64>>(0)
-                })
-                .map_err(|e| e.to_string())?;
+            let Some(ts) = Self::oldest_ts(tx, None) else { break };
+            let next = Self::oldest_ts(tx, Some(ts));
             let hi = next.map(|n| n.saturating_sub(1)).unwrap_or(i64::MAX);
-            // Collect the files in this window before deleting the rows.
-            let mut removed_here = 0usize;
+            // Collect the frame + crop files in this window before deleting rows.
             {
                 let mut stmt = tx
                     .prepare("SELECT path, crop_path FROM frames WHERE ts>=?1 AND ts<=?2")
@@ -275,10 +302,13 @@ impl Store {
                     .map_err(|e| e.to_string())?;
                 for r in rows {
                     unlink.push(r.map_err(|e| e.to_string())?);
-                    removed_here += 1;
                 }
             }
-            for (table, has) in [
+            // Delete every observation row in the oldest window across all
+            // tables (clipboard-only periods included), counting total rows
+            // removed to guarantee forward progress.
+            let mut removed_here = 0usize;
+            for (table, required) in [
                 ("frames", true),
                 ("clips", true),
                 ("layouts", true),
@@ -289,11 +319,11 @@ impl Store {
             ] {
                 let sql = format!("DELETE FROM {table} WHERE ts>=?1 AND ts<=?2");
                 let res = tx.execute(&sql, params![ts, hi]);
-                if has {
-                    res.map_err(|e| e.to_string())?;
+                if required {
+                    removed_here += res.map_err(|e| e.to_string())?;
                 } else {
                     // ocr/search_fallback may not exist depending on FTS build.
-                    let _ = res;
+                    removed_here += res.unwrap_or(0);
                 }
             }
             // Guard against a pathological no-progress loop.
@@ -310,34 +340,14 @@ impl Store {
         }
         let mut removed = 0i64;
         loop {
-            let total: i64 = self
-                .conn
-                .query_row("SELECT COALESCE(SUM(bytes),0)+COALESCE(SUM(crop_bytes),0) FROM frames", [], |r| r.get(0))
-                .map_err(|e| e.to_string())?;
+            let total = Self::managed_total(&self.conn);
             if total <= cap {
                 break;
             }
-            let row: Option<(i64, String, Option<String>)> = self
-                .conn
-                .query_row(
-                    "SELECT ts, path, crop_path FROM frames ORDER BY ts ASC LIMIT 1",
-                    [],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                )
-                .optional()
-                .map_err(|e| e.to_string())?;
-            let Some((ts, _path, _crop)) = row else {
+            let Some(ts) = Self::oldest_ts(&self.conn, None) else {
                 break;
             };
-            let next: Option<i64> = self
-                .conn
-                .query_row(
-                    "SELECT MIN(ts) FROM frames WHERE ts > ?1",
-                    params![ts],
-                    |r| r.get::<_, Option<i64>>(0),
-                )
-                .ok()
-                .flatten();
+            let next = Self::oldest_ts(&self.conn, Some(ts));
             let hi = next.map(|n| n.saturating_sub(1)).unwrap_or(i64::MAX);
             self.delete_range(0, hi)?;
             removed += 1;
@@ -720,14 +730,14 @@ impl Store {
         if !still() {
             return Ok(false);
         }
-        tx.execute(
-            "UPDATE frames SET crop_path=NULL WHERE ts=?1",
-            params![ts],
-        )
-        .map_err(|e| e.to_string())?;
-        if !still() {
-            return Ok(false);
-        }
+        // Do NOT null crop_path here. The crop file is still on disk at this
+        // point; the caller deletes the file first and only then clears the
+        // metadata (`clear_crop`). If we nulled the path inside this commit and
+        // a privacy pause began before the file deletion ran, the row would no
+        // longer reference the file — leaving an untracked full-resolution crop
+        // that survives both pruning and wipe. Keeping crop_path set until the
+        // file is actually gone means an interrupted deletion still leaves the
+        // crop tracked, so a later prune/wipe reclaims it.
         tx.commit().map_err(|e| e.to_string())?;
         Ok(true)
     }
@@ -737,6 +747,7 @@ impl Store {
         ts: i64,
         mime: &str,
         content: &str,
+        byte_cap: i64,
         mut still: F,
     ) -> Result<bool, String>
     where
@@ -818,7 +829,20 @@ impl Store {
         if !still() {
             return Ok(false);
         }
+        // Clipboard content counts against the cap too, so prune oldest-first
+        // inside this same transaction — clipboard-heavy periods (even with no
+        // new frames) can no longer grow storage without bound.
+        let to_unlink = Self::prune_within_tx(&tx, byte_cap)?;
+        if !still() {
+            return Ok(false);
+        }
         tx.commit().map_err(|e| e.to_string())?;
+        for (path, crop) in to_unlink {
+            let _ = std::fs::remove_file(self.root.join(&path));
+            if let Some(c) = crop {
+                let _ = std::fs::remove_file(self.root.join(c));
+            }
+        }
         Ok(true)
     }
 
@@ -856,23 +880,80 @@ impl Store {
         Ok(out)
     }
 
+    /// Delete the full-resolution OCR crop file for `ts`, THEN clear its
+    /// metadata — but only null crop_path/crop_bytes once the file is actually
+    /// gone. If the unlink fails, the row keeps referencing the file so a later
+    /// prune/wipe still reclaims it (no untracked crop can survive).
     pub fn clear_crop(&self, ts: i64) -> Result<(), String> {
-        if let Ok(path) = self.conn.query_row(
-            "SELECT crop_path FROM frames WHERE ts=?1",
-            params![ts],
-            |r| r.get::<_, Option<String>>(0),
-        ) {
-            if let Some(p) = path {
-                let _ = std::fs::remove_file(self.root.join(p));
+        let path: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT crop_path FROM frames WHERE ts=?1",
+                params![ts],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .flatten();
+        let gone = match path {
+            Some(p) => {
+                let full = self.root.join(&p);
+                match std::fs::remove_file(&full) {
+                    Ok(()) => true,
+                    // Already absent counts as gone; any other error keeps the
+                    // path referenced so the file stays tracked for reclamation.
+                    Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+                }
+            }
+            None => true,
+        };
+        if gone {
+            self.conn
+                .execute(
+                    "UPDATE frames SET crop_path=NULL, crop_bytes=0 WHERE ts=?1",
+                    params![ts],
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Reclaim any full-resolution crop file on disk that no frames row still
+    /// references (e.g. a crop orphaned by an earlier interrupted deletion, or
+    /// left by a crash between the OCR commit and the file unlink). Run only in
+    /// an authorized, unpaused window. Returns the number of files removed.
+    pub fn sweep_orphan_crops(&self) -> Result<usize, String> {
+        let crops_dir = self.root.join("crops");
+        let entries = match std::fs::read_dir(&crops_dir) {
+            Ok(e) => e,
+            Err(_) => return Ok(0), // no crops dir yet: nothing to sweep
+        };
+        let mut removed = 0usize;
+        for entry in entries.flatten() {
+            let full = entry.path();
+            if !full.is_file() {
+                continue;
+            }
+            // Relative path as stored in crop_path (root-relative "crops/<name>").
+            let rel = match full.strip_prefix(&self.root) {
+                Ok(r) => r.to_string_lossy().to_string(),
+                Err(_) => continue,
+            };
+            let referenced: i64 = self
+                .conn
+                .query_row(
+                    "SELECT COUNT(1) FROM frames WHERE crop_path=?1",
+                    params![rel],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if referenced == 0 {
+                if std::fs::remove_file(&full).is_ok() {
+                    removed += 1;
+                }
             }
         }
-        self.conn
-            .execute(
-                "UPDATE frames SET crop_path=NULL, crop_bytes=0 WHERE ts=?1",
-                params![ts],
-            )
-            .map_err(|e| e.to_string())?;
-        Ok(())
+        Ok(removed)
     }
 
     pub fn search(&self, q: &str, limit: usize, from: i64, to: i64) -> Result<Value, String> {
@@ -1193,10 +1274,10 @@ impl Store {
             .conn
             .query_row("SELECT COUNT(*) FROM frames", [], |r| r.get(0))
             .map_err(|e| e.to_string())?;
-        let bytes: i64 = self
-            .conn
-            .query_row("SELECT COALESCE(SUM(bytes),0)+COALESCE(SUM(crop_bytes),0) FROM frames", [], |r| r.get(0))
-            .map_err(|e| e.to_string())?;
+        // Report the FULL managed total (frames+crops+clips+layouts+OCR text),
+        // so the "usage vs cap" the UI shows reflects everything that counts
+        // against the cap — not just frame bytes.
+        let bytes: i64 = Self::managed_total(&self.conn);
         let first_ts: i64 = self
             .conn
             .query_row("SELECT COALESCE(MIN(ts),0) FROM frames", [], |r| r.get(0))
@@ -1517,7 +1598,7 @@ mod tests {
         store.insert_frame(&sample(7, 10, "clip")).unwrap();
         let mut n = 0;
         let ok = store
-            .commit_clip_tx(7, "text/plain", "secret", || {
+            .commit_clip_tx(7, "text/plain", "secret", 0, || {
                 n += 1;
                 n < 2
             })
@@ -1656,5 +1737,85 @@ mod tests {
         store.wipe("today", 0, 0).unwrap();
         let snap = store.stats().unwrap();
         assert_eq!(snap.frames, 1);
+    }
+
+    #[test]
+    fn ocr_commit_keeps_crop_tracked_until_file_deleted() {
+        // Blocker 1: commit_ocr_tx must NOT null crop_path. If a pause lands
+        // between the OCR commit and the crop-file deletion, the crop must stay
+        // referenced so a later prune/wipe still reclaims it — never an
+        // untracked sensitive file surviving on disk.
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("rewind.db")).unwrap();
+        std::fs::create_dir_all(dir.path().join("crops")).unwrap();
+        let crop_rel = "crops/9.png";
+        std::fs::write(dir.path().join(crop_rel), b"SENSITIVE").unwrap();
+        let mut f = sample(9, 10, "x");
+        f.crop_path = Some(crop_rel.into());
+        f.crop_bytes = 9;
+        store.insert_frame(&f).unwrap();
+        let ok = store
+            .commit_ocr_tx(9, "hello", "kitty", "x", "", &[], || true)
+            .unwrap();
+        assert!(ok);
+        let still: Option<String> = store
+            .conn
+            .query_row("SELECT crop_path FROM frames WHERE ts=9", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            still.as_deref(),
+            Some(crop_rel),
+            "OCR commit leaves the crop tracked (deleted separately)"
+        );
+        assert!(dir.path().join(crop_rel).exists());
+        // The authorized cleanup deletes the file, THEN clears metadata.
+        store.clear_crop(9).unwrap();
+        assert!(!dir.path().join(crop_rel).exists(), "crop file deleted");
+        let after: Option<String> = store
+            .conn
+            .query_row("SELECT crop_path FROM frames WHERE ts=9", [], |r| r.get(0))
+            .unwrap();
+        assert!(after.is_none(), "crop_path cleared only after the file is gone");
+    }
+
+    #[test]
+    fn sweep_orphan_crops_removes_unreferenced_files() {
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("rewind.db")).unwrap();
+        std::fs::create_dir_all(dir.path().join("crops")).unwrap();
+        std::fs::write(dir.path().join("crops/ref.png"), b"r").unwrap();
+        std::fs::write(dir.path().join("crops/orphan.png"), b"o").unwrap();
+        let mut f = sample(1, 1, "ref");
+        f.crop_path = Some("crops/ref.png".into());
+        f.crop_bytes = 1;
+        store.insert_frame(&f).unwrap();
+        let removed = store.sweep_orphan_crops().unwrap();
+        assert_eq!(removed, 1, "only the unreferenced crop is swept");
+        assert!(dir.path().join("crops/ref.png").exists());
+        assert!(!dir.path().join("crops/orphan.png").exists());
+    }
+
+    #[test]
+    fn clipboard_growth_prunes_under_cap() {
+        // Blocker 5: clipboard-only growth (no frames) must trigger pruning and
+        // stay under the cap — clip content is counted in the managed total.
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("rewind.db")).unwrap();
+        let cap = 200i64;
+        for ts in 1..=50 {
+            store
+                .commit_clip_tx(ts, "text/plain", &"x".repeat(20), cap, || true)
+                .unwrap();
+        }
+        let total = Store::managed_total(&store.conn);
+        assert!(
+            total <= cap,
+            "clipboard-only growth must prune under cap (got {total})"
+        );
+        let n: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM clips", [], |r| r.get(0))
+            .unwrap();
+        assert!(n > 0 && n < 50, "oldest clips pruned, newest kept (n={n})");
     }
 }

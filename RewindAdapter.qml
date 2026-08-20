@@ -51,7 +51,12 @@ Item {
       if (rt && rt.length)
         return rt + "/rewind"
     } catch (e) {}
-    return dataDir()
+    // No runtime dir (rare — logind always sets one): fall back to a per-user
+    // path under /tmp, NEVER the persistent data dir. The service creates it
+    // 0700 (`mkdir -m 700`). Reboot-ephemeral and outside observation storage,
+    // so a transient read snapshot can never be written into persistent data.
+    var user = Quickshell.env("USER") || "user"
+    return "/tmp/rewind-" + user
   }
 
   function resolveHelper(dir) {

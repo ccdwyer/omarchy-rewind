@@ -177,6 +177,28 @@ pub fn dispatch(request: &str) -> Result<(), String> {
     }
 }
 
+/// Run `hyprctl dispatch <dispatcher> <arg>` with the dispatcher and its
+/// argument as SEPARATE argv items — the form Hyprland's dispatch expects.
+/// Passing the whole "dispatcher arg" string as one argv (as `dispatch` above
+/// does) mis-parses multi-word dispatchers; reopen must use this. Returns the
+/// real exit status so a failed step is not silently counted as success.
+pub fn dispatch_parts(dispatcher: &str, arg: &str) -> Result<(), String> {
+    let status = Command::new("hyprctl")
+        .arg("dispatch")
+        .arg(dispatcher)
+        .arg(arg)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| e.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("hyprctl dispatch {dispatcher} {arg} failed"))
+    }
+}
+
 pub fn locked() -> bool {
     if hyprlock_running() {
         return true;

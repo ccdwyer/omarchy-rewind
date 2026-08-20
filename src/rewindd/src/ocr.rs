@@ -132,16 +132,18 @@ pub(crate) fn process_pending(shared: &DaemonState) -> i64 {
                         .unwrap_or(Ok(false))
                         .unwrap_or(false)
                 });
-                // Only delete the crop once its text is durably committed AND the
-                // session is still in an OCR-writable state — never delete a crop
-                // belonging to an unwritten frame.
-                if committed
-                    && crate::still_recording(shared, gen, epoch0)
-                    && shared.ocr_may_write()
-                {
+                // The crop belongs to an already-committed, authorized frame.
+                // Once its text is durably committed the full-resolution crop is
+                // pure surplus sensitive data, so delete it UNCONDITIONALLY —
+                // even if a hard privacy pause (lock/overlay/…) engaged in the
+                // meantime. Deleting your own already-authorized crop reduces
+                // data on disk; it is privacy cleanup, never an observation
+                // write (same principle as immediate orphan-temp cleanup).
+                // `clear_crop` unlinks the file first and only nulls the row's
+                // crop_path/crop_bytes once the file is actually gone, so an
+                // interrupted unlink leaves the crop tracked for a later prune.
+                if committed {
                     let _ = std::fs::remove_file(&path);
-                    // The crop file is gone; drop its bytes from the managed
-                    // budget and null its path so it is no longer counted.
                     let _ = shared.with_store_mut(|s| s.clear_crop(ts));
                     done += 1;
                     emit(&Event::ocr_progress(done, queued));

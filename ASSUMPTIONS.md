@@ -8,7 +8,7 @@ Conservative choices where the Omarchy / Quickshell / Hyprland API was not 100% 
 - **Injected properties used:** `omarchyPath`, `shell`, `manifest`, `pluginRegistry`, `bar` (host load). **Not used:** `serviceFor` / `firstPartyServiceFor`. Overlay and bar widget talk to the service only through documented `omarchy-shell shell summon|hide|toggle|call <id> …`. FileView snapshots under `$XDG_DATA_HOME/rewind/` are written only while `armed && !paused`. While disarmed or paused, the bar polls `call <id> status '{}'` for live armed/paused state so it never depends on a stale `ui.json`.
 - **`keepLoaded: true`** so the overlay’s layer-shell window survives between summons (image-picker pattern). The spec’s kinds/entryPoints are otherwise unchanged.
 - **Settings are inline on the `shell.json` entry.** Widget keys live in `manifest.barWidget.defaults` + `schema`. The bar widget pushes them with `shell call … configure '<json>'`.
-- **Arm/consent persistence** is runtime state in `~/.local/share/rewind/state.json` (0600). Steady-state disarmed operation writes nothing. The one exception is the explicit consent-transition write (`persist_consent`) when the user accepts the consent screen, including “Keep disarmed.” Capture/OCR/settings/snapshots still require armed. Startup recording is `consentAt > 0 && armOnLogin` only; a bare persisted `armed` bit does not resume capture. `arm` is rejected until consent is recorded.
+- **Arm/consent persistence** is runtime state in `~/.local/share/rewind/state.json` (0600). Steady-state disarmed operation writes nothing. The one exception is the explicit consent-transition write (`persist_consent`) when the user accepts the consent screen, including “Keep disarmed.” Capture/OCR/settings/snapshots still require armed. `armOnLogin` is not persisted, so the daemon boots disarmed; startup auto-arm is deferred until the shell pushes `armOnLogin` (with `consentAt > 0`) via `configure`. A bare persisted `armed` bit does not resume capture. `arm` is rejected until consent is recorded.
 - **IPC replies:** `IpcHandler` methods return a string (consumed via Process `StdioCollector waitForEnd`). Query/timeline/moment/plan payloads are also published to the snapshot files so the overlay never depends on discarded `execDetached` stdout.
 - **Third-party id** is `io.github.chris.rewind`. Never `omarchy.*`.
 
@@ -55,7 +55,7 @@ Conservative choices where the Omarchy / Quickshell / Hyprland API was not 100% 
 
 ## Helper fallback
 
-- The competition brief asked for a missing-binary degrade path. `compat/rewindd.sh` speaks the same NDJSON protocol for query/wipe/stats/clips/timeline/moment/consent/configure, but **does not record**. A shell grim loop cannot honor the pause matrix or a persistent screencopy session; an unsafe partial recorder was rejected in review. Arm replies with `compat-norecord` and an error telling the user to run `build.sh`. Wipe rewrites `index.jsonl` / `clips.jsonl` atomically and drops missing files.
+- The competition brief asked for a missing-binary degrade path. `compat/rewindd.sh` speaks the same NDJSON protocol for query/wipe/stats/clips/timeline/moment/consent/configure, but **does not record**. A shell grim loop cannot honor the pause matrix or a persistent screencopy session; an unsafe partial recorder was rejected in review. Arm replies with `compat-norecord` and an error telling the user to run `build.sh`. Query/timeline/moment/clips/stats and wipe operate on the REAL `rewind.db` SQLite store (via `python3`'s bundled `sqlite3`), returning absolute frame paths and deleting the actual frame/ocr/clip/layout/event rows plus their files — never a legacy JSONL index. A wipe never reports success while data survives.
 
 ## Deviations from the spec (reference or honesty)
 
@@ -211,20 +211,30 @@ Conservative choices where the Omarchy / Quickshell / Hyprland API was not 100% 
   transaction, then reports the true count; a missing DB reports 0 honestly. No
   `eval` of untrusted settings strings (load_state/merge_configure read only
   numeric/bool runtime fields via a safe read).
-- **Quattro settings.** `state.json` persists only runtime consent/arm state
-  (`consentAt`, `armed`, `armOnLogin`). Every customization value (byte cap,
-  cadence, idle, excludes, title patterns) comes exclusively from the inline
-  shell.json entry via `configure`, never duplicated to disk.
+- **Quattro settings.** `state.json` persists only the runtime consent/arm
+  boundary (`consentAt`, `armed`). Every customization value — byte cap,
+  cadence, idle, excludes, title patterns, **and `armOnLogin`** — comes
+  exclusively from the inline shell.json entry via `configure`, never
+  duplicated to disk. `armOnLogin` is a user preference, so it is not persisted;
+  startup auto-arm is deferred until the shell delivers `armOnLogin` (with
+  recorded consent) via `configure` — never resumed from a stale on-disk bit.
 - **Fail-closed pause.** If `hyprctl -j clients` errors, `evaluate_pause` returns
   the hard `Unknown` pause (never None/Idle) — a transient IPC failure while a
   private/excluded window is on screen cannot let capture proceed.
 - **Synchronous overlay epoch.** Handling `set-pause reason=overlay` advances the
   privacy epoch synchronously, so an in-flight capture/clip job is invalidated
   the instant the overlay opens.
-- **OCR crops are in the managed byte budget.** `frames.crop_bytes` counts the
-  full-resolution OCR crop; the cap sums `bytes + crop_bytes` and prunes
-  frame/crop pairs together. OCR zeroes `crop_bytes` when it consumes+deletes a
-  crop, so crops cannot grow unbounded under the cap.
+- **The byte cap counts ALL retained observation data.** The managed total is
+  frame thumbnails + full-resolution OCR crops (`frames.crop_bytes`) + clipboard
+  content + window layouts + OCR/search text — not just frame bytes. Pruning
+  runs oldest-first on every growth path (capture AND clipboard commits), and
+  advances by the oldest timestamp across every observation table, so a
+  clipboard-, layout- or OCR-only period is bounded too, not only frame windows.
+  WAL/page overhead is bounded separately by the deferred truncating checkpoint.
+  OCR deletes a crop file first, then clears `crop_path`/`crop_bytes` only once
+  the file is actually gone — so an interrupted deletion leaves the crop tracked
+  for a later prune/wipe rather than orphaned; a `sweep_orphan_crops` pass in an
+  authorized window reclaims any pre-existing unreferenced crop.
 - **Cooperative shutdown.** On `shutdown` the daemon sets a `stopping` flag (the
   capture/OCR/clipboard workers check it and exit their loops), explicitly
   terminates the persistent `wl-paste` clipboard child (its own process group),

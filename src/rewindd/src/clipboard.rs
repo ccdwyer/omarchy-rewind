@@ -91,13 +91,24 @@ pub fn copy_text(text: &str) -> Result<(), String> {
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| e.to_string())?;
-    if let Some(stdin) = child.stdin.as_mut() {
+    // Write the payload, then drop stdin so wl-copy sees EOF and exits.
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "wl-copy stdin unavailable".to_string())?;
         stdin
             .write_all(text.as_bytes())
             .map_err(|e| e.to_string())?;
     }
-    let _ = child.wait();
-    Ok(())
+    // Report success only if wl-copy actually exited 0 — otherwise the caller
+    // must not claim the clip was recovered onto the clipboard.
+    let status = child.wait().map_err(|e| e.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("wl-copy failed".into())
+    }
 }
 
 pub(crate) fn watch(shared: Arc<DaemonState>) {
@@ -215,6 +226,7 @@ pub(crate) fn ingest(shared: &DaemonState, raw: &str) {
     // the cache only on success. Caching before validation would let a rejected
     // clip attach to the next valid frame (leaking into search data), so the
     // cache is only ever populated with a clip that actually committed.
+    let byte_cap = shared.settings.lock().map(|s| s.byte_cap).unwrap_or(0);
     let committed = crate::with_arm_read(shared, |arm| {
         if !crate::write_allowed(shared, arm, ticket) || shared.privacy_epoch() != epoch0 {
             return false;
@@ -222,7 +234,7 @@ pub(crate) fn ingest(shared: &DaemonState, raw: &str) {
         let ts = now_ms();
         shared
             .with_store_mut(|store| {
-                store.commit_clip_tx(ts, "text/plain", &text, || {
+                store.commit_clip_tx(ts, "text/plain", &text, byte_cap, || {
                     crate::write_allowed(shared, arm, ticket) && shared.privacy_epoch() == epoch0
                 })
             })

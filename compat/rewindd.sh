@@ -58,6 +58,8 @@ load_state() {
   fi
   # Read ONLY the runtime consent/arm fields (ints/bool), one per line — never
   # eval() a string field from disk, so a crafted state.json cannot inject shell.
+  # Read ONLY consentAt from disk. armOnLogin is inline customization delivered
+  # via configure, never persisted, so it is not read here.
   vals=$(python3 -c '
 import json,sys
 try:
@@ -65,12 +67,10 @@ try:
 except Exception:
     s={}
 print(int(s.get("consentAt") or 0))
-print(1 if s.get("armOnLogin") else 0)
 ' "$STATE" 2>/dev/null) || return 0
   CONSENT_AT=$(printf '%s\n' "$vals" | sed -n 1p)
-  ARMONLOGIN=$(printf '%s\n' "$vals" | sed -n 2p)
   case "$CONSENT_AT" in ''|*[!0-9]*) CONSENT_AT=0 ;; esac
-  case "$ARMONLOGIN" in ''|*[!0-9]*) ARMONLOGIN=0 ;; esac
+  ARMONLOGIN=0
   if [ "$CONSENT_AT" -gt 0 ]; then CONSENT=1; else CONSENT=0; fi
 }
 
@@ -83,20 +83,17 @@ save_state() {
     return 0
   fi
   prepare_data
+  # state.json holds ONLY the durable consent/arm boundary — NEVER any inline
+  # customization (byte cap, cadence, idle, excludes, title patterns, or
+  # armOnLogin). Those are single-sourced from the shell.json entry and pushed
+  # via `configure`; persisting them here would duplicate the Quattro settings
+  # model. (The fallback never records, so armed is always false.)
   python3 -c '
 import json,os,sys,tempfile
 path=sys.argv[1]
 body={
   "armed": False,
   "consentAt": int(sys.argv[2]),
-  "armOnLogin": sys.argv[3]=="1",
-  "byteCap": int(sys.argv[4]),
-  "cadenceMs": int(sys.argv[5]),
-  "idlePauseSec": int(sys.argv[6]),
-  "excludeApps": sys.argv[7],
-  "titlePausePatterns": sys.argv[8],
-  "record": False,
-  "reason": "compat-norecord",
 }
 d=os.path.dirname(path) or "."
 fd,tmp=tempfile.mkstemp(prefix=".state.",dir=d)
@@ -122,7 +119,7 @@ except Exception:
     except OSError:
         pass
     sys.exit(1)
-' "$STATE" "${CONSENT_AT:-0}" "$ARMONLOGIN" "$BYTECAP" "$CADENCE" "$IDLEPAUSE" "$EXCLUDES" "$TITLEPAUSE"
+' "$STATE" "${CONSENT_AT:-0}"
 }
 
 merge_configure() {
@@ -209,6 +206,10 @@ query_index() {
   python3 -c '
 import json,sys,os,sqlite3
 q=sys.argv[1]; db=sys.argv[2]
+root=os.path.dirname(os.path.abspath(db))
+def absf(p):
+    p=p or ""
+    return p if (not p or os.path.isabs(p)) else os.path.join(root,p)
 if not q or not os.path.exists(db):
     print(json.dumps({"hits":[],"ocrAvailable":False,"query":q})); sys.exit(0)
 try:
@@ -226,7 +227,7 @@ def add(ts,f,snippet=""):
     ts=int(ts or 0)
     if ts in seen: return
     seen.add(ts)
-    row={"ts":ts,"path":f["path"] if f else "","app":(f["app"] if f else "clipboard") or "",
+    row={"ts":ts,"path":absf(f["path"]) if f else "","app":(f["app"] if f else "clipboard") or "",
          "title":(f["title"] if f else "") or "","snippet":snippet,"boxes":[]}
     hits.append(row)
 def frame_at(ts):
@@ -261,11 +262,15 @@ timeline_json() {
   python3 -c '
 import json,sys,os,sqlite3
 db=sys.argv[1]; frames=[]
+root=os.path.dirname(os.path.abspath(db))
+def absf(p):
+    p=p or ""
+    return p if (not p or os.path.isabs(p)) else os.path.join(root,p)
 if os.path.exists(db):
     try:
         c=sqlite3.connect("file:%s?mode=ro"%db, uri=True); c.row_factory=sqlite3.Row
         rows=c.execute("SELECT ts,path,app,title,workspace,output FROM frames ORDER BY ts DESC LIMIT 400").fetchall()
-        frames=[{"ts":r["ts"],"path":r["path"],"app":r["app"] or "","title":r["title"] or "",
+        frames=[{"ts":r["ts"],"path":absf(r["path"]),"app":r["app"] or "","title":r["title"] or "",
                  "workspace":r["workspace"] or "","output":r["output"] or ""} for r in reversed(rows)]
         c.close()
     except Exception:
@@ -298,6 +303,9 @@ moment_json() {
   python3 -c '
 import json,sys,os,sqlite3
 ts=int(sys.argv[1] or 0); db=sys.argv[2]; root=sys.argv[3]
+def absf(p):
+    p=p or ""
+    return p if (not p or os.path.isabs(p)) else os.path.join(root,p)
 frame=None; clip=""; windows=[]
 if os.path.exists(db):
     try:
@@ -305,7 +313,7 @@ if os.path.exists(db):
         r=c.execute("SELECT ts,path,app,title,workspace,output FROM frames WHERE ts=?",(ts,)).fetchone() \
           or c.execute("SELECT ts,path,app,title,workspace,output FROM frames WHERE ts<=? ORDER BY ts DESC LIMIT 1",(ts,)).fetchone()
         if r:
-            frame={"ts":r["ts"],"path":r["path"],"app":r["app"] or "","title":r["title"] or "",
+            frame={"ts":r["ts"],"path":absf(r["path"]),"app":r["app"] or "","title":r["title"] or "",
                    "workspace":r["workspace"] or "","output":r["output"] or ""}
             cr=c.execute("SELECT content FROM clips WHERE ts<=? ORDER BY ts DESC LIMIT 1",(r["ts"],)).fetchone()
             clip=(cr["content"] if cr else "") or ""

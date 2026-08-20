@@ -324,6 +324,21 @@ fn handle_command(shared: &Arc<Shared>, cmd: Command) {
         }
         Command::Configure { id, settings } => {
             apply_settings(shared, settings);
+            // Startup auto-arm is DEFERRED to here: `armOnLogin` is inline
+            // shell.json customization, not persisted, so we only auto-arm once
+            // the shell has delivered it — and only with recorded consent and
+            // when not already recording. This is the sole place a Configure can
+            // start recording.
+            let (consent, want, already) = {
+                let st = shared.settings.lock().unwrap();
+                let already = shared.gate.read().map(|g| g.armed).unwrap_or(false);
+                (st.consent_at > 0, st.arm_on_login, already)
+            };
+            if consent && want && !already {
+                if let Err(e) = arm_now(shared) {
+                    emit(&Event::error(Some(id), e));
+                }
+            }
             emit_state(shared, id);
         }
         Command::Query { id, q, limit, from, to } => match query_locked(shared, &q, limit, from, to)
@@ -571,45 +586,59 @@ fn execute_plan(plan: serde_json::Value) -> Result<serde_json::Value, String> {
         .cloned()
         .unwrap_or_default();
     let mut ran = Vec::new();
+    let mut failed = Vec::new();
     for step in steps {
         let kind = step.get("kind").and_then(|k| k.as_str()).unwrap_or("");
-        match kind {
-            "exec" => {
-                if let Some(cmd) = step.get("cmd").and_then(|c| c.as_str()) {
-                    let ws = step
-                        .get("workspace")
-                        .and_then(|w| w.as_i64())
-                        .unwrap_or(1);
-                    let req = format!("[workspace {ws} silent] {cmd}");
-                    let _ = hypr::dispatch(&format!("exec {req}"));
-                    ran.push(step);
+        // Each dispatch passes the dispatcher and its argument as SEPARATE argv
+        // items (dispatch_parts), and we record the step only when hyprctl
+        // actually reports success — a failed step is surfaced, never counted
+        // as done.
+        let result: Option<Result<(), String>> = match kind {
+            "exec" => step.get("cmd").and_then(|c| c.as_str()).map(|cmd| {
+                let ws = step.get("workspace").and_then(|w| w.as_i64()).unwrap_or(1);
+                hypr::dispatch_parts("exec", &format!("[workspace {ws} silent] {cmd}"))
+            }),
+            "move" => match (
+                step.get("address").and_then(|a| a.as_str()),
+                step.get("workspace").and_then(|w| w.as_i64()),
+            ) {
+                (Some(addr), Some(ws)) => Some(hypr::dispatch_parts(
+                    "movetoworkspacesilent",
+                    &format!("{ws},address:{addr}"),
+                )),
+                _ => None,
+            },
+            "geometry" => match (
+                step.get("address").and_then(|a| a.as_str()),
+                step.get("x").and_then(|v| v.as_i64()),
+                step.get("y").and_then(|v| v.as_i64()),
+            ) {
+                (Some(addr), Some(x), Some(y)) => Some(hypr::dispatch_parts(
+                    "movewindowpixel",
+                    &format!("exact {x} {y},address:{addr}"),
+                )),
+                _ => None,
+            },
+            _ => None,
+        };
+        match result {
+            Some(Ok(())) => ran.push(step),
+            Some(Err(e)) => {
+                let mut f = step.clone();
+                if let Some(obj) = f.as_object_mut() {
+                    obj.insert("error".into(), json!(e));
                 }
+                failed.push(f);
             }
-            "move" => {
-                if let (Some(addr), Some(ws)) = (
-                    step.get("address").and_then(|a| a.as_str()),
-                    step.get("workspace").and_then(|w| w.as_i64()),
-                ) {
-                    let _ = hypr::dispatch(&format!("movetoworkspacesilent {ws},address:{addr}"));
-                    ran.push(step);
-                }
-            }
-            "geometry" => {
-                if let (Some(addr), Some(x), Some(y)) = (
-                    step.get("address").and_then(|a| a.as_str()),
-                    step.get("x").and_then(|v| v.as_i64()),
-                    step.get("y").and_then(|v| v.as_i64()),
-                ) {
-                    let _ = hypr::dispatch(&format!(
-                        "movewindowpixel exact {x} {y},address:{addr}"
-                    ));
-                    ran.push(step);
-                }
-            }
-            _ => {}
+            None => {} // malformed/unknown step: neither ran nor failed
         }
     }
-    Ok(json!({"ran": ran.len(), "steps": ran}))
+    Ok(json!({
+        "ran": ran.len(),
+        "failed": failed.len(),
+        "steps": ran,
+        "failures": failed
+    }))
 }
 
 fn copy_clip(shared: &Shared, ts: i64) -> Result<serde_json::Value, String> {
@@ -903,6 +932,10 @@ fn flush_deferred(shared: &Shared) {
                 shared.pending_settings_save.store(true, Ordering::SeqCst);
             }
         }
+        // (4) Reclaim any crop file left with no referencing row (e.g. a crash
+        // between an OCR commit and the crop unlink). Safe cleanup of sensitive
+        // surplus data in this authorized, unpaused window.
+        let _ = shared.with_store(|s| s.sweep_orphan_crops());
     });
 }
 
@@ -2717,14 +2750,19 @@ mod tests {
         flush_deferred(&shared);
         assert!(!shared.pending_settings_save.load(Ordering::SeqCst));
         let after = std::fs::read_to_string(&state).unwrap_or_default();
+        // The deferred save lands once recording resumes: the persisted runtime
+        // consent/arm boundary is present (we armed above).
         assert!(
-            after.contains("armOnLogin") && after.contains("true"),
+            after.contains("consentAt") && after.contains("armed"),
             "the deferred runtime-state save is written once recording resumes"
         );
-        // Customization must never reach disk, paused or not.
+        // Customization must NEVER reach disk — including armOnLogin, which we
+        // just set to true above. It is inline shell.json state, not persisted.
         assert!(
-            !after.contains("byteCap") && !after.contains("excludeApps"),
-            "customization settings must not be persisted to state.json"
+            !after.contains("armOnLogin")
+                && !after.contains("byteCap")
+                && !after.contains("excludeApps"),
+            "customization (incl. armOnLogin) must not be persisted to state.json"
         );
         std::env::remove_var("REWIND_TEST_CAPTURE");
     }

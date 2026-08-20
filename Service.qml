@@ -314,18 +314,22 @@ Item {
       return "consent"
     }
     send("arm", root.settingsPayload())
-    return root.status()
+    // Return a benign ack — NOT status(). The command is asynchronous; the
+    // helper's authoritative `state` event (which sets root.armed and republishes
+    // ui.json) is the ONLY thing the chip renders from. Returning the pre-toggle
+    // status here would let a caller paint stale state.
+    return "ok"
   }
 
   function disarm() {
-    // Do NOT optimistically flip armed/paused here. Recording is still on until
-    // the helper acknowledges the disarm (it replies with an authoritative
-    // `state` event that sets armed=false). If `send` fails (stdin-failed) the
-    // helper keeps recording and armed stays true — so the bar never shows
-    // "disarmed" while recording is actually still running, and never on a
-    // failed disarm. status() returns the current (pre-ack) truthful state.
+    // Do NOT optimistically flip armed/paused here, and do NOT return a status:
+    // recording is still on until the helper acknowledges the disarm with its
+    // authoritative `state` event (which sets armed=false and republishes
+    // ui.json). If `send` fails (stdin-failed) the helper keeps recording and
+    // armed stays true — so the chip, which renders only from the acknowledged
+    // state, never shows "disarmed" while recording is actually still running.
     send("disarm", {})
-    return root.status()
+    return "ok"
   }
 
   function toggleArm(arg) {

@@ -58,12 +58,14 @@ impl Default for Settings {
     }
 }
 
-/// The ONLY thing persisted to `state.json`: runtime consent/arm state. Every
-/// customization value (byte cap, cadence, idle, excludes, title patterns) comes
-/// exclusively from the inline plugin entry in `shell.json`, pushed to the
-/// daemon via `configure` — never duplicated to disk, per the Quattro single
-/// source-of-truth settings model. Persisting these three is not customization;
-/// it is the durable consent boundary the privacy contract requires.
+/// The ONLY thing persisted to `state.json`: runtime consent/arm state. EVERY
+/// customization value — including `armOnLogin` — comes exclusively from the
+/// inline plugin entry in `shell.json`, pushed to the daemon via `configure`,
+/// never duplicated to disk, per the Quattro single source-of-truth settings
+/// model. `armOnLogin` is a user preference (customization), so it is NOT
+/// persisted here; startup auto-arm waits until the shell delivers it. The two
+/// fields below are not customization — they are the durable consent boundary
+/// the privacy contract requires.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct PersistedState {
@@ -71,8 +73,6 @@ struct PersistedState {
     consent_at: i64,
     #[serde(default)]
     armed: bool,
-    #[serde(default)]
-    arm_on_login: bool,
 }
 
 impl Settings {
@@ -89,7 +89,10 @@ impl Settings {
         let mut s = Settings::default();
         s.consent_at = p.consent_at;
         s.armed = p.armed;
-        s.arm_on_login = p.arm_on_login;
+        // arm_on_login is deliberately NOT read from disk — it is inline
+        // shell.json customization delivered via `configure`. It stays at its
+        // default (false) until the shell pushes it, so startup never auto-arms
+        // from a stale on-disk preference.
         Ok(s)
     }
 
@@ -100,7 +103,6 @@ impl Settings {
         let persisted = PersistedState {
             consent_at: self.consent_at,
             armed: self.armed,
-            arm_on_login: self.arm_on_login,
         };
         let body = serde_json::to_string_pretty(&persisted).map_err(|e| e.to_string())?;
         let tmp = path.with_file_name(format!(

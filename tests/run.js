@@ -473,22 +473,30 @@ test("compat fallback operates on the sqlite store, not a legacy jsonl index", (
   assert.ok(!/eval\s+"\$\(/.test(sh), "no eval of untrusted python/settings output")
 })
 
-test("bar polls live status and toggleArm always sends an arg", () => {
+test("bar chip renders only from the authoritative daemon state, not the toggle reply", () => {
   const bar = fs.readFileSync(path.join(ROOT, "BarWidget.qml"), "utf8")
   assert.ok(bar.indexOf("function applyLive") >= 0)
   assert.ok(bar.indexOf("function pollStatus") >= 0)
   assert.ok(bar.indexOf("interval: 2500") >= 0)
   assert.ok(bar.indexOf("interval: 400") < 0)
-  // toggleArm runs through a reply-capturing process (blocker r14/4: the dot
-  // must reflect the helper's authoritative post-toggle reply, not a racing
-  // poll) and still always sends the "{}" arg.
-  assert.ok(bar.indexOf("id: toggleProc") >= 0)
-  assert.ok(bar.indexOf('"toggleArm", "{}"') >= 0)
+  // Blocker r16/2 — definitive fix: the chip's displayed state is DECOUPLED
+  // from the toggle command. toggleArm is fire-and-forget (execDetached) and
+  // its reply is never consumed for display; the chip renders only from the
+  // daemon-authoritative snapshot (ui.json, written after the helper actually
+  // arms/disarms) and the periodic status poll. So the dot can never show
+  // "disarmed" while recording is on, nor optimistically flip before ack.
+  assert.ok(bar.indexOf('"toggleArm", "{}"') >= 0, "toggleArm still sends the {} arg")
+  assert.ok(bar.indexOf("id: toggleProc") < 0, "no reply-capturing toggle process")
   const togIdx = bar.indexOf("function toggleArm")
   const togEnd = bar.indexOf("\n  function ", togIdx + 1)
   const togBody = bar.slice(togIdx, togEnd < 0 ? togIdx + 800 : togEnd)
-  assert.ok(togBody.indexOf("toggleProc") >= 0)
+  assert.ok(togBody.indexOf("execDetached") >= 0, "toggle is fire-and-forget")
+  assert.ok(togBody.indexOf("applyLive") < 0, "toggle reply is not applied to the chip")
   assert.ok(togBody.indexOf("pollStatus") < 0) // no racing poll after toggle
+  // The only inputs to the chip's armed/paused state are the daemon channel:
+  // the ui.json FileView and the periodic status poll — both authoritative.
+  assert.ok(/uiView[\s\S]*applyLive|applyLive[\s\S]*uiView/.test(bar) || bar.indexOf("onLoaded: root.applyLive(text())") >= 0,
+    "chip state comes from the ui.json snapshot")
   const overlay = fs.readFileSync(path.join(ROOT, "Overlay.qml"), "utf8")
   assert.ok(overlay.indexOf("Channel.applyLiveUi") >= 0)
   assert.ok(overlay.indexOf("Channel.overlayViewAfterRefresh") >= 0)
@@ -595,7 +603,7 @@ test("compat arm without consent is rejected and does not record consent", () =>
   }
 })
 
-test("compat consent persists armOnLogin and still does not record", () => {
+test("compat consent persists only consent (not armOnLogin) and still does not record", () => {
   const os = require("os")
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "rewind-consent-"))
   const env = Object.assign({}, process.env, { REWIND_DATA_DIR: tmp })
@@ -607,9 +615,13 @@ test("compat consent persists armOnLogin and still does not record", () => {
     input: '{"cmd":"consent","id":1,"armNow":true,"armOnLogin":true}\n{"cmd":"arm","id":2}\n{"cmd":"shutdown","id":3}\n'
   })
   assert.strictEqual(r.status, 0, r.stderr + r.stdout)
-  const st = JSON.parse(fs.readFileSync(path.join(tmp, "state.json"), "utf8"))
-  assert.ok(st.consentAt > 0)
-  assert.strictEqual(st.armOnLogin, true)
+  const raw = fs.readFileSync(path.join(tmp, "state.json"), "utf8")
+  const st = JSON.parse(raw)
+  assert.ok(st.consentAt > 0, "consent boundary is persisted")
+  // Blocker r16/4: armOnLogin is inline shell.json customization, NOT persisted
+  // to state.json — even though the consent command carried armOnLogin:true.
+  assert.ok(!("armOnLogin" in st), "armOnLogin must NOT be persisted to state.json")
+  assert.ok(raw.indexOf("byteCap") < 0 && raw.indexOf("excludeApps") < 0, "no customization on disk")
   assert.ok(r.stdout.indexOf("does not record") >= 0, r.stdout)
   const files = fs.existsSync(path.join(tmp, "frames")) ? fs.readdirSync(path.join(tmp, "frames")) : []
   assert.strictEqual(files.length, 0)
