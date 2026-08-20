@@ -2,6 +2,8 @@ use crate::encode::which;
 use image::RgbaImage;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+#[cfg(feature = "wayland")]
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub struct RawFrame {
@@ -10,6 +12,8 @@ pub struct RawFrame {
     pub height: u32,
 }
 
+/// Preferred backend from compile-time/env probes. Prefer `CaptureSession::active_backend`
+/// for the backend actually in use after grim fallback.
 pub fn backend_name() -> &'static str {
     #[cfg(feature = "wayland")]
     {
@@ -37,7 +41,8 @@ pub fn next_cadence_ms(base_ms: u64, last_unchanged: bool) -> u64 {
 pub struct CaptureSession {
     #[cfg(feature = "wayland")]
     wlr: Option<capture_wlr::Session>,
-    grim_only: bool,
+    #[cfg(feature = "wayland")]
+    wlr_retry_at: Instant,
 }
 
 impl Default for CaptureSession {
@@ -51,14 +56,12 @@ impl CaptureSession {
         Self {
             #[cfg(feature = "wayland")]
             wlr: None,
-            grim_only: false,
+            #[cfg(feature = "wayland")]
+            wlr_retry_at: Instant::now(),
         }
     }
 
     pub fn using_grim(&self) -> bool {
-        if self.grim_only {
-            return true;
-        }
         #[cfg(feature = "wayland")]
         {
             return self.wlr.is_none();
@@ -69,30 +72,49 @@ impl CaptureSession {
         }
     }
 
+    /// Backend that served (or will serve) the last/next grab, not the env probe.
+    pub fn active_backend(&self) -> &'static str {
+        #[cfg(feature = "wayland")]
+        {
+            if self.wlr.is_some() {
+                return "wlr-screencopy";
+            }
+        }
+        if which("grim") {
+            "grim"
+        } else {
+            "missing"
+        }
+    }
+
+    #[cfg(feature = "wayland")]
+    fn bump_wlr_retry(&mut self) {
+        self.wlr_retry_at = Instant::now() + Duration::from_secs(15);
+    }
+
     pub fn grab(&mut self, output: &str) -> Result<RawFrame, String> {
         #[cfg(feature = "wayland")]
         {
-            if !self.grim_only {
-                if self.wlr.is_none() {
-                    match capture_wlr::Session::connect() {
-                        Ok(sess) => self.wlr = Some(sess),
-                        Err(err) => {
-                            eprintln!(
-                                "rewindd: wlr-screencopy connect failed ({err}); grim fallback"
-                            );
-                            self.grim_only = true;
-                        }
+            if self.wlr.is_none() && Instant::now() >= self.wlr_retry_at {
+                match capture_wlr::Session::connect() {
+                    Ok(sess) => self.wlr = Some(sess),
+                    Err(err) => {
+                        eprintln!(
+                            "rewindd: wlr-screencopy connect failed ({err}); grim fallback, will retry"
+                        );
+                        self.bump_wlr_retry();
                     }
                 }
-                if let Some(sess) = self.wlr.as_mut() {
-                    match sess.grab(output) {
-                        Ok(frame) => return Ok(frame),
-                        Err(err) => {
-                            eprintln!(
-                                "rewindd: wlr-screencopy grab failed ({err}); grim this tick"
-                            );
-                            self.wlr = None;
-                        }
+            }
+            if let Some(sess) = self.wlr.as_mut() {
+                match sess.grab(output) {
+                    Ok(frame) => return Ok(frame),
+                    Err(err) => {
+                        eprintln!(
+                            "rewindd: wlr-screencopy grab failed ({err}); grim this tick, will retry"
+                        );
+                        self.wlr = None;
+                        self.bump_wlr_retry();
                     }
                 }
             }
@@ -165,6 +187,16 @@ mod tests {
     fn backend_is_named() {
         let name = backend_name();
         assert!(name == "grim" || name == "missing" || name == "wlr-screencopy");
+    }
+
+    #[test]
+    fn active_backend_reports_session_not_probe() {
+        let session = CaptureSession::new();
+        let name = session.active_backend();
+        assert!(name == "grim" || name == "missing" || name == "wlr-screencopy");
+        if session.using_grim() {
+            assert_ne!(name, "wlr-screencopy");
+        }
     }
 
     #[test]

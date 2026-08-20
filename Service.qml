@@ -60,7 +60,7 @@ Item {
   property string lastQuery: ""
   property double firstTs: 0
   property double lastTs: 0
-  readonly property bool persistUi: root.consent || root.armed || root.frames > 0
+  readonly property bool persistUi: root.armed
 
   property double byteCapGb: 2
   property int cadenceMs: 3000
@@ -550,7 +550,12 @@ Item {
     function arm(): string { return root.arm() }
     function disarm(): string { return root.disarm() }
     function toggleArm(): string { return root.toggleArm() }
-    function summon(): string { return root.openTimeline() }
+    function summon(arg: string): string {
+      var raw = String(arg || "").trim()
+      if (raw && raw !== "undefined" && raw !== "null")
+        return root.summonOverlay(raw)
+      return root.openTimeline()
+    }
     function openTimeline(): string { return root.openTimeline() }
     function openClips(): string { return root.openClips() }
     function openConsent(): string { return root.openConsent() }

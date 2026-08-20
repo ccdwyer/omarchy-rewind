@@ -272,7 +272,7 @@ test("network-audit fails when binary is missing", () => {
 
 test("IpcHandler exposes JSON-arg methods", () => {
   const src = fs.readFileSync(path.join(ROOT, "Service.qml"), "utf8")
-  for (const name of ["consentNow", "copyClip", "executePlan", "wipe", "reopenPlan", "query", "refresh"]) {
+  for (const name of ["consentNow", "copyClip", "executePlan", "wipe", "reopenPlan", "query", "refresh", "summon"]) {
     assert.ok(src.indexOf("function " + name + "(arg: string)") >= 0
       || src.indexOf("function " + name + "(q: string)") >= 0, name)
   }
@@ -346,10 +346,26 @@ test("compat daemon writes nothing while disarmed", () => {
 
 test("service keeps snapshots in memory until consent/arm", () => {
   const src = fs.readFileSync(path.join(ROOT, "Service.qml"), "utf8")
-  assert.ok(src.indexOf("persistUi") >= 0)
+  assert.ok(/persistUi:\s*root\.armed/.test(src))
   assert.ok(src.indexOf("data.wiped") >= 0)
   assert.ok(src.indexOf("root.refreshTimeline()") >= 0)
   assert.ok(src.indexOf("root.armed = true") < 0)
+  assert.ok(src.indexOf("function summon(arg: string)") >= 0)
+})
+
+test("ocr does not treat disarmed as idle and capture reports runtime backend", () => {
+  const ocr = fs.readFileSync(path.join(ROOT, "src", "rewindd", "src", "ocr.rs"), "utf8")
+  assert.ok(ocr.indexOf("if !shared.is_armed()") >= 0)
+  const lib = fs.readFileSync(path.join(ROOT, "src", "rewindd", "src", "lib.rs"), "utf8")
+  const idleFn = lib.split("fn is_idle")[1] || ""
+  assert.ok(idleFn.indexOf("PauseReason::Idle") >= 0)
+  assert.ok(idleFn.split("fn with_store")[0].indexOf("PauseReason::Disarmed") < 0)
+  assert.ok(lib.indexOf("recording_now") >= 0)
+  assert.ok(lib.indexOf("finalize_capture") >= 0)
+  const cap = fs.readFileSync(path.join(ROOT, "src", "rewindd", "src", "capture.rs"), "utf8")
+  assert.ok(cap.indexOf("active_backend") >= 0)
+  assert.ok(cap.indexOf("wlr_retry_at") >= 0)
+  assert.ok(cap.indexOf("grim_only = true") < 0)
 })
 
 test("overlay refreshes and clears after wipe; range uses archive bounds", () => {

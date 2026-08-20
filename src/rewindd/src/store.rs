@@ -815,6 +815,36 @@ impl Store {
     }
 
     /// Crop origin/size in capture pixels plus output and stored-frame size.
+    pub fn mutation_counters(&self) -> Result<(i64, i64, i64, i64), String> {
+        let frames: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM frames", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        let events: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        let boxes: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM ocr_boxes", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        let clips: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM clips", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        Ok((frames, events, boxes, clips))
+    }
+
+    pub fn pending_crop_count(&self) -> Result<i64, String> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM frames WHERE crop_path IS NOT NULL AND crop_path != ''",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())
+    }
+
     pub fn frame_geom(&self, ts: i64) -> Option<FrameGeom> {
         self.conn
             .query_row(

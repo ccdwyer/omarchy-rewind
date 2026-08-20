@@ -18,64 +18,81 @@ pub(crate) fn idle_loop(shared: Arc<DaemonState>) {
     }
     loop {
         thread::sleep(Duration::from_secs(4));
-        if !shared.is_idle() {
+        let _ = process_pending(&shared);
+    }
+}
+
+/// One OCR pass. No-ops while disarmed — pending crops stay untouched.
+pub(crate) fn process_pending(shared: &DaemonState) -> i64 {
+    if !shared.is_armed() {
+        return 0;
+    }
+    if !shared.is_idle() {
+        return 0;
+    }
+    if !tesseract_available() {
+        return 0;
+    }
+    let pending = match shared.with_store(|s| s.pending_crops()) {
+        Some(Ok(p)) => p,
+        _ => return 0,
+    };
+    let queued = pending.len() as i64;
+    let mut done = 0i64;
+    for (ts, rel) in pending {
+        if !shared.is_armed() || !shared.is_idle() {
+            break;
+        }
+        let path = shared.data_paths().root.join(&rel);
+        if !path.exists() {
+            let _ = shared.with_store(|s| s.clear_crop(ts));
             continue;
         }
-        let pending = match shared.with_store(|s| s.pending_crops()) {
-            Some(Ok(p)) => p,
-            _ => continue,
-        };
-        let queued = pending.len() as i64;
-        let mut done = 0i64;
-        for (ts, rel) in pending {
-            if !shared.is_idle() {
-                break;
-            }
-            let path = shared.data_paths().root.join(&rel);
-            if !path.exists() {
-                let _ = shared.with_store(|s| s.clear_crop(ts));
-                continue;
-            }
-            match run_tesseract(&path) {
-                Ok((text, raw_boxes)) => {
-                    let meta = frame_geom(&shared, ts);
-                    let boxes: Vec<WordBox> = raw_boxes
-                        .into_iter()
-                        .map(|b| {
-                            if let Some(g) = &meta {
-                                scale_roi_to_frame(
-                                    (b.x, b.y, b.w, b.h),
-                                    g.crop_x,
-                                    g.crop_y,
-                                    g.crop_w,
-                                    g.crop_h,
-                                    g.out_w,
-                                    g.out_h,
-                                    g.stored_w,
-                                    g.stored_h,
-                                    &b.word,
-                                )
-                            } else {
-                                b
-                            }
-                        })
-                        .collect();
-                    let _ = shared.with_store(|store| {
-                        let (app, title) = store_app_title(store, ts);
-                        let clip = store.clip_at(ts).unwrap_or_default();
-                        let _ = store.index_search_row(ts, &text, &app, &title, &clip);
-                        let _ = store.insert_ocr_boxes(ts, &boxes);
-                        let _ = store.clear_crop(ts);
-                    });
-                    done += 1;
-                    emit(&Event::ocr_progress(done, queued));
+        match run_tesseract(&path) {
+            Ok((text, raw_boxes)) => {
+                if !shared.is_armed() {
+                    break;
                 }
-                Err(_) => {
+                let meta = frame_geom(shared, ts);
+                let boxes: Vec<WordBox> = raw_boxes
+                    .into_iter()
+                    .map(|b| {
+                        if let Some(g) = &meta {
+                            scale_roi_to_frame(
+                                (b.x, b.y, b.w, b.h),
+                                g.crop_x,
+                                g.crop_y,
+                                g.crop_w,
+                                g.crop_h,
+                                g.out_w,
+                                g.out_h,
+                                g.stored_w,
+                                g.stored_h,
+                                &b.word,
+                            )
+                        } else {
+                            b
+                        }
+                    })
+                    .collect();
+                let _ = shared.with_store(|store| {
+                    let (app, title) = store_app_title(store, ts);
+                    let clip = store.clip_at(ts).unwrap_or_default();
+                    let _ = store.index_search_row(ts, &text, &app, &title, &clip);
+                    let _ = store.insert_ocr_boxes(ts, &boxes);
+                    let _ = store.clear_crop(ts);
+                });
+                done += 1;
+                emit(&Event::ocr_progress(done, queued));
+            }
+            Err(_) => {
+                if shared.is_armed() {
                     let _ = shared.with_store(|s| s.clear_crop(ts));
                 }
             }
         }
     }
+    done
 }
 
 fn store_app_title(store: &crate::store::Store, ts: i64) -> (String, String) {
