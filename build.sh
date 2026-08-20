@@ -14,10 +14,17 @@ chmod +x "$ROOT/scripts/"*.sh 2>/dev/null || true
 chmod +x "$ROOT/scripts/rewind" 2>/dev/null || true
 
 install_fallback() {
-  cp "$ROOT/compat/rewindd.sh" "$OUT/rewindd"
-  chmod +x "$OUT/rewindd"
-  cp "$OUT/rewindd" "$OUT/rewind"
-  echo "build.sh: wrote $OUT/rewindd (POSIX fallback)"
+  # Keep the POSIX fallback ONLY at its compat path — do NOT write bin/rewindd.
+  # The QML probe treats an executable bin/rewindd as the real Rust helper
+  # (usingFallback=false); masquerading the shell fallback there would make the
+  # UI wrongly claim recording works. With bin/rewindd absent, the probe finds
+  # compat/rewindd.sh and reports "fallback" honestly (non-recording). The
+  # `rewind` CLI (wipe/stats/query) is still provided from the fallback so those
+  # commands work without the Rust binary.
+  rm -f "$OUT/rewindd"
+  cp "$ROOT/compat/rewindd.sh" "$OUT/rewind"
+  chmod +x "$OUT/rewind"
+  echo "build.sh: no Rust helper; recording unavailable. rewind CLI installed; daemon uses compat/rewindd.sh (fallback, non-recording)"
 }
 
 if ! command -v cargo >/dev/null 2>&1; then

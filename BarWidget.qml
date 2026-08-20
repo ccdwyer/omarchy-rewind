@@ -48,8 +48,15 @@ BarWidget {
   }
 
   function toggleArm() {
-    root.callShell("toggleArm", "{}")
-    root.pollStatus()
+    // Run toggleArm and apply ITS reply as the authoritative new state. The
+    // helper's toggleArm returns the post-toggle status, so the dot reflects
+    // what actually happened. A detached call + separate status poll would race:
+    // the poll could observe the pre-toggle state and show "disarmed" while
+    // recording had already started, breaking the bar-as-truth guarantee.
+    if (toggleProc.running)
+      return
+    toggleProc.command = ["omarchy-shell", "shell", "call", root.moduleName, "toggleArm", "{}"]
+    toggleProc.running = true
   }
 
   function pollStatus() {
@@ -94,6 +101,17 @@ BarWidget {
     running: false
     stdout: StdioCollector {
       waitForEnd: true
+      onStreamFinished: root.applyLive(text)
+    }
+  }
+
+  Process {
+    id: toggleProc
+    running: false
+    stdout: StdioCollector {
+      waitForEnd: true
+      // The toggleArm reply is the authoritative post-toggle state; apply it
+      // directly so the dot never lags or lies about recording state.
       onStreamFinished: root.applyLive(text)
     }
   }

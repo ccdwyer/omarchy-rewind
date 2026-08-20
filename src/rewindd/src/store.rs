@@ -651,6 +651,21 @@ impl Store {
             return Ok(false);
         }
         let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+        // INVARIANT: OCR only ever annotates a frame that was already captured
+        // and committed while armed-and-unpaused. `pending_crops()` sources ts
+        // values exclusively from committed `frames` rows, so OCR never touches
+        // unauthorized/new content — this check makes that explicit and also
+        // skips a frame the byte cap pruned between queueing and this commit.
+        // A missing frame row means there is nothing authorized to annotate:
+        // write nothing (the tx rolls back on drop).
+        let frame_exists: i64 = tx
+            .query_row("SELECT COUNT(1) FROM frames WHERE ts=?1", params![ts], |r| {
+                r.get(0)
+            })
+            .unwrap_or(0);
+        if frame_exists == 0 {
+            return Ok(false);
+        }
         let _ = tx.execute("DELETE FROM ocr WHERE ts=?1", params![ts]);
         if tx
             .execute(

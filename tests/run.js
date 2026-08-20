@@ -425,7 +425,16 @@ test("bar polls live status and toggleArm always sends an arg", () => {
   assert.ok(bar.indexOf("function pollStatus") >= 0)
   assert.ok(bar.indexOf("interval: 2500") >= 0)
   assert.ok(bar.indexOf("interval: 400") < 0)
-  assert.ok(bar.indexOf('callShell("toggleArm", "{}")') >= 0)
+  // toggleArm runs through a reply-capturing process (blocker r14/4: the dot
+  // must reflect the helper's authoritative post-toggle reply, not a racing
+  // poll) and still always sends the "{}" arg.
+  assert.ok(bar.indexOf("id: toggleProc") >= 0)
+  assert.ok(bar.indexOf('"toggleArm", "{}"') >= 0)
+  const togIdx = bar.indexOf("function toggleArm")
+  const togEnd = bar.indexOf("\n  function ", togIdx + 1)
+  const togBody = bar.slice(togIdx, togEnd < 0 ? togIdx + 800 : togEnd)
+  assert.ok(togBody.indexOf("toggleProc") >= 0)
+  assert.ok(togBody.indexOf("pollStatus") < 0) // no racing poll after toggle
   const overlay = fs.readFileSync(path.join(ROOT, "Overlay.qml"), "utf8")
   assert.ok(overlay.indexOf("Channel.applyLiveUi") >= 0)
   assert.ok(overlay.indexOf("Channel.overlayViewAfterRefresh") >= 0)

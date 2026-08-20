@@ -275,24 +275,56 @@ fn now_ms() -> i64 {
 }
 
 pub fn portal_screencast_active() -> bool {
-    if let Ok(out) = Command::new("pw-dump")
-        .stdin(Stdio::null())
-        .output()
-    {
-        let text = String::from_utf8_lossy(&out.stdout);
-        if parse_portal_dump(&text) {
-            return true;
+    match Command::new("pw-dump").stdin(Stdio::null()).output() {
+        // pw-dump ran and produced output we can parse.
+        Ok(out) if out.status.success() => {
+            parse_portal_dump(&String::from_utf8_lossy(&out.stdout))
         }
+        // pw-dump exists but failed (nonzero exit / unreadable): we cannot rule
+        // out an active screencast, so FAIL CLOSED — treat as sharing and pause.
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // pw-dump is not installed. PipeWire screencast (portal / OBS /
+            // wf-recorder) requires PipeWire, whose tooling ships pw-dump, so
+            // its absence means this signal is unavailable rather than uncertain
+            // about a live capture; the other pause signals still apply. (Legacy
+            // X11-only capture is a documented limitation.)
+            false
+        }
+        // Any other spawn failure is genuine uncertainty: fail closed.
+        Err(_) => true,
     }
-    false
 }
 
+/// True when the PipeWire graph shows an active screen-capture stream. Detects
+/// portal ScreenCast sessions and the common recorders (OBS, wf-recorder,
+/// gpu-screen-recorder, kooha, GNOME Shell), keyed on a screencast/portal marker
+/// paired with a video-stream node — including `Stream/Output/Video`, which the
+/// earlier check missed — so a screen share can never evade the pause. The
+/// marker requirement keeps ordinary video *playback* (e.g. mpv/browser, which
+/// also creates `Stream/Output/Video` nodes but no screencast marker) from
+/// falsely pausing recording.
 pub fn parse_portal_dump(dump: &str) -> bool {
     let lower = dump.to_ascii_lowercase();
-    (lower.contains("xdg-desktop-portal") || lower.contains("gnome-shell"))
-        && (lower.contains("screencast")
-            || lower.contains("stream/input/video")
-            || lower.contains("media.class\":\"video/source"))
+    // A node name that is unambiguously a screencast is conclusive on its own.
+    let explicit = lower.contains("xdg-desktop-portal-screencast")
+        || lower.contains("screen-cast")
+        || lower.contains("node.name\":\"screencast");
+    if explicit {
+        return true;
+    }
+    let video_stream = lower.contains("stream/input/video")
+        || lower.contains("stream/output/video")
+        || lower.contains("media.class\":\"video/source")
+        || lower.contains("video/source");
+    let screencast_marker = lower.contains("screencast")
+        || lower.contains("xdg-desktop-portal")
+        || lower.contains("gnome-shell")
+        || lower.contains("wf-recorder")
+        || lower.contains("gpu-screen-recorder")
+        || lower.contains("obs")
+        || lower.contains("kooha");
+    video_stream && screencast_marker
 }
 
 fn hyprctl(args: &[&str]) -> Result<String, String> {
@@ -330,5 +362,31 @@ mod tests {
         let dump = r#"[{"type":"PipeWire:Interface:Node","info":{"props":{"node.name":"xdg-desktop-portal-screencast","media.class":"Stream/Input/Video"}}}]"#;
         assert!(parse_portal_dump(dump));
         assert!(!parse_portal_dump(r#"[{"node.name":"firefox"}]"#));
+    }
+
+    #[test]
+    fn portal_dump_detects_output_video_screencast() {
+        // OBS / wf-recorder capture surfaces as Stream/Output/Video with a
+        // recorder marker — the class the earlier check missed. Must pause.
+        let obs = r#"[{"info":{"props":{"node.name":"OBS-Studio","media.class":"Stream/Output/Video"}}}]"#;
+        assert!(parse_portal_dump(obs));
+        let wfr = r#"[{"info":{"props":{"application.name":"wf-recorder","media.class":"Stream/Output/Video"}}}]"#;
+        assert!(parse_portal_dump(wfr));
+        // A portal screencast node name alone is conclusive.
+        let portal = r#"[{"info":{"props":{"node.name":"xdg-desktop-portal-ScreenCast"}}}]"#;
+        assert!(parse_portal_dump(portal));
+    }
+
+    #[test]
+    fn portal_dump_ignores_plain_video_playback() {
+        // Ordinary media playback also creates Stream/Output/Video nodes but has
+        // no screencast/recorder marker — it must NOT pause recording.
+        let mpv = r#"[{"info":{"props":{"node.name":"mpv","media.class":"Stream/Output/Video"}}}]"#;
+        assert!(!parse_portal_dump(mpv));
+        let browser = r#"[{"info":{"props":{"application.name":"Firefox","media.class":"Stream/Output/Video"}}}]"#;
+        assert!(!parse_portal_dump(browser));
+        // A webcam (Video/Source) without a screencast marker is not a share.
+        let cam = r#"[{"info":{"props":{"node.name":"v4l2 Camera","media.class":"Video/Source"}}}]"#;
+        assert!(!parse_portal_dump(cam));
     }
 }

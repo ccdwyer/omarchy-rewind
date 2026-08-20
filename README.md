@@ -136,7 +136,7 @@ Data lives at `$XDG_DATA_HOME/rewind` (default `~/.local/share/rewind`), created
 - **Reopen & arrange is a reviewable plan**, not session restore. Missing apps launch by `.desktop` mapping; browser tabs, documents, and unsaved state are listed as unrecoverable.
 - **Clipboard is text only.** Images and passwords in password-manager windows should never be captured because those apps pause recording while visible — still, do not arm Rewind over a password field in a terminal.
 - **OCR is optional.** Without tesseract, search is titles + clipboard + app names. That path is the one designed to demo well.
-- **Screencast pause is heuristic** (`pw-dump` node names). If detection misses, pause by opening the overlay or disarming.
+- **Screencast pause** reads the live PipeWire graph (`pw-dump`): it detects portal ScreenCast sessions and the common recorders (OBS, wf-recorder, gpu-screen-recorder, kooha, GNOME Shell) across `Stream/Input/Video` and `Stream/Output/Video` nodes, and **fails closed** — if `pw-dump` errors, capture pauses. The only gap is legacy X11-only screen capture (no PipeWire node); for that, pause by opening the overlay or disarming.
 - **Private-window pause is heuristic** on documented Firefox / Chrome / Brave title markers.
 - **Lock/idle** prefer the compositor + `pidof hyprlock` + `loginctl`. The grim fallback cannot open a wlr-screencopy session.
 - **No at-rest encryption.** Roadmap, not v1. Wipe anytime.

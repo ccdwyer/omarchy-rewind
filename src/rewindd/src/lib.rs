@@ -102,9 +102,29 @@ pub(crate) struct Shared {
     /// must not itself write to the database — that would be a write while
     /// paused. Transitions are buffered here with their original timestamp and
     /// flushed only inside an authorized, currently-unpaused transaction (see
-    /// `flush_pending_gaps`). Bounded so a long paused period cannot grow it
+    /// `flush_deferred`). Bounded so a long paused period cannot grow it
     /// without limit.
     pending_gaps: Mutex<Vec<(i64, &'static str, String)>>,
+    /// Uncommitted capture temp files whose deletion was deferred because a
+    /// privacy pause (or disarm) was active when the capture was rejected.
+    /// Deleting a file is a filesystem mutation, so it must not happen while
+    /// paused; the paths are buffered here and unlinked only in a later
+    /// authorized, unpaused window (`flush_deferred`). The files are
+    /// unreferenced by any database row, so they are never reachable by
+    /// query/search/overlay while they wait. Bounded.
+    pending_deletes: Mutex<Vec<PathBuf>>,
+    /// A WAL checkpoint owed to the database but deferred because it came due on
+    /// the disarm path (a checkpoint writes the db file). Performed only in a
+    /// later authorized, unpaused window. It merges already-committed authorized
+    /// data — it never persists new captured content.
+    pending_checkpoint: AtomicBool,
+    /// A settings save owed to disk but deferred because it came due while a
+    /// hard privacy pause was active (writing state.json is a filesystem
+    /// mutation). Flushed in a later authorized, unpaused window. Settings are
+    /// user config, not screen content, but the pause contract is uniform: zero
+    /// writes while paused. Consent writes are NOT routed through here — an
+    /// explicit consent authorization persists immediately.
+    pending_settings_save: AtomicBool,
     tripwire: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
@@ -143,6 +163,9 @@ fn boot_shared(data_dir: &Path) -> Result<Arc<Shared>, String> {
         arm_gen: AtomicU64::new(if armed { 1 } else { 0 }),
         privacy_epoch: AtomicU64::new(0),
         pending_gaps: Mutex::new(Vec::new()),
+        pending_deletes: Mutex::new(Vec::new()),
+        pending_checkpoint: AtomicBool::new(false),
+        pending_settings_save: AtomicBool::new(false),
         tripwire: Mutex::new(None),
     }))
 }
@@ -339,6 +362,14 @@ fn persist_settings(shared: &Shared) {
     if !shared.armed.load(Ordering::SeqCst) {
         return;
     }
+    // Never write settings to disk while a privacy pause is active: state.json is
+    // a filesystem write, and the pause contract is zero writes while paused.
+    // Defer to the next authorized, unpaused window; the in-memory settings hold
+    // the latest values meanwhile so nothing is lost.
+    if evaluate_pause(shared).is_some() {
+        shared.pending_settings_save.store(true, Ordering::SeqCst);
+        return;
+    }
     let st = shared.settings.lock().unwrap();
     let _ = st.save(&shared.paths.state);
 }
@@ -391,7 +422,12 @@ fn drop_writable_store(shared: &Shared) {
         return;
     };
     if s.is_writable() {
-        let _ = s.checkpoint();
+        // Do NOT checkpoint here: this runs on the disarm/stop path, and a WAL
+        // checkpoint writes the database file. That would be a database mutation
+        // triggered by disarming. Defer it — a later authorized, unpaused window
+        // (`flush_deferred`) performs the checkpoint, which only merges data that
+        // was already committed while armed and never persists new content.
+        shared.pending_checkpoint.store(true, Ordering::SeqCst);
         drop(s);
         *g = if shared.paths.db.exists() {
             Store::open_read_only(&shared.paths.db).ok()
@@ -554,17 +590,26 @@ fn stats_json(shared: &Shared) -> serde_json::Value {
     let snap = shared
         .with_store(|s| s.stats().unwrap_or_default())
         .unwrap_or_default();
-    let settings = shared.settings.lock().unwrap();
+    // Evaluate the pause state BEFORE locking settings. `current_pause` ->
+    // `evaluate_pause` itself locks `settings`, so computing it while holding the
+    // settings guard below would be a re-entrant self-deadlock on the (non-
+    // reentrant) settings mutex whenever the session is armed and unpaused.
+    let pause = current_pause(shared);
+    // Snapshot only the settings fields we need, then release the guard.
+    let (consent_at, byte_cap) = {
+        let settings = shared.settings.lock().unwrap();
+        (settings.consent_at, settings.byte_cap)
+    };
     json!({
         "armed": shared.armed.load(Ordering::SeqCst),
-        "consent": settings.consent_at > 0,
-        "paused": current_pause(shared).is_some(),
-        "reason": current_pause(shared).map(|r| r.as_str()).unwrap_or(""),
+        "consent": consent_at > 0,
+        "paused": pause.is_some(),
+        "reason": pause.map(|r| r.as_str()).unwrap_or(""),
         "frames": snap.frames,
         "framesToday": snap.frames_today,
         "bytes": snap.bytes,
-        "byteCap": settings.byte_cap,
-        "daysEstimate": query::days_estimate(snap.bytes, settings.byte_cap, snap.first_ts, now_ms()),
+        "byteCap": byte_cap,
+        "daysEstimate": query::days_estimate(snap.bytes, byte_cap, snap.first_ts, now_ms()),
         "firstTs": snap.first_ts,
         "lastTs": snap.last_ts,
         "encoder": shared.encoder.lock().unwrap().clone(),
@@ -688,6 +733,30 @@ fn discard_capture_files(files: &[PathBuf]) {
     }
 }
 
+/// Buffer capture temp-file paths for later deletion. Used when a capture is
+/// rejected while a privacy pause (or disarm) is active: unlinking is a
+/// filesystem mutation, so it must not happen while paused. The files are
+/// uncommitted and unreferenced by any row, so nothing can read them while they
+/// wait; `flush_deferred` unlinks them in a later authorized, unpaused window.
+fn defer_discard(shared: &Shared, files: &[PathBuf]) {
+    if files.is_empty() {
+        return;
+    }
+    let mut q = shared.pending_deletes.lock().unwrap();
+    q.extend(files.iter().cloned());
+    const MAX_PENDING_DELETES: usize = 1024;
+    let len = q.len();
+    if len > MAX_PENDING_DELETES {
+        // Oldest paths past the bound are unlinked immediately as a safety valve
+        // so screen-content temp files can never accumulate without limit. This
+        // only trips under pathological churn; the steady state is a handful.
+        let overflow: Vec<PathBuf> = q.drain(0..len - MAX_PENDING_DELETES).collect();
+        drop(q);
+        discard_capture_files(&overflow);
+    }
+}
+
+
 /// Observe the live pause state and, if it transitioned since the last
 /// observation, bump the privacy epoch and record the pause/resume event.
 /// Returns the current pause reason (None = recording). This is the single
@@ -720,7 +789,7 @@ fn note_pause_change(shared: &Shared, reason: Option<PauseReason>) {
     // Do NOT write the pause/resume event here: entering a pause must not itself
     // produce a database write. Buffer the transition (with its real timestamp)
     // in memory; it is persisted later, only inside an authorized and currently
-    // unpaused transaction (`flush_pending_gaps`). The buffer is bounded so a
+    // unpaused transaction (`flush_deferred`). The buffer is bounded so a
     // long paused stretch cannot grow it without limit.
     {
         let mut gaps = shared.pending_gaps.lock().unwrap();
@@ -745,14 +814,23 @@ fn note_pause_change(shared: &Shared, reason: Option<PauseReason>) {
 /// event reaches the database, so no write is ever a side effect of pausing.
 /// Called from the capture loop while recording; a no-op when paused/disarmed
 /// or when nothing is buffered.
-fn flush_pending_gaps(shared: &Shared) {
-    // Nothing to do unless there is buffered gap metadata AND we are recording
-    // right now. `refresh_pause` observes the live state (and advances the epoch
-    // on any freshly-seen transition), so a pause that engaged since the caller
-    // last checked is caught here and blocks the flush.
-    if shared.pending_gaps.lock().unwrap().is_empty() {
+/// Persist/apply everything that was deferred while paused or disarming — gap
+/// metadata (DB), rejected-capture file deletions (fs), and an owed WAL
+/// checkpoint (DB) — but only inside an authorized, currently-unpaused window.
+/// This is the single place any of that deferred work reaches disk, so nothing
+/// deferred is ever a side effect of pausing/disarming. Called from the capture
+/// loop while recording; a no-op when paused/disarmed or when nothing is owed.
+fn flush_deferred(shared: &Shared) {
+    let nothing_owed = shared.pending_gaps.lock().unwrap().is_empty()
+        && shared.pending_deletes.lock().unwrap().is_empty()
+        && !shared.pending_checkpoint.load(Ordering::SeqCst)
+        && !shared.pending_settings_save.load(Ordering::SeqCst);
+    if nothing_owed {
         return;
     }
+    // `refresh_pause` observes the live state (and advances the epoch on any
+    // freshly-seen transition), so a pause that engaged since the caller last
+    // checked is caught here and blocks the whole flush.
     if refresh_pause(shared).is_some() {
         return;
     }
@@ -760,29 +838,58 @@ fn flush_pending_gaps(shared: &Shared) {
         if !write_allowed(shared, arm, arm.gen) {
             return;
         }
+        // (1) Gap metadata → the database.
         let pending: Vec<(i64, &'static str, String)> = {
             let mut g = shared.pending_gaps.lock().unwrap();
             std::mem::take(&mut *g)
         };
-        if pending.is_empty() {
-            return;
+        if !pending.is_empty() {
+            let wrote = shared.with_store_mut(|store| {
+                if !store.is_writable() {
+                    return false;
+                }
+                for (ts, kind, reason) in &pending {
+                    let _ = store.record_event(*ts, *kind, reason.as_str());
+                }
+                true
+            });
+            // If the store was unavailable, put the transitions back so a later
+            // authorized flush can persist them rather than dropping the gaps.
+            if wrote != Some(true) {
+                let mut g = shared.pending_gaps.lock().unwrap();
+                let mut restored = pending;
+                restored.append(&mut *g);
+                *g = restored;
+            }
         }
-        let wrote = shared.with_store_mut(|store| {
-            if !store.is_writable() {
-                return false;
+        // (2) Deferred rejected-capture file deletions → the filesystem. These
+        // are uncommitted, unreferenced temp files; unlinking now (unpaused) is
+        // the authorized window for the cleanup the pause path deferred.
+        let deletes: Vec<PathBuf> = {
+            let mut q = shared.pending_deletes.lock().unwrap();
+            std::mem::take(&mut *q)
+        };
+        if !deletes.is_empty() {
+            discard_capture_files(&deletes);
+        }
+        // (3) Owed WAL checkpoint → the database (merges already-committed data).
+        if shared.pending_checkpoint.swap(false, Ordering::SeqCst) {
+            let done = shared
+                .with_store_mut(|store| store.is_writable() && store.checkpoint().is_ok())
+                .unwrap_or(false);
+            if !done {
+                // Store not writable right now; re-owe it for the next window.
+                shared.pending_checkpoint.store(true, Ordering::SeqCst);
             }
-            for (ts, kind, reason) in &pending {
-                let _ = store.record_event(*ts, *kind, reason.as_str());
+        }
+        // (4) Owed settings save → state.json (user config, deferred from a
+        // pause). We are armed and unpaused here, so persist_settings writes now.
+        if shared.pending_settings_save.swap(false, Ordering::SeqCst) {
+            let st = shared.settings.lock().unwrap();
+            if st.save(&shared.paths.state).is_err() {
+                drop(st);
+                shared.pending_settings_save.store(true, Ordering::SeqCst);
             }
-            true
-        });
-        // If the store was unavailable, put the transitions back so a later
-        // authorized flush can persist them rather than dropping the gaps.
-        if wrote != Some(true) {
-            let mut g = shared.pending_gaps.lock().unwrap();
-            let mut restored = pending;
-            restored.append(&mut *g);
-            *g = restored;
         }
     });
 }
@@ -807,7 +914,9 @@ fn finalize_capture(
     with_arm_read(shared, |arm| {
         let epoch_ok = shared.privacy_epoch.load(Ordering::SeqCst) == epoch0;
         if !write_allowed(shared, arm, ticket) || !epoch_ok || live.is_some() {
-            discard_capture_files(files);
+            // Paused/disarmed: defer the unlink so the pause path performs zero
+            // filesystem mutation.
+            defer_discard(shared, files);
             return Ok(false);
         }
         // Attach only a clip committed under this frame's exact (generation,
@@ -828,20 +937,24 @@ fn finalize_capture(
                 {
                     Ok(true)
                 } else {
-                    discard_capture_files(files);
+                    // A pause/disarm landed during the commit: defer the unlink.
+                    defer_discard(shared, files);
                     Ok(false)
                 }
             }
             Some(Ok(false)) => {
-                discard_capture_files(files);
+                // Store rejected the frame (e.g. byte cap). Defer the unlink
+                // rather than evaluate the pause state under the gate read lock;
+                // the next recording tick's flush cleans this uncommitted file.
+                defer_discard(shared, files);
                 Ok(false)
             }
             Some(Err(e)) => {
-                discard_capture_files(files);
+                defer_discard(shared, files);
                 Err(e)
             }
             None => {
-                discard_capture_files(files);
+                defer_discard(shared, files);
                 Err("store not initialized".into())
             }
         }
@@ -874,7 +987,7 @@ fn capture_loop(shared: Arc<Shared>) {
         // Recording is live right now: persist any pause/resume transitions that
         // were buffered in memory while paused. This is the authorized, unpaused
         // window their gap metadata is allowed to reach the database.
-        flush_pending_gaps(&shared);
+        flush_deferred(&shared);
 
         match capture_once(&shared, &settings, &mut session) {
             Ok(true) => last_unchanged = true,
@@ -961,7 +1074,10 @@ fn capture_once(
     let (enc, written) = encode::encode_frame(&scaled.bytes, scaled.width, scaled.height, &dest)?;
     let mut files = vec![written.clone()];
     if !still_recording(shared, gen, epoch0) {
-        discard_capture_files(&files);
+        // A privacy pause or disarm engaged mid-capture: defer the unlink so the
+        // pause path performs zero filesystem mutation (the file is uncommitted
+        // and unreferenced; `flush_deferred` removes it in a later armed window).
+        defer_discard(shared, &files);
         return Ok(false);
     }
     perms::secure_file(&written).map_err(|e| e.to_string())?;
@@ -977,7 +1093,7 @@ fn capture_once(
     let mut crop_h = raw.height as i64;
     if let Some(roi) = encode::crop_roi(&raw.rgba, raw.width, raw.height, &active, &monitor) {
         if !still_recording(shared, gen, epoch0) {
-            discard_capture_files(&files);
+            defer_discard(shared, &files);
             return Ok(false);
         }
         crop_x = roi.x as i64;
@@ -1000,7 +1116,10 @@ fn capture_once(
     }
 
     if !still_recording(shared, gen, epoch0) {
-        discard_capture_files(&files);
+        // A privacy pause or disarm engaged mid-capture: defer the unlink so the
+        // pause path performs zero filesystem mutation (the file is uncommitted
+        // and unreferenced; `flush_deferred` removes it in a later armed window).
+        defer_discard(shared, &files);
         return Ok(false);
     }
 
@@ -1556,6 +1675,7 @@ mod tests {
 
     #[test]
     fn disarm_during_capture_discards_files_and_rows() {
+        let _env = TEST_CAPTURE_ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path().join("rewind");
         let shared = boot_shared(&data).unwrap();
@@ -1597,6 +1717,7 @@ mod tests {
             crop_path: Some(crop_rel.into()),
         };
         let settings = shared.settings.lock().unwrap().clone();
+        let epoch0 = shared.privacy_epoch();
 
         // Disarm through the real path (drops the writable store, bumps gen).
         disarm_now(&shared);
@@ -1608,16 +1729,32 @@ mod tests {
             &[written.clone(), crop.clone()],
             &[],
             ticket,
+            epoch0,
         )
         .unwrap();
+        // The core privacy guarantee: NOTHING is committed to the archive.
         assert!(!committed);
-        assert!(!written.exists(), "disarm must discard the in-flight frame");
-        assert!(!crop.exists(), "disarm must discard the in-flight crop");
         let counts = shared
             .with_store(|s| s.mutation_counters().unwrap())
             .unwrap();
         assert_eq!(counts.0, 0, "no frame rows");
         assert_eq!(counts.1, 0, "no event rows");
+        // The unlink of the uncommitted temp files is DEFERRED (deleting them is
+        // a filesystem mutation, which the disarm path must not perform). They
+        // are unreferenced by any row, so nothing can read them meanwhile; a
+        // later authorized, unpaused flush removes them.
+        assert_eq!(
+            shared.pending_deletes.lock().unwrap().len(),
+            2,
+            "disarm defers the in-flight file deletions"
+        );
+        // Re-arm and flush: the deferred temp files are now removed.
+        arm_now(&shared).unwrap();
+        std::env::set_var("REWIND_TEST_CAPTURE", "1");
+        flush_deferred(&shared);
+        std::env::remove_var("REWIND_TEST_CAPTURE");
+        assert!(!written.exists(), "flush removes the deferred in-flight frame");
+        assert!(!crop.exists(), "flush removes the deferred in-flight crop");
     }
 
     #[test]
@@ -2030,6 +2167,7 @@ mod tests {
         // A capture job takes its ticket while armed, then the user disarms and
         // re-arms (a fresh generation). The stale job must NOT commit, even
         // though the daemon is armed again by the time it reaches finalize.
+        let _env = TEST_CAPTURE_ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path().join("rewind");
         let shared = boot_shared(&data).unwrap();
@@ -2083,14 +2221,22 @@ mod tests {
             crop_path: None,
         };
         let settings = shared.settings.lock().unwrap().clone();
+        let epoch0 = shared.privacy_epoch();
         let committed =
-            finalize_capture(&shared, &settings, &insert, &[written.clone()], &[], ticket).unwrap();
+            finalize_capture(&shared, &settings, &insert, &[written.clone()], &[], ticket, epoch0)
+                .unwrap();
         assert!(!committed, "stale-ticket finalize must not commit");
-        assert!(!written.exists(), "stale capture file must be discarded");
         let counts = shared
             .with_store(|s| s.mutation_counters().unwrap())
             .unwrap();
         assert_eq!(counts.0, 0, "no rows written for a stale-ticket job");
+        // The stale file's unlink is deferred (buffered), then removed by a
+        // later authorized flush — the pause/disarm path itself writes nothing.
+        assert_eq!(shared.pending_deletes.lock().unwrap().len(), 1);
+        std::env::set_var("REWIND_TEST_CAPTURE", "1");
+        flush_deferred(&shared);
+        std::env::remove_var("REWIND_TEST_CAPTURE");
+        assert!(!written.exists(), "flush removes the deferred stale file");
     }
 
     #[test]
@@ -2332,7 +2478,7 @@ mod tests {
 
         // Recording is live (overlay_open never set, test-capture active), so a
         // flush persists the buffered gap(s) and drains the buffer.
-        flush_pending_gaps(&shared);
+        flush_deferred(&shared);
         let after = shared
             .with_store(|s| s.mutation_counters().unwrap())
             .unwrap();
@@ -2371,6 +2517,132 @@ mod tests {
         assert_eq!(counts.3, 0, "no clip row may be written while paused");
         shared.overlay_open.store(false, Ordering::SeqCst);
         clipboard::clear_cached();
+        std::env::remove_var("REWIND_TEST_CAPTURE");
+    }
+
+    #[test]
+    fn ocr_only_annotates_an_existing_committed_frame() {
+        // OCR must never write text for a ts that has no committed frame row
+        // (e.g. a frame pruned by the byte cap between queueing and commit).
+        // This makes explicit that OCR only annotates already-authorized frames.
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("rewind");
+        DataPaths::prepare(&data).unwrap();
+        let mut store = Store::open(&data.join("rewind.db")).unwrap();
+        let boxes = [crate::query::WordBox {
+            word: "hello".into(),
+            x: 0.0,
+            y: 0.0,
+            w: 0.1,
+            h: 0.1,
+        }];
+        // ts 999 was never committed as a frame → OCR writes nothing.
+        let wrote = store
+            .commit_ocr_tx(999, "hello", "kitty", "t", "", &boxes, || true)
+            .unwrap();
+        assert!(!wrote, "OCR must not commit for a frame that does not exist");
+        let counts = store.mutation_counters().unwrap();
+        assert_eq!(counts.2, 0, "no ocr boxes for a non-existent frame");
+    }
+
+    #[test]
+    fn disarm_defers_checkpoint_and_flush_applies_it() {
+        // Disarming must not checkpoint (a db write); it owes one, performed only
+        // in a later authorized, unpaused window.
+        let _env = TEST_CAPTURE_ENV_LOCK.lock().unwrap();
+        std::env::set_var("REWIND_TEST_CAPTURE", "1");
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("rewind");
+        let shared = boot_shared(&data).unwrap();
+        {
+            let mut st = shared.settings.lock().unwrap();
+            st.consent_at = now_ms();
+        }
+        persist_consent(&shared).unwrap();
+        arm_now(&shared).unwrap();
+        disarm_now(&shared);
+        assert!(
+            shared.pending_checkpoint.load(Ordering::SeqCst),
+            "disarm must defer (owe) the checkpoint, not perform it"
+        );
+        // Re-arm (unpaused via test-capture) and flush: the checkpoint clears.
+        arm_now(&shared).unwrap();
+        flush_deferred(&shared);
+        assert!(
+            !shared.pending_checkpoint.load(Ordering::SeqCst),
+            "an authorized unpaused flush performs the owed checkpoint"
+        );
+        std::env::remove_var("REWIND_TEST_CAPTURE");
+    }
+
+    #[test]
+    fn rejected_capture_delete_is_deferred_while_paused_then_flushed() {
+        let _env = TEST_CAPTURE_ENV_LOCK.lock().unwrap();
+        std::env::set_var("REWIND_TEST_CAPTURE", "1");
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("rewind");
+        let shared = boot_shared(&data).unwrap();
+        {
+            let mut st = shared.settings.lock().unwrap();
+            st.consent_at = now_ms();
+        }
+        persist_consent(&shared).unwrap();
+        arm_now(&shared).unwrap();
+        // A stray uncommitted capture temp file.
+        std::fs::create_dir_all(&data).unwrap();
+        let orphan = data.join("frames-tmp.png");
+        std::fs::write(&orphan, b"screen-content").unwrap();
+        // Simulate the pause-rejection path buffering its deletion.
+        defer_discard(&shared, &[orphan.clone()]);
+        assert!(
+            orphan.exists(),
+            "deferred delete must not touch the filesystem yet"
+        );
+        assert_eq!(shared.pending_deletes.lock().unwrap().len(), 1);
+        // An authorized, unpaused flush performs the deletion.
+        flush_deferred(&shared);
+        assert!(!orphan.exists(), "flush unlinks the deferred temp file");
+        assert!(shared.pending_deletes.lock().unwrap().is_empty());
+        std::env::remove_var("REWIND_TEST_CAPTURE");
+    }
+
+    #[test]
+    fn settings_save_deferred_while_paused() {
+        let _env = TEST_CAPTURE_ENV_LOCK.lock().unwrap();
+        std::env::set_var("REWIND_TEST_CAPTURE", "1");
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("rewind");
+        let shared = boot_shared(&data).unwrap();
+        {
+            let mut st = shared.settings.lock().unwrap();
+            st.consent_at = now_ms();
+        }
+        persist_consent(&shared).unwrap();
+        arm_now(&shared).unwrap();
+        let state = data.join("state.json");
+        let before = std::fs::read_to_string(&state).unwrap_or_default();
+        // Engage a hard pause, then change + persist settings.
+        shared.overlay_open.store(true, Ordering::SeqCst);
+        {
+            let mut st = shared.settings.lock().unwrap();
+            st.byte_cap = 9_999_999;
+        }
+        persist_settings(&shared);
+        assert!(
+            shared.pending_settings_save.load(Ordering::SeqCst),
+            "a settings save while paused must be deferred, not written"
+        );
+        let during = std::fs::read_to_string(&state).unwrap_or_default();
+        assert_eq!(before, during, "state.json must not change while paused");
+        // Resume recording and flush: the deferred save lands.
+        shared.overlay_open.store(false, Ordering::SeqCst);
+        flush_deferred(&shared);
+        assert!(!shared.pending_settings_save.load(Ordering::SeqCst));
+        let after = std::fs::read_to_string(&state).unwrap_or_default();
+        assert!(
+            after.contains("9999999"),
+            "the deferred settings save is written once recording resumes"
+        );
         std::env::remove_var("REWIND_TEST_CAPTURE");
     }
 }

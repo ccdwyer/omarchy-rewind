@@ -60,7 +60,18 @@ Item {
   property string lastQuery: ""
   property double firstTs: 0
   property double lastTs: 0
-  readonly property bool persistUi: root.armed
+  // Snapshot files are written only while genuinely recording — armed AND not
+  // paused. Writing them during any pause (lock, idle, overlay, portal,
+  // exclusion, private-browsing, title-pattern) would be a filesystem write
+  // while paused, violating the zero-writes-while-paused contract. `armed` and
+  // `paused` are set from the helper's authoritative events. The in-memory
+  // properties hold the latest values while paused; `onPersistUiChanged`
+  // flushes them once recording resumes.
+  readonly property bool persistUi: root.armed && !root.paused
+  onPersistUiChanged: {
+    if (root.persistUi)
+      root.publish()
+  }
 
   property double byteCapGb: 2
   property int cadenceMs: 3000
