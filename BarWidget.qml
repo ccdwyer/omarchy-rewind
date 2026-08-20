@@ -1,10 +1,12 @@
 import QtQuick
 import Quickshell
 import Quickshell.Io
+import qs.Commons
 import qs.Ui
 import "js/Format.js" as Format
 import "js/Pause.js" as Pause
 import "js/Channel.js" as Channel
+import "js/Binds.js" as Binds
 
 BarWidget {
   id: root
@@ -24,6 +26,8 @@ BarWidget {
   property string pauseReason: "disarmed"
   property int framesToday: 0
   property double bytesUsed: 0
+  property bool offerBinds: false
+  property string offerNote: ""
   readonly property bool opened: false
 
   RewindAdapter { id: adapter }
@@ -86,8 +90,18 @@ BarWidget {
     Quickshell.execDetached(["omarchy-shell", "shell", "summon", root.moduleName, payload || "{}"])
   }
 
-  implicitWidth: button.implicitWidth
-  implicitHeight: button.implicitHeight
+  function refreshBinds() {
+    var offer = Binds.offer || {}
+    root.offerBinds = !!offer.needed
+    root.offerNote = String(offer.note || "Add Super+R overlay")
+  }
+
+  function installBinds() {
+    Quickshell.execDetached(["omarchy-shell", root.moduleName, "installBinds", ""])
+  }
+
+  implicitWidth: row.implicitWidth
+  implicitHeight: row.implicitHeight
 
   FileView {
     id: uiView
@@ -114,9 +128,19 @@ BarWidget {
     onTriggered: root.pollStatus()
   }
 
+  Timer {
+    interval: 250
+    running: true
+    repeat: true
+    onTriggered: root.refreshBinds()
+  }
+
+  Row {
+    id: row
+    spacing: Style.space(4)
+
   WidgetButton {
     id: button
-    anchors.fill: parent
     bar: root.bar
     text: Format.barText({
       armed: root.armed,
@@ -166,7 +190,22 @@ BarWidget {
     }
   }
 
-  Component.onCompleted: root.pushSettings()
+    WidgetButton {
+      visible: root.offerBinds
+      bar: root.bar
+      text: "keys"
+      tooltipText: root.offerNote.length ? root.offerNote : "Add Super+R / Super+Shift+R keybindings (skips combos you already use)"
+      onPressed: function(buttonCode) {
+        if (buttonCode === Qt.LeftButton)
+          root.installBinds()
+      }
+    }
+  }
+
+  Component.onCompleted: {
+    root.pushSettings()
+    root.refreshBinds()
+  }
   onByteCapGbChanged: root.pushSettings()
   onCadenceMsChanged: root.pushSettings()
   onIdlePauseSecChanged: root.pushSettings()

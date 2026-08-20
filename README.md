@@ -61,11 +61,11 @@ Optional garnish, never required:
 | Clipboard history | **Long-press** the chip, then Enter to re-copy |
 | Wipe | Overlay “wipe today”, or `./scripts/rewind wipe today\|all\|range` |
 
-The plugin does **not** write Hyprland binds. Add them yourself:
+If Super+R / Super+Shift+R are free, the overlay first-run card, the empty timeline card, and a **keys** chip on the bar offer **Add keybindings**. That writes `o.bind` lines to `~/.config/hypr/bindings.lua` (Hyprland reloads on save). Combos you already use are skipped; Super+R falls back to Super+Alt+R, Super+Shift+R to Super+Alt+Shift+R. Super+Ctrl+R is Omarchy “Set reminder” and is never used. The plugin never unbinds someone else's shortcut.
 
 ```
-bind = SUPER, R, exec, omarchy-shell shell summon io.github.chris.rewind '{}'
-bind = SUPER SHIFT, R, exec, omarchy-shell io.github.chris.rewind toggleArm '{}'
+omarchy-shell shell summon io.github.chris.rewind '{}'
+omarchy-shell io.github.chris.rewind toggleArm '{}'
 ```
 
 In the overlay:

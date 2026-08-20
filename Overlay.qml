@@ -9,6 +9,7 @@ import "js/Pause.js" as Pause
 import "js/Plan.js" as Plan
 import "js/Query.js" as Query
 import "js/Channel.js" as Channel
+import "js/Binds.js" as Binds
 
 Item {
   id: root
@@ -209,6 +210,11 @@ Item {
   function toggleArm(arg) {
     var payload = arg === undefined || arg === null || String(arg).length === 0 ? "{}" : arg
     return root.callSvc("toggleArm", payload)
+  }
+
+  function installBinds(arg) {
+    var payload = arg === undefined || arg === null ? "" : String(arg)
+    return root.callSvc("installBinds", payload)
   }
 
   function pull() {
@@ -717,6 +723,35 @@ Item {
           font.pixelSize: Style.font.bodySmall
           text: "Default exclusions: KeePassXC, 1Password, Bitwarden, Seahorse, polkit agents."
         }
+        Text {
+          visible: !!(Binds.offer && Binds.offer.needed)
+          width: parent.width
+          wrapMode: Text.WordWrap
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+          text: "No Rewind keys yet.\n\nPreferred: Super+R overlay · Super+Shift+R arm/disarm.\nCombos you already use are skipped.\n\n" + String((Binds.offer && Binds.offer.note) || "")
+        }
+        Rectangle {
+          visible: !!(Binds.offer && Binds.offer.needed)
+          width: rewindBindLabel.implicitWidth + Style.space(16)
+          height: rewindBindLabel.implicitHeight + Style.space(10)
+          radius: Math.max(4, root.cornerRadius / 2)
+          color: root.accent
+          Text {
+            id: rewindBindLabel
+            anchors.centerIn: parent
+            text: "Add keybindings"
+            color: root.background
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+          }
+          MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.callSvc("installBinds", "{}")
+          }
+        }
         Row {
           spacing: Style.space(10)
           Rectangle {
@@ -919,17 +954,42 @@ Item {
                 height: Math.max(4, (modelData.h || 0) * fit.h)
               }
             }
-            Text {
+            Column {
               visible: !root.frames.length
               anchors.centerIn: parent
-              text: "No frames yet. Arm Rewind from the bar, work for a few seconds, then come back."
-              color: root.foreground
-              opacity: 0.7
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.body
-              wrapMode: Text.WordWrap
-              width: parent.width * 0.6
-              horizontalAlignment: Text.AlignHCenter
+              width: parent.width * 0.7
+              spacing: Style.space(10)
+              Text {
+                width: parent.width
+                text: "No frames yet. Arm Rewind from the bar, work for a few seconds, then come back."
+                color: root.foreground
+                opacity: 0.7
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                wrapMode: Text.WordWrap
+                horizontalAlignment: Text.AlignHCenter
+              }
+              Rectangle {
+                visible: !!(Binds.offer && Binds.offer.needed)
+                anchors.horizontalCenter: parent.horizontalCenter
+                width: emptyBindLabel.implicitWidth + Style.space(16)
+                height: emptyBindLabel.implicitHeight + Style.space(10)
+                radius: Math.max(4, root.cornerRadius / 2)
+                color: root.accent
+                Text {
+                  id: emptyBindLabel
+                  anchors.centerIn: parent
+                  text: "Add keybindings"
+                  color: root.background
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                }
+                MouseArea {
+                  anchors.fill: parent
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.callSvc("installBinds", "{}")
+                }
+              }
             }
           }
         }

@@ -46,6 +46,7 @@ const Format = loadEngine("Format.js")
 const Plan = loadEngine("Plan.js")
 const Query = loadEngine("Query.js")
 const Channel = loadEngine("Channel.js")
+const Binds = loadEngine("Binds.js")
 
 let passed = 0
 let failed = 0
@@ -68,6 +69,52 @@ function fixture(name) {
 function jsonFix(name) {
   return JSON.parse(fixture(name))
 }
+
+test("binds: empty live list offers preferred combos", () => {
+  const p = Binds.plan([])
+  assert.strictEqual(p.needed, true)
+  assert.strictEqual(p.toAdd.length, 2)
+  assert.strictEqual(p.toAdd[0].keys, "SUPER + R")
+  assert.strictEqual(p.toAdd[1].keys, "SUPER + SHIFT + R")
+  const lua = Binds.luaBlock(p.toAdd)
+  assert.ok(lua.indexOf("o.bind(\"SUPER + R\"") === 0)
+  assert.ok(lua.indexOf("omarchy-shell shell summon io.github.chris.rewind '{}'") >= 0)
+  assert.ok(lua.indexOf("omarchy-shell io.github.chris.rewind toggleArm '{}'") >= 0)
+  assert.ok(lua.indexOf("SUPER + CTRL") < 0)
+})
+
+test("binds: skips occupied combos and uses an alternate", () => {
+  const live = [
+    { modmask: 64, key: "R", dispatcher: "exec", arg: "other", description: "something else" }
+  ]
+  const p = Binds.plan(live)
+  assert.strictEqual(p.needed, true)
+  const overlay = p.toAdd.filter((x) => x.desc === "Rewind overlay")[0]
+  assert.ok(overlay)
+  assert.strictEqual(overlay.chosen, "SUPER + ALT + R")
+  assert.ok(p.note.indexOf("SUPER + ALT + R") >= 0)
+})
+
+test("binds: already-ours hides the offer", () => {
+  const live = [
+    { modmask: 64, key: "R", dispatcher: "__lua", arg: "15", description: "Rewind overlay" }
+  ]
+  const p = Binds.plan(live)
+  assert.strictEqual(p.needed, false)
+  assert.strictEqual(p.already, 1)
+})
+
+test("binds: skip when preferred and alternate are taken", () => {
+  const live = [
+    { modmask: 64, key: "R", dispatcher: "exec", arg: "a", description: "taken" },
+    { modmask: 72, key: "R", dispatcher: "exec", arg: "b", description: "also taken" }
+  ]
+  const p = Binds.plan(live)
+  assert.strictEqual(p.needed, true)
+  assert.strictEqual(p.toAdd.filter((x) => x.desc === "Rewind overlay").length, 0)
+  assert.ok(p.skipped.some((s) => s.keys === "SUPER + R"))
+  assert.ok(p.note.indexOf("skipped SUPER + R") >= 0)
+})
 
 test("protocol: parses frame-written and replies", () => {
   const ev = Protocol.parseLine('{"event":"frame-written","ts":1,"path":"/x.png","bytes":40}')
@@ -322,7 +369,7 @@ test("network-audit fails when binary is missing", () => {
 
 test("IpcHandler exposes JSON-arg methods", () => {
   const src = fs.readFileSync(path.join(ROOT, "Service.qml"), "utf8")
-  for (const name of ["consentNow", "copyClip", "executePlan", "wipe", "reopenPlan", "reopenWindow", "query", "refresh", "summon", "toggleArm"]) {
+  for (const name of ["consentNow", "copyClip", "executePlan", "wipe", "reopenPlan", "reopenWindow", "query", "refresh", "summon", "toggleArm", "installBinds"]) {
     assert.ok(src.indexOf("function " + name + "(arg: string)") >= 0
       || src.indexOf("function " + name + "(q: string)") >= 0, name)
   }

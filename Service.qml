@@ -5,6 +5,7 @@ import Quickshell.Hyprland
 import "js/Protocol.js" as Protocol
 import "js/Pause.js" as Pause
 import "js/Format.js" as Format
+import "js/Binds.js" as Binds
 
 Item {
   id: root
@@ -45,6 +46,10 @@ Item {
   property string captureBackend: "grim"
   property string lastStatus: "starting"
   property int statsRevision: 0
+  property bool bindOfferNeeded: true
+  property string bindOfferNote: ""
+  property var bindQueue: []
+  property var bindCurrent: null
 
   property var timeline: []
   property var gaps: []
@@ -475,6 +480,70 @@ Item {
   function ping() { return "ok" }
   function status() { return JSON.stringify(root.statsObject()) }
 
+  function enqueueBindWork(command, done) {
+    if (!command)
+      return
+    var q = []
+    for (var i = 0; i < root.bindQueue.length; i++)
+      q.push(root.bindQueue[i])
+    q.push({ command: command, done: done || null })
+    root.bindQueue = q
+    root.runBindWork()
+  }
+
+  function runBindWork() {
+    if (bindProc.running || root.bindCurrent)
+      return
+    if (!root.bindQueue.length)
+      return
+    var next = root.bindQueue[0]
+    var rest = []
+    for (var i = 1; i < root.bindQueue.length; i++)
+      rest.push(root.bindQueue[i])
+    root.bindQueue = rest
+    root.bindCurrent = next
+    bindProc.command = next.command
+    bindProc.running = true
+  }
+
+  function applyBindPlan(plan) {
+    var p = plan || Binds.offer
+    root.bindOfferNeeded = !!p.needed
+    root.bindOfferNote = String(p.note || "")
+    Binds.setOffer(p)
+  }
+
+  function scanBinds() {
+    root.enqueueBindWork(["hyprctl", "-j", "binds"], function(text, code) {
+      if (Number(code) !== 0)
+        return
+      root.applyBindPlan(Binds.applyScan(text))
+    })
+  }
+
+  function installBinds(arg) {
+    root.enqueueBindWork(["hyprctl", "-j", "binds"], function(text, code) {
+      if (Number(code) !== 0) {
+        root.bindOfferNote = "could not read keybinds"
+        return
+      }
+      var plan = Binds.applyScan(text)
+      if (!plan.toAdd || !plan.toAdd.length) {
+        root.applyBindPlan(plan)
+        return
+      }
+      var lua = Binds.luaBlock(plan.toAdd)
+      root.enqueueBindWork(["python3", root.pluginDir + "/compat/install-binds.py", root.pluginId, lua], function(out, instCode) {
+        if (Number(instCode) !== 0) {
+          root.bindOfferNote = "could not write ~/.config/hypr/bindings.lua"
+          return
+        }
+        Qt.callLater(root.scanBinds)
+      })
+    })
+    return "ok"
+  }
+
   property bool triedBuild: false
   property bool triedDownload: false
 
@@ -694,6 +763,37 @@ Item {
       root.publish()
       return root.status()
     }
+    function installBinds(arg: string): string { return root.installBinds(arg) }
+  }
+
+  Process {
+    id: bindProc
+    running: false
+    stdout: StdioCollector {
+      id: bindOut
+      waitForEnd: true
+    }
+    onExited: function(exitCode) {
+      var text = bindOut.text
+      var job = root.bindCurrent
+      root.bindCurrent = null
+      if (job && job.done) {
+        try {
+          job.done(text, exitCode)
+        } catch (e) {
+          console.warn("rewind: bind work failed", e)
+        }
+      }
+      root.runBindWork()
+    }
+  }
+
+  Timer {
+    id: bindScanTimer
+    interval: 3000
+    repeat: true
+    running: true
+    onTriggered: root.scanBinds()
   }
 
   Component.onCompleted: {
@@ -706,6 +806,7 @@ Item {
         Quickshell.execDetached(["mkdir", "-p", "-m", "700", root.snapDir])
     } catch (e) {}
     root.findHelper()
+    Qt.callLater(root.scanBinds)
   }
 
   Component.onDestruction: {
