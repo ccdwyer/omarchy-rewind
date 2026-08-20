@@ -77,7 +77,7 @@ First launch opens a consent screen. Nothing is pre-checked that records. “Kee
 ## What it records (only while armed)
 
 - Focused output, about every 3 s (5 s on the grim fallback). Unchanged frames (perceptual hash) drop to 10 s and are not written again.
-- 720p-ish still: `cwebp` if present, otherwise PNG. Full-res focused-window crop kept for idle OCR, then deleted.
+- 720p-ish still: `cwebp` → image-crate WebP → reduced-scale PNG if both WebP paths fail. Full-res focused-window crop kept for idle OCR, then deleted.
 - Window class, title, workspace, and a `hyprctl clients -j` layout snapshot.
 - Clipboard text only, 64 KB cap, via one persistent `wl-paste -w` child.
 
@@ -87,7 +87,7 @@ Default exclusions: KeePassXC, 1Password, Bitwarden, Seahorse, polkit agents.
 
 ## Disk math (honest)
 
-A 720p WebP of text-heavy UI is **25–80 KB**, not single-digit KB. Retention is a **byte cap** (default 2 GB). Oldest frames are deleted inside the insert transaction.
+Planning estimate (not measured on this host): a 720p still of text-heavy UI is **~25–80 KB/frame**, not single-digit KB. Retention is a **byte cap** (default 2 GB). Oldest frames are deleted inside the insert transaction.
 
 The bar and consent screen report **≈N days at your usage** once rewindd has measured this machine. Until then they show the planning band for 25–80 KB at a 10 s write average (dHash skip), not a promised calendar window.
 

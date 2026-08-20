@@ -43,6 +43,64 @@ function summarize(plan) {
     }
 }
 
+function oneWindowPlan(win) {
+    win = win || {}
+    var cls = win.class || win.app || ""
+    var title = win.title || ""
+    var ws = win.workspace || win.ws || "1"
+    var addr = win.address || ""
+    var x = 0
+    var y = 0
+    if (win.at && win.at.length >= 2) {
+        x = win.at[0]
+        y = win.at[1]
+    } else {
+        x = Number(win.x) || 0
+        y = Number(win.y) || 0
+    }
+    if (isBrowser(cls)) {
+        return {
+            title: "Reopen " + (cls || "window"),
+            honest: true,
+            steps: [],
+            unrecoverable: [{ class: cls, title: title, reason: "browser tabs cannot be restored" }],
+            note: "One-window plan. Browser tabs and documents are unrecoverable. Confirm does nothing for this window."
+        }
+    }
+    var steps = []
+    steps.push({
+        kind: "exec",
+        class: cls,
+        cmd: win.exec || win.cmd || "",
+        workspace: ws,
+        label: "Launch " + (cls || "app")
+    })
+    if (addr) {
+        steps.push({
+            kind: "move",
+            class: cls,
+            address: addr,
+            workspace: ws,
+            label: "Move to workspace " + ws
+        })
+        steps.push({
+            kind: "geometry",
+            class: cls,
+            address: addr,
+            x: x,
+            y: y,
+            label: "Place at " + x + "," + y
+        })
+    }
+    return {
+        title: "Reopen " + (cls || "window"),
+        honest: true,
+        steps: steps,
+        unrecoverable: [],
+        note: "Review this one-window plan. Confirm launches and places only this window."
+    }
+}
+
 function countKind(steps, kind) {
     var n = 0
     for (var i = 0; i < steps.length; i++) {

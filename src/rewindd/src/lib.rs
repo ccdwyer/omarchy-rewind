@@ -283,14 +283,10 @@ fn handle_command(shared: &Arc<Shared>, cmd: Command) {
             scope,
             from,
             to,
-        } => {
-            let data = shared.with_store_mut(|s| s.wipe(&scope, from, to));
-            match data {
-                Some(Ok(data)) => emit(&Event::reply(id, data)),
-                Some(Err(e)) => emit(&Event::error(Some(id), e.to_string())),
-                None => emit(&Event::reply(id, json!({"wiped": 0, "scope": scope}))),
-            }
-        }
+        } => match authorized_wipe(shared, &scope, from, to) {
+            Ok(data) => emit(&Event::reply(id, data)),
+            Err(e) => emit(&Event::error(Some(id), e)),
+        },
         Command::CopyClip { id, ts } => match copy_clip(shared, ts) {
             Ok(data) => emit(&Event::reply(id, data)),
             Err(e) => emit(&Event::error(Some(id), e.to_string())),
@@ -333,6 +329,30 @@ fn ensure_store(shared: &Shared) -> Result<(), String> {
     DataPaths::prepare(&shared.paths.root)?;
     *g = Some(Store::open(&shared.paths.db)?);
     Ok(())
+}
+
+fn authorized_wipe(
+    shared: &Shared,
+    scope: &str,
+    from: i64,
+    to: i64,
+) -> Result<serde_json::Value, String> {
+    let mut arm = shared.gate.write().unwrap();
+    let was_armed = arm.armed;
+    if !was_armed && !shared.paths.db.exists() {
+        return Ok(json!({"wiped": 0, "scope": scope, "from": from, "to": to}));
+    }
+    ensure_store(shared)?;
+    let data = shared
+        .with_store_mut(|s| s.wipe(scope, from, to))
+        .ok_or_else(|| "wipe: store unavailable".to_string())??;
+    if !was_armed {
+        drop_writable_store(shared);
+        arm.armed = false;
+        shared.armed.store(false, Ordering::SeqCst);
+        shared.settings.lock().unwrap().armed = false;
+    }
+    Ok(data)
 }
 
 fn drop_writable_store(shared: &Shared) {
@@ -1519,19 +1539,19 @@ mod tests {
     }
 
     #[test]
-    fn capture_rolls_back_when_disarmed_mid_transaction() {
+    fn concurrent_disarm_during_gated_commit_writes_nothing() {
+        use std::sync::Barrier;
+        use std::thread;
+
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path().join("rewind");
         let shared = boot_shared(&data).unwrap();
         {
             let mut st = shared.settings.lock().unwrap();
             st.consent_at = now_ms();
-            st.armed = true;
         }
-        persist_settings(&shared);
-        ensure_store(&shared).unwrap();
-        shared.arm_gen.store(1, Ordering::SeqCst);
-        shared.armed.store(true, Ordering::SeqCst);
+        persist_consent(&shared).unwrap();
+        arm_now(&shared).unwrap();
 
         let written = data.join("frames/1/in-flight.webp");
         fs::create_dir_all(written.parent().unwrap()).unwrap();
@@ -1556,20 +1576,106 @@ mod tests {
             encoder: "png".into(),
             crop_path: None,
         };
-        let settings = shared.settings.lock().unwrap().clone();
-        let hits = std::sync::atomic::AtomicU64::new(0);
-        let s = Arc::clone(&shared);
-        shared.set_tripwire(move || {
-            if hits.fetch_add(1, Ordering::SeqCst) >= 1 {
-                s.arm_gen.fetch_add(1, Ordering::SeqCst);
-                s.armed.store(false, Ordering::SeqCst);
-            }
-        });
-        let committed = finalize_capture(&shared, &settings, &insert, &[written.clone()], &[])
-            .unwrap();
-        shared.clear_tripwire();
+        let parked = Arc::new(Barrier::new(2));
+        let writer = {
+            let shared = Arc::clone(&shared);
+            let parked = Arc::clone(&parked);
+            let written = written.clone();
+            thread::spawn(move || {
+                let committed = with_arm_read(&shared, |arm| {
+                    if !write_allowed(&shared, arm) {
+                        discard_capture_files(&[written.clone()]);
+                        return false;
+                    }
+                    let mut n = 0;
+                    shared
+                        .with_store_mut(|store| {
+                            store.commit_capture_tx(&insert, &[], "", 1_000_000, || {
+                                n += 1;
+                                if n >= 2 {
+                                    parked.wait();
+                                    false
+                                } else {
+                                    true
+                                }
+                            })
+                        })
+                        .unwrap_or(Ok(false))
+                        .unwrap_or(false)
+                });
+                if !committed {
+                    discard_capture_files(&[written]);
+                }
+                committed
+            })
+        };
+        let disarmer = {
+            let shared = Arc::clone(&shared);
+            let parked = Arc::clone(&parked);
+            thread::spawn(move || {
+                parked.wait();
+                disarm_now(&shared);
+            })
+        };
+        let committed = writer.join().expect("writer");
+        disarmer.join().expect("disarmer");
         assert!(!committed);
         assert!(!written.exists());
+        assert!(!shared.armed.load(Ordering::SeqCst));
+        assert!(shared
+            .with_store(|s| !s.is_writable())
+            .unwrap_or(true));
+        let counts = shared
+            .with_store(|s| s.mutation_counters().unwrap())
+            .unwrap();
+        assert_eq!(counts.0, 0);
+    }
+
+    #[test]
+    fn disarmed_wipe_is_user_authorized_and_does_not_rearm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("rewind");
+        let shared = boot_shared(&data).unwrap();
+        {
+            let mut st = shared.settings.lock().unwrap();
+            st.consent_at = now_ms();
+        }
+        persist_consent(&shared).unwrap();
+        arm_now(&shared).unwrap();
+        shared
+            .with_store_mut(|s| {
+                s.insert_frame(&FrameInsert {
+                    ts: now_ms(),
+                    path: "frames/x.png".into(),
+                    app: "kitty".into(),
+                    title: "t".into(),
+                    workspace: "1".into(),
+                    output: "eDP-1".into(),
+                    width: 8,
+                    height: 8,
+                    out_w: 8,
+                    out_h: 8,
+                    crop_x: 0,
+                    crop_y: 0,
+                    crop_w: 8,
+                    crop_h: 8,
+                    bytes: 4,
+                    dhash: 1,
+                    encoder: "png".into(),
+                    crop_path: None,
+                })
+            })
+            .unwrap()
+            .unwrap();
+        disarm_now(&shared);
+        assert!(!shared.armed.load(Ordering::SeqCst));
+        let reply = authorized_wipe(&shared, "all", 0, 0).unwrap();
+        assert!(reply.get("wiped").and_then(|v| v.as_i64()).unwrap_or(0) >= 1);
+        assert!(!shared.armed.load(Ordering::SeqCst));
+        assert!(!shared.settings.lock().unwrap().armed);
+        assert!(shared
+            .with_store(|s| !s.is_writable())
+            .unwrap_or(true));
         let counts = shared
             .with_store(|s| s.mutation_counters().unwrap())
             .unwrap();

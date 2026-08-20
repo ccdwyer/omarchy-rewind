@@ -65,7 +65,7 @@ Item {
   property double byteCapGb: 2
   property int cadenceMs: 3000
   property int idlePauseSec: 120
-  property string excludeApps: "keepassxc,1Password,1password,Bitwarden,bitwarden,seahorse,polkit-gnome-authentication-agent-1,polkit-kde-authentication-agent-1,lxqt-policykit-agent"
+  property string excludeApps: "keepassxc,1Password,1password,Bitwarden,bitwarden,seahorse,polkit-gnome-authentication-agent-1,polkit-kde-authentication-agent-1,lxqt-policykit-agent,mate-polkit,xfce-polkit"
   property string titlePausePatterns: ""
   property bool armOnLogin: false
 
@@ -119,6 +119,7 @@ Item {
       return
     if (ev.event === "ready") {
       root.helperStatus = "ready"
+      root.helperReady = true
       root.consent = ev.consentShown === true
       root.armed = ev.armed === true
       root.encoder = ev.encoder || root.encoder
@@ -467,7 +468,7 @@ Item {
     daemonProc.command = [root.helperPath, "daemon"]
     daemonProc.running = true
     root.helperStatus = "starting"
-    root.helperReady = true
+    root.helperReady = false
   }
 
   Process {

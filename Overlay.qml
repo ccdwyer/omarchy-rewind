@@ -373,6 +373,15 @@ Item {
     root.callSvc("reopenPlan", String(f.ts))
   }
 
+  function askOneWindow(win) {
+    if (!win)
+      return
+    root.plan = Plan.oneWindowPlan(win)
+    root.planReady = true
+    root.planRequestTs = Number(win.ts || (root.currentFrame() ? root.currentFrame().ts : 0))
+    root.showPlan = true
+  }
+
   function execPlan() {
     root.callSvc("executePlan", root.plan || {})
     root.showPlan = false
@@ -629,7 +638,7 @@ Item {
           font.pixelSize: Style.font.body
           text: {
             var cap = root.uiByteCap || 2147483648
-            return "Measured on real UI: 25–80 KB per 720p frame. Default cap "
+            return "Planning estimate: ~25–80 KB per 720p frame (not measured on this host). Default cap "
                    + Format.humanBytes(cap) + " · " + Format.daysLabel(root.uiDaysEstimate, cap)
                    + ". Oldest frames go first. Search works on titles and clipboard even if tesseract is not installed."
           }
@@ -944,15 +953,37 @@ Item {
               height: parent.height - Style.space(220)
               clip: true
               model: (root.moment && root.moment.windows) ? root.moment.windows : []
-              delegate: Text {
+              delegate: Column {
                 required property var modelData
                 width: parent.width
-                text: (modelData.class || "") + " · ws " + (modelData.workspace || "") + "\n" + (modelData.title || "")
-                color: root.foreground
-                opacity: 0.8
-                wrapMode: Text.WordWrap
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
+                spacing: Style.space(4)
+                Text {
+                  width: parent.width
+                  text: (modelData.class || "") + " · ws " + (modelData.workspace || "") + "\n" + (modelData.title || "")
+                  color: root.foreground
+                  opacity: 0.8
+                  wrapMode: Text.WordWrap
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                }
+                Rectangle {
+                  width: reopenOneLab.implicitWidth + Style.space(12)
+                  height: Style.space(22)
+                  radius: 4
+                  color: Style.normalFillFor(root.foreground, root.accent)
+                  Text {
+                    id: reopenOneLab
+                    anchors.centerIn: parent
+                    text: "Reopen"
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                  }
+                  MouseArea {
+                    anchors.fill: parent
+                    onClicked: root.askOneWindow(modelData)
+                  }
+                }
               }
             }
             Text {
@@ -1003,26 +1034,57 @@ Item {
           anchors.fill: parent
           anchors.margins: Style.space(8)
           spacing: Style.space(6)
-          Row {
+          Item {
             id: density
             width: parent.width
             height: Style.space(10)
-            spacing: 0
-            Repeater {
-              model: Math.max(1, Math.min(root.frames.length, 240))
-              delegate: Rectangle {
-                required property int index
-                width: density.width / Math.max(1, Math.min(root.frames.length, 240))
-                height: parent.height
-                color: {
-                  if (!root.frames.length)
-                    return "transparent"
-                  var step = Math.max(1, Math.floor(root.frames.length / 240))
-                  var f = root.frames[Math.min(index * step, root.frames.length - 1)]
-                  if (root.isHit(f.ts))
-                    return root.accent
-                  return Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.45)
+            Row {
+              anchors.fill: parent
+              spacing: 0
+              Repeater {
+                model: Math.max(1, Math.min(root.frames.length, 240))
+                delegate: Rectangle {
+                  required property int index
+                  width: density.width / Math.max(1, Math.min(root.frames.length, 240))
+                  height: parent.height
+                  color: {
+                    if (!root.frames.length)
+                      return "transparent"
+                    var step = Math.max(1, Math.floor(root.frames.length / 240))
+                    var f = root.frames[Math.min(index * step, root.frames.length - 1)]
+                    var gap = Query.gapReason(f.ts, root.gaps)
+                    if (gap === "lock")
+                      return Qt.rgba(0.75, 0.2, 0.2, 0.7)
+                    if (gap)
+                      return Qt.rgba(0, 0, 0, 0.45)
+                    if (root.isHit(f.ts))
+                      return root.accent
+                    return Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.45)
+                  }
                 }
+              }
+            }
+            Repeater {
+              model: root.gaps
+              delegate: Rectangle {
+                required property var modelData
+                height: parent.height
+                visible: root.frames.length > 1
+                x: {
+                  var a = Number(root.frames[0].ts)
+                  var b = Number(root.frames[root.frames.length - 1].ts)
+                  var span = Math.max(1, b - a)
+                  return density.width * ((Number(modelData.from) - a) / span)
+                }
+                width: {
+                  var a = Number(root.frames[0].ts)
+                  var b = Number(root.frames[root.frames.length - 1].ts)
+                  var span = Math.max(1, b - a)
+                  return Math.max(2, density.width * ((Number(modelData.to) - Number(modelData.from)) / span))
+                }
+                color: (modelData.reason === "lock")
+                       ? Qt.rgba(0.8, 0.15, 0.15, 0.35)
+                       : Qt.rgba(0.05, 0.05, 0.05, 0.4)
               }
             }
           }
@@ -1057,6 +1119,8 @@ Item {
                   fillMode: Image.PreserveAspectCrop
                   asynchronous: true
                   cache: true
+                  sourceSize.width: Style.space(92)
+                  sourceSize.height: strip.height
                 }
                 Rectangle {
                   visible: root.isHit(modelData.ts)

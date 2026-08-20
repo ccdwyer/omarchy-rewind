@@ -195,6 +195,23 @@ test("plan: browsers are unrecoverable tabs", () => {
   assert.strictEqual(label, "Launch Kitty")
 })
 
+test("plan: one-window reopen is reviewable and browsers stay unrecoverable", () => {
+  const kitty = Plan.oneWindowPlan({ class: "kitty", title: "vim", workspace: "2", address: "0x1", at: [10, 20] })
+  assert.ok(kitty.steps.length >= 1)
+  assert.strictEqual(kitty.unrecoverable.length, 0)
+  assert.ok(String(kitty.note).toLowerCase().indexOf("one-window") >= 0 || String(kitty.note).indexOf("Confirm") >= 0)
+  const fox = Plan.oneWindowPlan({ class: "firefox", title: "Mail" })
+  assert.strictEqual(fox.steps.length, 0)
+  assert.ok(fox.unrecoverable.length >= 1)
+})
+
+test("query: gapReason maps lock vs gap spans", () => {
+  const gaps = [{ from: 100, to: 200, reason: "lock" }, { from: 300, to: 400, reason: "gap" }]
+  assert.strictEqual(Query.gapReason(150, gaps), "lock")
+  assert.strictEqual(Query.gapReason(350, gaps), "gap")
+  assert.strictEqual(Query.gapReason(50, gaps), "")
+})
+
 test("golden corpus: title+clipboard search without OCR", () => {
   const corpus = jsonFix("search-corpus.json")
   const q = "zebra-token"
@@ -394,6 +411,10 @@ test("service keeps snapshots in memory until consent/arm", () => {
   assert.ok(src.indexOf("root.armed = true") < 0)
   assert.ok(src.indexOf("function summon(arg: string)") >= 0)
   assert.ok(src.indexOf("function toggleArm(arg: string)") >= 0)
+  assert.ok(/helperReady = true/.test(src.split("if (ev.event === \"ready\")")[1] || ""))
+  assert.ok(src.indexOf("root.helperReady = true") >= 0)
+  const start = src.split("function startHelper")[1] || ""
+  assert.ok(start.indexOf("root.helperReady = false") >= 0)
 })
 
 test("bar polls live status and toggleArm always sends an arg", () => {
@@ -462,6 +483,11 @@ test("overlay refreshes and clears after wipe; range uses archive bounds", () =>
   assert.ok(src.indexOf("uiFirstTs") >= 0)
   assert.ok(src.indexOf("uiLastTs") >= 0)
   assert.ok(src.indexOf("full archive") >= 0)
+  assert.ok(src.indexOf("function askOneWindow") >= 0)
+  assert.ok(src.indexOf("Plan.oneWindowPlan") >= 0)
+  assert.ok(src.indexOf("Measured on real UI") < 0)
+  assert.ok(src.indexOf("Planning estimate") >= 0)
+  assert.ok(src.indexOf("Query.gapReason") >= 0)
 })
 
 test("encoder fallback chain is cwebp then image-webp then smaller png", () => {

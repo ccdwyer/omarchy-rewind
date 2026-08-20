@@ -62,7 +62,7 @@ Conservative choices where the Omarchy / Quickshell / Hyprland API was not 100% 
 - **`keepLoaded: true`** added so the overlay outlives a summon (reference).
 - **`barWidget` metadata block** added (reference requires it when `kinds` includes `bar-widget`).
 - **Widget settings in shell.json**, not a Rewind config file (reference).
-- **No committed 8-hour CPU% / GB/day.** Authoring host has no Hyprland. Planning numbers are the spec’s 25–80 KB/frame; live UI uses measured bytes.
+- **No committed 8-hour CPU% / GB/day.** Authoring host has no Hyprland. Frame size is a **planning estimate** of ~25–80 KB/frame (spec band), not a measurement from this machine. Live UI uses measured bytes once frames exist.
 - **wlr-screencopy is feature-gated** (macOS cannot compile wayland). On Linux with the feature, the session is persistent; grim is fallback only.
 - **POSIX fallback does not record** (privacy). Query/wipe of existing data still work.
 - **image-crate WebP is compiled in** (`webp` feature). PNG is only the last fallback, at a smaller scale than the 720p WebP path.

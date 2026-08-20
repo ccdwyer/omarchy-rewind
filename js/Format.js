@@ -52,7 +52,7 @@ function daysLabel(days, cap) {
         return "≈" + Math.round(d) + " days at your usage"
     }
     var band = planningDays(cap)
-    return "≈" + Math.round(band.low) + "–" + Math.round(band.high) + " days at 25–80 KB/frame"
+    return "planning estimate ≈" + Math.round(band.low) + "–" + Math.round(band.high) + " days at ~25–80 KB/frame"
 }
 
 function clockLabel(ts) {

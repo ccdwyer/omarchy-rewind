@@ -22,7 +22,7 @@
       "byteCapGb": 2,
       "cadenceMs": 3000,
       "idlePauseSec": 120,
-      "excludeApps": "keepassxc,1Password,1password,Bitwarden,bitwarden,seahorse,polkit-gnome-authentication-agent-1,polkit-kde-authentication-agent-1,lxqt-policykit-agent",
+      "excludeApps": "keepassxc,1Password,1password,Bitwarden,bitwarden,seahorse,polkit-gnome-authentication-agent-1,polkit-kde-authentication-agent-1,lxqt-policykit-agent,mate-polkit,xfce-polkit",
       "titlePausePatterns": "",
       "armOnLogin": false
     },

@@ -84,6 +84,19 @@ function fittedRect(containerW, containerH, sourceW, sourceH) {
     }
 }
 
+function gapReason(ts, gaps) {
+    ts = Number(ts) || 0
+    gaps = gaps || []
+    for (var i = 0; i < gaps.length; i++) {
+        var g = gaps[i] || {}
+        var lo = Number(g.from) || 0
+        var hi = Number(g.to) || 0
+        if (ts > lo && ts < hi)
+            return g.reason || "gap"
+    }
+    return ""
+}
+
 function boxesForQuery(boxes, needle) {
     var n = String(needle || "").toLowerCase()
     var out = []

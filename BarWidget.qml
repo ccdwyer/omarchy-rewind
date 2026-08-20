@@ -13,7 +13,7 @@ BarWidget {
   property double byteCapGb: 2
   property int cadenceMs: 3000
   property int idlePauseSec: 120
-  property string excludeApps: "keepassxc,1Password,1password,Bitwarden,bitwarden,seahorse,polkit-gnome-authentication-agent-1,polkit-kde-authentication-agent-1,lxqt-policykit-agent"
+  property string excludeApps: "keepassxc,1Password,1password,Bitwarden,bitwarden,seahorse,polkit-gnome-authentication-agent-1,polkit-kde-authentication-agent-1,lxqt-policykit-agent,mate-polkit,xfce-polkit"
   property string titlePausePatterns: ""
   property bool armOnLogin: false
 

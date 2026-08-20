@@ -1,6 +1,8 @@
 use crate::perms;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::Path;
 
 pub const DEFAULT_BYTE_CAP: i64 = 2 * 1024 * 1024 * 1024;
@@ -77,7 +79,31 @@ impl Settings {
             perms::secure_dir(parent).map_err(|e| e.to_string())?;
         }
         let body = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(path, body).map_err(|e| e.to_string())?;
+        let tmp = path.with_file_name(format!(
+            ".state-{}.tmp",
+            std::process::id()
+        ));
+        let write_tmp = (|| -> Result<(), String> {
+            let mut f = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp)
+                .map_err(|e| e.to_string())?;
+            f.write_all(body.as_bytes()).map_err(|e| e.to_string())?;
+            f.flush().map_err(|e| e.to_string())?;
+            f.sync_all().map_err(|e| e.to_string())?;
+            Ok(())
+        })();
+        if let Err(e) = write_tmp {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        perms::secure_file(&tmp).map_err(|e| e.to_string())?;
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.to_string());
+        }
         perms::secure_file(path).map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -176,5 +202,27 @@ mod tests {
         let mut s = Settings::default();
         s.merge_json(&serde_json::json!({"excludeApps": "foo, bar"}));
         assert_eq!(s.exclude_apps, vec!["foo", "bar"]);
+    }
+
+    #[test]
+    fn save_replaces_via_temp_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut s = Settings::default();
+        s.consent_at = 99;
+        s.save(&path).unwrap();
+        let parsed: Settings =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed.consent_at, 99);
+        let tmps: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp")
+            })
+            .collect();
+        assert!(tmps.is_empty());
     }
 }
