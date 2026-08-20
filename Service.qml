@@ -32,6 +32,7 @@ Item {
   property var pending: ({})
 
   property bool armed: false
+  property string reason: ""
   property bool paused: false
   property string pauseReason: "disarmed"
   property bool consent: false
@@ -145,6 +146,8 @@ Item {
       root.lastStatus = "ready"
       send("configure", root.settingsPayload())
       send("stats", {})
+      if (root.pendingArm && root.consent && root.helperIsBinary)
+        send("arm", root.settingsPayload())
       if (root.publishUi)
         root.publish()
       return
@@ -313,11 +316,30 @@ Item {
     }
   }
 
+  function ensureRecorder() {
+    if (root.helperIsBinary && !root.usingFallback)
+      return false
+    if (!root.triedBuild) {
+      root.lastStatus = "building recorder…"
+      root.buildHelper()
+      return true
+    }
+    if (!root.triedDownload) {
+      root.lastStatus = "downloading recorder…"
+      root.downloadHelper()
+      return true
+    }
+    return false
+  }
+
   function arm() {
     if (!root.consent) {
       root.openConsent()
       return "consent"
     }
+    root.pendingArm = true
+    if (root.ensureRecorder())
+      return "building"
     send("arm", root.settingsPayload())
     // Return a benign ack — NOT status(). The command is asynchronous; the
     // helper's authoritative `state` event (which sets root.armed and republishes
@@ -373,6 +395,11 @@ Item {
     }
     send("consent", { armNow: armNow, armOnLogin: onLogin })
     root.armOnLogin = onLogin
+    if (armNow) {
+      root.pendingArm = true
+      if (root.ensureRecorder())
+        return "building"
+    }
     return "ok"
   }
 
@@ -557,6 +584,7 @@ Item {
 
   property bool triedBuild: false
   property bool triedDownload: false
+  property bool pendingArm: false
 
   function findHelper() {
     var paths = adapter.resolveHelper(root.pluginDir)
@@ -570,7 +598,7 @@ Item {
     //   4. fallback     — none of the above: the non-recording compat helper.
     // triedBuild/triedDownload prevent looping. Each tier re-probes after.
     var buildable = root.triedBuild ? "" :
-      "elif command -v cargo >/dev/null 2>&1 && [ -f \"$3\" ]; then echo buildable; "
+      "elif ( command -v cargo >/dev/null 2>&1 || [ -x \"$HOME/.cargo/bin/cargo\" ] ) && [ -f \"$3\" ]; then echo buildable; "
     var downloadable = root.triedDownload ? "" :
       "elif ( command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 ) && " +
       "( command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 ) && " +
@@ -589,7 +617,7 @@ Item {
     root.triedBuild = true
     root.helperStatus = "building"
     root.lastStatus = "building recorder…"
-    buildProc.command = ["sh", "-c", "cd \"$1\" && sh build.sh >/dev/null 2>&1", "sh", root.pluginDir]
+    buildProc.command = ["sh", "-c", "PATH=\"$HOME/.cargo/bin:$PATH\" cd \"$1\" && sh build.sh >/dev/null 2>&1", "sh", root.pluginDir]
     buildProc.running = true
   }
 
@@ -732,10 +760,10 @@ Item {
   IpcHandler {
     target: "io.github.chris.rewind"
 
-    function ping(): string { return "ok" }
-    function status(): string { return root.status() }
-    function arm(): string { return root.arm() }
-    function disarm(): string { return root.disarm() }
+    function ping(arg: string): string { return "ok" }
+    function status(arg: string): string { return root.status() }
+    function arm(arg: string): string { return root.arm() }
+    function disarm(arg: string): string { return root.disarm() }
     function toggleArm(arg: string): string { return root.toggleArm(arg) }
     function summon(arg: string): string {
       var raw = String(arg || "").trim()
@@ -743,9 +771,9 @@ Item {
         return root.summonOverlay(raw)
       return root.openTimeline()
     }
-    function openTimeline(): string { return root.openTimeline() }
-    function openClips(): string { return root.openClips() }
-    function openConsent(): string { return root.openConsent() }
+    function openTimeline(arg: string): string { return root.openTimeline() }
+    function openClips(arg: string): string { return root.openClips() }
+    function openConsent(arg: string): string { return root.openConsent() }
     function query(q: string): string { root.requestQuery(q); return "ok" }
     function consentNow(arg: string): string { return root.consentNow(arg) }
     function copyClip(arg: string): string { return root.copyClip(arg) }

@@ -42,6 +42,10 @@ function applyLiveUi(target, src) {
         target.framesToday = Number(src.framesToday) || 0
     if (src.bytes !== undefined)
         target.bytes = Number(src.bytes) || 0
+    if (src.status !== undefined)
+        target.status = String(src.status || "")
+    if (src.fallback !== undefined)
+        target.fallback = src.fallback === true
     target.firstRun = !target.consent
     return target
 }

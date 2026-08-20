@@ -125,8 +125,8 @@ BarWidget {
       bytes: root.bytesUsed
     })
     tooltipText: root.armed
-                 ? (Pause.reasonLabel(root.pauseReason) + " · " + Format.humanBytes(root.bytesUsed) + " · hold for clipboard")
-                 : "Rewind disarmed · click to arm · hold for clipboard history"
+                 ? ("Rewind · " + Pause.reasonLabel(root.pauseReason) + " · " + Format.humanBytes(root.bytesUsed) + " · hold for clipboard")
+                 : "Rewind · disarmed · click to arm · hold for clipboard history"
 
     Rectangle {
       width: 7

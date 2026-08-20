@@ -54,6 +54,7 @@ Item {
   property bool planReady: false
   property bool uiConsent: false
   property bool uiArmed: false
+  property string uiStatus: ""
   property string uiPauseReason: "disarmed"
   property bool uiOcr: false
   property string openView: ""
@@ -244,6 +245,8 @@ Item {
     root.uiArmed = live.armed === true
     root.uiConsent = live.consent === true
     root.uiPauseReason = live.reason || (root.uiArmed ? "" : "disarmed")
+    if (live.status !== undefined)
+      root.uiStatus = String(live.status || "")
     root.uiOcr = live.ocrAvailable === true
     if (live.byteCap !== undefined)
       root.uiByteCap = Number(live.byteCap) || root.uiByteCap
@@ -817,7 +820,9 @@ Item {
           anchors.verticalCenter: parent.verticalCenter
         }
         Text {
-          text: root.uiArmed ? Pause.reasonLabel(root.uiPauseReason) : "disarmed"
+          text: root.uiArmed
+                ? Pause.reasonLabel(root.uiPauseReason)
+                : (root.uiStatus && root.uiStatus.length ? root.uiStatus : "disarmed")
           color: root.foreground
           opacity: 0.7
           font.family: root.fontFamily

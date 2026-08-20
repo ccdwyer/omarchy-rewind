@@ -74,14 +74,8 @@ function dayLabel(ts) {
 }
 
 function barText(stats) {
-    stats = stats || {}
-    if (!stats.armed)
-        return "Rewind"
-    var count = stats.framesToday || stats.frames || 0
-    var disk = humanBytes(stats.bytes || 0)
-    if (stats.paused)
-        return "Rewind · paused"
-    return "Rewind · " + count + " · " + disk
+    var _ = stats
+    return "󰑓"
 }
 
 function fileUrl(path) {

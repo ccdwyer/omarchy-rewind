@@ -72,12 +72,19 @@ Item {
   function writeLine(proc, line) {
     if (!proc || !line)
       return false
+    var payload = String(line) + "\n"
     try {
       if (typeof proc.write === "function") {
-        proc.write(String(line) + "\n")
+        proc.write(payload)
         return true
       }
     } catch (e) {}
+    try {
+      if (proc.stdin && typeof proc.stdin.write === "function") {
+        proc.stdin.write(payload)
+        return true
+      }
+    } catch (e2) {}
     return false
   }
 
