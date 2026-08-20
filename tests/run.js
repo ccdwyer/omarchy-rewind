@@ -521,10 +521,46 @@ test("bar chip renders only from the authoritative daemon state, not the toggle 
   assert.ok(overlay.indexOf("Channel.overlayViewAfterRefresh") >= 0)
   const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8")
   assert.ok(readme.indexOf("toggleArm '{}'") >= 0)
+  assert.ok(readme.indexOf("omarchy-shell io.github.chris.rewind toggleArm") >= 0)
+  assert.ok(readme.indexOf("shell call io.github.chris.rewind toggleArm") < 0)
   assert.ok(readme.indexOf("omarchy bar put") < 0)
   assert.ok(readme.indexOf("./scripts/rewind wipe") >= 0)
   assert.ok(readme.indexOf("omarchy plugin enable") >= 0)
   assert.ok(fs.existsSync(path.join(ROOT, "preview.png")))
+})
+
+test("bar and overlay call the plugin IpcHandler, not overlay shell call", () => {
+  const bar = fs.readFileSync(path.join(ROOT, "BarWidget.qml"), "utf8")
+  const overlay = fs.readFileSync(path.join(ROOT, "Overlay.qml"), "utf8")
+  const adapter = fs.readFileSync(path.join(ROOT, "RewindAdapter.qml"), "utf8")
+  // summon/hide stay on the shell target; method calls must not.
+  assert.ok(bar.indexOf('"shell", "summon"') >= 0 || bar.indexOf("shell\", \"summon") >= 0)
+  assert.ok(adapter.indexOf('"shell", "summon"') >= 0)
+  assert.ok(adapter.indexOf('"shell", "hide"') >= 0)
+  assert.ok(bar.indexOf('"shell", "call"') < 0, "bar must not use overlay shell call")
+  assert.ok(overlay.indexOf('"shell", "call"') < 0, "overlay callSvc must not use overlay shell call")
+  assert.ok(overlay.indexOf("function toggleArm") >= 0, "overlay forwards toggleArm for leftover shell call binds")
+  assert.ok(bar.indexOf('["omarchy-shell", root.moduleName, "toggleArm", "{}"]') >= 0
+    || /omarchy-shell", root\.moduleName, "toggleArm"/.test(bar))
+})
+
+test("rewindd and seed-demo emit Hyprland 0.56 Lua dispatch", () => {
+  const hypr = fs.readFileSync(path.join(ROOT, "src", "rewindd", "src", "hypr.rs"), "utf8")
+  const lib = fs.readFileSync(path.join(ROOT, "src", "rewindd", "src", "lib.rs"), "utf8")
+  const seed = fs.readFileSync(path.join(ROOT, "scripts", "seed-demo.sh"), "utf8")
+  const adapter = fs.readFileSync(path.join(ROOT, "RewindAdapter.qml"), "utf8")
+  assert.ok(hypr.indexOf("fn dispatch_lua") >= 0)
+  assert.ok(hypr.indexOf("hl.dsp.exec_cmd") >= 0)
+  assert.ok(hypr.indexOf("hl.dsp.window.move") >= 0)
+  assert.ok(hypr.indexOf("fn dispatch_parts") < 0)
+  assert.ok(lib.indexOf("dispatch_parts") < 0)
+  assert.ok(lib.indexOf("[workspace") < 0)
+  assert.ok(lib.indexOf("movetoworkspacesilent") < 0)
+  assert.ok(lib.indexOf("movewindowpixel") < 0)
+  assert.ok(lib.indexOf("dispatch_lua") >= 0)
+  assert.ok(seed.indexOf("hl.dsp.exec_cmd") >= 0)
+  assert.ok(!/hyprctl dispatch exec /.test(seed))
+  assert.ok(adapter.indexOf("hl.dsp.exec_cmd") >= 0)
 })
 
 test("rewind launcher forwards wipe range bounds to the sqlite store", () => {

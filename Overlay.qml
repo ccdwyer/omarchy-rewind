@@ -85,7 +85,7 @@ Item {
     var payload = arg
     if (arg !== undefined && arg !== null && typeof arg === "object")
       payload = JSON.stringify(arg)
-    var cmd = ["omarchy-shell", "shell", "call", root.pluginId, name]
+    var cmd = ["omarchy-shell", root.pluginId, name]
     if (payload !== undefined && payload !== null && String(payload).length)
       cmd.push(String(payload))
     var q = []
@@ -202,6 +202,13 @@ Item {
       root.close()
     else
       root.open("{}")
+  }
+
+  // `shell call <id> toggleArm` lands on this overlay. Forward to the service
+  // IpcHandler so leftover binds still arm/disarm instead of returning unknown.
+  function toggleArm(arg) {
+    var payload = arg === undefined || arg === null || String(arg).length === 0 ? "{}" : arg
+    return root.callSvc("toggleArm", payload)
   }
 
   function pull() {

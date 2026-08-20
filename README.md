@@ -65,7 +65,7 @@ The plugin does **not** write Hyprland binds. Add them yourself:
 
 ```
 bind = SUPER, R, exec, omarchy-shell shell summon io.github.chris.rewind '{}'
-bind = SUPER SHIFT, R, exec, omarchy-shell shell call io.github.chris.rewind toggleArm '{}'
+bind = SUPER SHIFT, R, exec, omarchy-shell io.github.chris.rewind toggleArm '{}'
 ```
 
 In the overlay:

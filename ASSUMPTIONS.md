@@ -5,9 +5,9 @@ Conservative choices where the Omarchy / Quickshell / Hyprland API was not 100% 
 ## Plugin host (reference wins)
 
 - **Entry points are `Item`s**, not `ShellRoot`. Overlay exposes `open(payloadJson)` / `close()` / `toggle()` for `omarchy-shell shell summon|hide|toggle`.
-- **Injected properties used:** `omarchyPath`, `shell`, `manifest`, `pluginRegistry`, `bar` (host load). **Not used:** `serviceFor` / `firstPartyServiceFor`. Overlay and bar widget talk to the service only through documented `omarchy-shell shell summon|hide|toggle|call <id> …`. The read-response snapshot channel (`ui/timeline/clips/moment/hits/plan.json`) lives in the **ephemeral tmpfs runtime dir `$XDG_RUNTIME_DIR/rewind`** (per-user 0700), never persistent storage; if `XDG_RUNTIME_DIR` is unset the channel fails closed (empty path) rather than fall back to an insecure `/tmp` path. These are transient views of already-authorized data, so they publish whenever `consent && (armed || overlayOpen)` and the overlay reads them even while its own privacy pause is active. New observation capture remains gated on `armed && !paused`.
+- **Injected properties used:** `omarchyPath`, `shell`, `manifest`, `pluginRegistry`, `bar` (host load). **Not used:** `serviceFor` / `firstPartyServiceFor`. Overlay and bar widget summon/hide via `omarchy-shell shell summon|hide <id>`. Service methods go through the plugin IpcHandler (`omarchy-shell io.github.chris.rewind <method> <arg>`). `shell call` looks up the overlay panelLoader, which has `toggle()` for the overlay UI — not `toggleArm`. Overlay.toggleArm forwards to the service so a leftover `shell call … toggleArm` still works. The read-response snapshot channel (`ui/timeline/clips/moment/hits/plan.json`) lives in the **ephemeral tmpfs runtime dir `$XDG_RUNTIME_DIR/rewind`** (per-user 0700), never persistent storage; if `XDG_RUNTIME_DIR` is unset the channel fails closed (empty path) rather than fall back to an insecure `/tmp` path. These are transient views of already-authorized data, so they publish whenever `consent && (armed || overlayOpen)` and the overlay reads them even while its own privacy pause is active. New observation capture remains gated on `armed && !paused`.
 - **`keepLoaded: true`** so the overlay’s layer-shell window survives between summons (image-picker pattern). The spec’s kinds/entryPoints are otherwise unchanged.
-- **Settings are inline on the `shell.json` entry.** Widget keys live in `manifest.barWidget.defaults` + `schema`. The bar widget pushes them with `shell call … configure '<json>'`.
+- **Settings are inline on the `shell.json` entry.** Widget keys live in `manifest.barWidget.defaults` + `schema`. The bar widget pushes them with `omarchy-shell <id> configure '<json>'`.
 - **Arm/consent persistence** is runtime state in `~/.local/share/rewind/state.json` (0600). Steady-state disarmed operation writes nothing. The one exception is the explicit consent-transition write (`persist_consent`) when the user accepts the consent screen, including “Keep disarmed.” Capture/OCR/settings/snapshots still require armed. `armOnLogin` is not persisted, so the daemon boots disarmed; startup auto-arm is deferred until the shell pushes `armOnLogin` (with `consentAt > 0`) via `configure`. A bare persisted `armed` bit does not resume capture. `arm` is rejected until consent is recorded.
 - **IPC replies:** `IpcHandler` methods return a string (consumed via Process `StdioCollector waitForEnd`). Query/timeline/moment/plan payloads are also published to the snapshot files so the overlay never depends on discarded `execDetached` stdout.
 - **Third-party id** is `io.github.chris.rewind`. Never `omarchy.*`.
@@ -20,7 +20,7 @@ Conservative choices where the Omarchy / Quickshell / Hyprland API was not 100% 
 - **`PanelWindow` + `WlrLayershell`** (`Overlay` layer, exclusive keyboard, `ExclusionMode.Ignore`) matches Desktop Undo / clipboard. Namespace `rewind`.
 - **Theme tokens** `Color.menu.*`, `Color.accent`, `Style.*`, `Border.*`, `BarWidget`, `WidgetButton`, `BorderSurface` — same first-party set as Desktop Undo. Reduced motion: `Style.reduceMotion` or `OMARCHY_REDUCED_MOTION=1`.
 - **`Hyprland.rawEvent`** is used only as a lock/unlock hint. Pause truth for lock/idle/exclusion/portal lives in rewindd (`pidof hyprlock`, `loginctl`, `hyprctl -j clients`, `pw-dump`).
-- **`Hyprland.dispatch`** is used from the adapter for reopen-exec fallback; rewindd also runs `hyprctl dispatch` itself. If `dispatch` throws, `hyprctl` is spawned.
+- **`Hyprland.dispatch` / `hyprctl dispatch`** take a Lua dispatcher as a single argument (`hl.dsp.exec_cmd(...)`, `hl.dsp.window.move({...})`). Classic `exec` / `movetoworkspacesilent` / `movewindowpixel` names become `hl.dispatch(<classic>)` and are a Lua syntax error on Hyprland 0.55+. If QML `dispatch` throws, `hyprctl dispatch <lua-expr>` is spawned.
 - **No invented Quickshell APIs.** Capture, encode, OCR, SQLite, and clipboard watching are all in rewindd.
 
 ## Capture
@@ -51,7 +51,7 @@ Conservative choices where the Omarchy / Quickshell / Hyprland API was not 100% 
 
 ## Reopen & arrange
 
-- Plan is built from the stored `hyprctl clients -j` vs live clients vs `.desktop` `StartupWMClass` / filename. Execution is `hyprctl dispatch exec|movetoworkspacesilent|movewindowpixel`. The overlay always shows the plan before that runs.
+- Plan is built from the stored `hyprctl clients -j` vs live clients vs `.desktop` `StartupWMClass` / filename. Execution is `hyprctl dispatch` of Lua `hl.dsp.exec_cmd` / `hl.dsp.window.move` expressions. The overlay always shows the plan before that runs.
 
 ## Helper fallback
 
