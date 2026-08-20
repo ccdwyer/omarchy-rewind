@@ -86,13 +86,13 @@ pub(crate) fn process_pending(shared: &DaemonState) -> i64 {
                     })
                     .unwrap_or_default();
                 let committed = crate::with_arm_read(shared, |arm| {
-                    if !crate::write_allowed(shared, arm) {
+                    if !crate::write_allowed(shared, arm, gen) {
                         return false;
                     }
                     shared
                         .with_store_mut(|store| {
                             store.commit_ocr_tx(ts, &text, &app, &title, &clip, &boxes, || {
-                                crate::write_allowed(shared, arm)
+                                crate::write_allowed(shared, arm, gen)
                             })
                         })
                         .unwrap_or(Ok(false))
