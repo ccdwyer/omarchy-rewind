@@ -11,6 +11,7 @@ OUT="$ROOT/bin"
 mkdir -p "$OUT"
 chmod +x "$ROOT/compat/rewindd.sh" 2>/dev/null || true
 chmod +x "$ROOT/scripts/"*.sh 2>/dev/null || true
+chmod +x "$ROOT/scripts/rewind" 2>/dev/null || true
 
 install_fallback() {
   cp "$ROOT/compat/rewindd.sh" "$OUT/rewindd"

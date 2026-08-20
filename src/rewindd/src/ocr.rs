@@ -85,14 +85,19 @@ pub(crate) fn process_pending(shared: &DaemonState) -> i64 {
                         (app, title, clip)
                     })
                     .unwrap_or_default();
-                let committed = shared
-                    .with_store_mut(|store| {
-                        store.commit_ocr_tx(ts, &text, &app, &title, &clip, &boxes, || {
-                            crate::still_armed(shared, gen)
+                let committed = crate::with_arm_read(shared, |arm| {
+                    if !crate::write_allowed(shared, arm) {
+                        return false;
+                    }
+                    shared
+                        .with_store_mut(|store| {
+                            store.commit_ocr_tx(ts, &text, &app, &title, &clip, &boxes, || {
+                                crate::write_allowed(shared, arm)
+                            })
                         })
-                    })
-                    .unwrap_or(Ok(false))
-                    .unwrap_or(false);
+                        .unwrap_or(Ok(false))
+                        .unwrap_or(false)
+                });
                 if committed && crate::still_armed(shared, gen) {
                     let _ = std::fs::remove_file(&path);
                     done += 1;

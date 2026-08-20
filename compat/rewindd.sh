@@ -415,7 +415,31 @@ cli() {
     ""|daemon) return 1 ;;
     self-test) self_test; exit 0 ;;
     wipe)
-      rewrite_index "${2:-today}" 0 0
+      from=0
+      to=0
+      if [ $# -ge 2 ] && [ "${2#--}" = "$2" ]; then
+        scope="$2"
+        shift 2
+      else
+        scope=today
+        shift
+      fi
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --from)
+            from="${2:-0}"
+            shift 2
+            ;;
+          --to)
+            to="${2:-0}"
+            shift 2
+            ;;
+          *)
+            shift
+            ;;
+        esac
+      done
+      rewrite_index "$scope" "$from" "$to"
       exit 0
       ;;
     query) shift; query_index "$*"; exit 0 ;;

@@ -49,6 +49,14 @@ BarWidget {
 
   function toggleArm() {
     root.callShell("toggleArm", "{}")
+    root.pollStatus()
+  }
+
+  function pollStatus() {
+    if (statusProc.running)
+      return
+    statusProc.command = ["omarchy-shell", "shell", "call", root.moduleName, "status", "{}"]
+    statusProc.running = true
   }
 
   function applyLive(raw) {
@@ -91,15 +99,10 @@ BarWidget {
   }
 
   Timer {
-    interval: 400
+    interval: 2500
     running: true
     repeat: true
-    onTriggered: {
-      if (statusProc.running)
-        return
-      statusProc.command = ["omarchy-shell", "shell", "call", root.moduleName, "status", "{}"]
-      statusProc.running = true
-    }
+    onTriggered: root.pollStatus()
   }
 
   WidgetButton {

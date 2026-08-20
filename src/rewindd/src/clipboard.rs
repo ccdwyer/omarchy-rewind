@@ -121,15 +121,16 @@ pub(crate) fn ingest(shared: &DaemonState, raw: &str) {
         }
         *g = text.clone();
     }
-    let Some(gen) = crate::arm_ticket(shared) else {
-        return;
-    };
-    if !crate::still_armed(shared, gen) {
-        return;
-    }
-    let ts = now_ms();
-    let _ = shared.with_store_mut(|store| {
-        let _ = store.commit_clip_tx(ts, "text/plain", &text, || crate::still_armed(shared, gen));
+    crate::with_arm_read(shared, |arm| {
+        if !crate::write_allowed(shared, arm) {
+            return;
+        }
+        let ts = now_ms();
+        let _ = shared.with_store_mut(|store| {
+            let _ = store.commit_clip_tx(ts, "text/plain", &text, || {
+                crate::write_allowed(shared, arm)
+            });
+        });
     });
 }
 

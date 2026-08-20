@@ -236,6 +236,20 @@ test("Channel.parse reads snapshot JSON", () => {
   assert.strictEqual(Channel.arrayOf(u.hits).length, 0)
 })
 
+test("live refresh overrides an armed snapshot and skips repeated consent", () => {
+  const snap = { armed: true, consent: true, reason: "" }
+  const live = { armed: false, consent: true, reason: "disarmed" }
+  const ui = Channel.applyLiveUi({}, snap)
+  assert.strictEqual(ui.armed, true)
+  Channel.applyLiveUi(ui, live)
+  assert.strictEqual(ui.armed, false)
+  assert.strictEqual(ui.consent, true)
+  assert.strictEqual(ui.firstRun, false)
+  assert.strictEqual(Channel.overlayViewAfterRefresh(ui.consent, ""), "scrub")
+  assert.strictEqual(Channel.overlayViewAfterRefresh(false, ""), "consent")
+  assert.strictEqual(Channel.overlayViewAfterRefresh(true, "clips"), "clips")
+})
+
 test("overlay and bar widget do not call serviceFor", () => {
   const overlay = fs.readFileSync(path.join(ROOT, "Overlay.qml"), "utf8")
   const bar = fs.readFileSync(path.join(ROOT, "BarWidget.qml"), "utf8")
@@ -385,14 +399,46 @@ test("service keeps snapshots in memory until consent/arm", () => {
 test("bar polls live status and toggleArm always sends an arg", () => {
   const bar = fs.readFileSync(path.join(ROOT, "BarWidget.qml"), "utf8")
   assert.ok(bar.indexOf("function applyLive") >= 0)
-  assert.ok(bar.indexOf('"status"') >= 0)
+  assert.ok(bar.indexOf("function pollStatus") >= 0)
+  assert.ok(bar.indexOf("interval: 2500") >= 0)
+  assert.ok(bar.indexOf("interval: 400") < 0)
   assert.ok(bar.indexOf('callShell("toggleArm", "{}")') >= 0)
+  const overlay = fs.readFileSync(path.join(ROOT, "Overlay.qml"), "utf8")
+  assert.ok(overlay.indexOf("Channel.applyLiveUi") >= 0)
+  assert.ok(overlay.indexOf("Channel.overlayViewAfterRefresh") >= 0)
   const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8")
   assert.ok(readme.indexOf("toggleArm '{}'") >= 0)
   assert.ok(readme.indexOf("omarchy bar put") < 0)
+  assert.ok(readme.indexOf("./scripts/rewind wipe") >= 0)
   assert.ok(readme.indexOf("omarchy plugin enable") >= 0)
-  assert.ok(readme.indexOf("omarchy bar move") >= 0)
   assert.ok(fs.existsSync(path.join(ROOT, "preview.png")))
+})
+
+test("rewind launcher forwards wipe range bounds", () => {
+  const launcher = path.join(ROOT, "scripts", "rewind")
+  assert.ok(fs.existsSync(launcher))
+  fs.chmodSync(launcher, 0o755)
+  const os = require("os")
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "rewind-range-"))
+  fs.mkdirSync(path.join(tmp, "frames"), { recursive: true })
+  const gone = path.join(tmp, "frames", "1.png")
+  const stay = path.join(tmp, "frames", "2.png")
+  fs.writeFileSync(gone, "a")
+  fs.writeFileSync(stay, "b")
+  fs.writeFileSync(
+    path.join(tmp, "index.jsonl"),
+    JSON.stringify({ ts: 10, path: gone }) + "\n" + JSON.stringify({ ts: 50, path: stay }) + "\n"
+  )
+  fs.writeFileSync(path.join(tmp, "clips.jsonl"), "")
+  const env = Object.assign({}, process.env, { REWIND_DATA_DIR: tmp })
+  const r = spawnSync(launcher, ["wipe", "range", "--from", "1", "--to", "20"], {
+    encoding: "utf8",
+    env
+  })
+  assert.strictEqual(r.status, 0, r.stderr + r.stdout)
+  const idx = fs.readFileSync(path.join(tmp, "index.jsonl"), "utf8").trim()
+  assert.ok(idx.indexOf('"ts": 50') >= 0 || idx.indexOf('"ts":50') >= 0, idx)
+  assert.ok(idx.indexOf('"ts": 10') < 0 && idx.indexOf('"ts":10') < 0, idx)
 })
 
 test("ocr does not treat disarmed as idle and capture reports runtime backend", () => {

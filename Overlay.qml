@@ -46,6 +46,7 @@ Item {
   property bool uiArmed: false
   property string uiPauseReason: "disarmed"
   property bool uiOcr: false
+  property string openView: ""
   property double uiByteCap: 2147483648
   property var uiDaysEstimate: null
   property double uiFirstTs: 0
@@ -130,6 +131,15 @@ Item {
           root.plan = {}
           root.planReady = false
         }
+        if (ev.armed !== undefined || ev.consent !== undefined) {
+          root.applyUi(ev)
+          if (root.opened) {
+            if (root.openView === "clips")
+              root.view = "clips"
+            else
+              root.view = Channel.overlayViewAfterRefresh(root.uiConsent, root.openView)
+          }
+        }
       } catch (e) {}
     }
     uiView.reload()
@@ -158,11 +168,12 @@ Item {
     try {
       payload = payloadJson && String(payloadJson).length ? JSON.parse(payloadJson) : {}
     } catch (e) { payload = {} }
+    root.openView = payload.view || ""
     root.firstRun = !root.uiConsent
-    if (payload.view === "consent" || root.firstRun)
-      root.view = "consent"
-    else if (payload.view === "clips")
+    if (payload.view === "clips")
       root.view = "clips"
+    else if (payload.view === "consent" || root.firstRun)
+      root.view = "consent"
     root.callSvc("refresh", { overlay: true })
     root.pull()
     Qt.callLater(root.focusForView)
@@ -195,18 +206,28 @@ Item {
   }
 
   function applyUi(raw) {
-    var u = Channel.parse(raw, {})
-    root.uiArmed = u.armed === true
-    root.uiConsent = u.consent === true
-    root.uiPauseReason = u.reason || (root.uiArmed ? "" : "disarmed")
-    root.uiOcr = u.ocrAvailable === true
-    if (u.byteCap !== undefined)
-      root.uiByteCap = Number(u.byteCap) || root.uiByteCap
-    root.uiDaysEstimate = u.daysEstimate
-    if (u.firstTs !== undefined)
-      root.uiFirstTs = Number(u.firstTs) || 0
-    if (u.lastTs !== undefined)
-      root.uiLastTs = Number(u.lastTs) || 0
+    var u = raw && typeof raw === "object" ? raw : Channel.parse(raw, {})
+    var live = Channel.applyLiveUi({
+      armed: root.uiArmed,
+      consent: root.uiConsent,
+      reason: root.uiPauseReason,
+      ocrAvailable: root.uiOcr,
+      byteCap: root.uiByteCap,
+      daysEstimate: root.uiDaysEstimate,
+      firstTs: root.uiFirstTs,
+      lastTs: root.uiLastTs
+    }, u)
+    root.uiArmed = live.armed === true
+    root.uiConsent = live.consent === true
+    root.uiPauseReason = live.reason || (root.uiArmed ? "" : "disarmed")
+    root.uiOcr = live.ocrAvailable === true
+    if (live.byteCap !== undefined)
+      root.uiByteCap = Number(live.byteCap) || root.uiByteCap
+    root.uiDaysEstimate = live.daysEstimate
+    if (live.firstTs !== undefined)
+      root.uiFirstTs = Number(live.firstTs) || 0
+    if (live.lastTs !== undefined)
+      root.uiLastTs = Number(live.lastTs) || 0
     root.firstRun = !root.uiConsent
   }
 

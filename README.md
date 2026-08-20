@@ -18,7 +18,7 @@ Then build the helper on the machine:
 ~/.config/omarchy/plugins/io.github.chris.rewind/build.sh
 ```
 
-`build.sh` compiles `rewindd` (Rust). If `cargo` or Wayland headers are missing it installs `compat/rewindd.sh` as `bin/rewindd`. That fallback **does not record** (it cannot honor the pause matrix); it still answers query/wipe/stats against existing data and the overlay stays usable. Recording requires the Rust binary.
+`build.sh` compiles `rewindd` (Rust). Missing Wayland headers usually still produce a **grim-only Rust helper**. The POSIX `compat/rewindd.sh` fallback is installed only when `cargo` itself is missing or `cargo build` fails. That fallback **does not record** (it cannot honor the pause matrix); it still answers query/wipe/stats against existing data. Recording requires the Rust binary.
 
 Linux CI (`.github/workflows/linux-helper.yml`) builds the Wayland helper, runs tests, `ldd`, and `strace -e trace=network`, and uploads `rewindd-linux`. This macOS authoring host cannot produce that ELF; `scripts/network-audit.sh` exits 1 when `bin/rewindd` is missing rather than pretending the audit passed.
 
@@ -51,7 +51,7 @@ Optional garnish, never required:
 | Arm / disarm | Click the bar chip |
 | Open the overlay | Right-click the chip, or the bind below |
 | Clipboard history | **Long-press** the chip, then Enter to re-copy |
-| Wipe | Overlay “wipe today”, or `rewindd wipe today\|all\|range` |
+| Wipe | Overlay “wipe today”, or `./scripts/rewind wipe today\|all\|range` |
 
 The plugin does **not** write Hyprland binds. Add them yourself:
 
@@ -115,14 +115,17 @@ Inline on the `shell.json` bar entry (no plugin config file):
 
 ## CLI
 
+User-facing launcher (plugin-relative; `build.sh` also installs `bin/rewind`):
+
 ```
-rewindd                  # NDJSON daemon (what the service starts)
-rewindd wipe today|all|range [--from MS --to MS]
-rewindd query TEXT
-rewindd stats
-rewindd ldd-report
-rewindd self-test
+./scripts/rewind wipe today
+./scripts/rewind wipe all
+./scripts/rewind wipe range --from MS --to MS
+./scripts/rewind query TEXT
+./scripts/rewind stats
 ```
+
+The service starts `bin/rewindd` as the NDJSON daemon. Do not invoke a bare `rewindd` unless that helper is on your `PATH`.
 
 Data lives at `$XDG_DATA_HOME/rewind` (default `~/.local/share/rewind`), created with umask `0077`.
 
