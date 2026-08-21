@@ -14,3 +14,5 @@
 .fix_agent_*.md
 .review_prompt*.md
 .fix_prompt_*.md
+__pycache__/
+*.pyc
